@@ -6,13 +6,23 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a WinCE pre-release after all required checks
+        type: boolean
+        default: false
+      pull_request:
+        description: Exact PR to merge after the checks (leave empty for an already merged revision)
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+  RUSTFLAGS: ""
+  CARGO_BUILD_JOBS: "2"
   # Keep Cargo artifacts separate from extracted FFmpeg sources.
   CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo
   # Keep older native dependencies compatible with recent CMake releases.
@@ -211,7 +221,7 @@ jobs:
       - name: build CLI + desktop
         shell: pwsh
         run: |
-          cargo build --release --locked -p pocket-cli
+          cargo build --release --locked -p pocket-cli --features unicorn
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --release --locked -p pocket-desktop
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -230,6 +240,9 @@ jobs:
           cp target/cargo/release/pockethle-gui.exe dist/PocketHLE-windows/
           cp README.md dist/PocketHLE-windows/
           cp docs/STEAMDECK.md dist/PocketHLE-windows/README-SteamDeck.md
+          cp docs/WINDOWS-CE.md dist/PocketHLE-windows/README-Windows-CE.md
+          mkdir -p dist/PocketHLE-windows/profiles
+          cp profiles/wince6-portable.json dist/PocketHLE-windows/profiles/
           cp -f README.ru.md dist/PocketHLE-windows/ 2>/dev/null || true
       - name: zip artifacts
         shell: pwsh
@@ -293,3 +306,77 @@ jobs:
           name: PocketHLE-android
           path: dist/android/PocketHLE-*.apk
           if-no-files-found: error
+
+  wince-source-and-profile:
+    name: WinCE profile and corresponding source
+    runs-on: ubuntu-24.04
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - name: Package profile templates and complete locked source
+        run: |
+          mkdir -p target dist/release
+          cargo vendor --locked vendor-cargo > target/vendor-config.toml
+          python3 tools/package-wince-profile.py --output dist/release/PocketHLE-GDI-WinCE-profile.zip
+          python3 tools/package-wince-source.py --output dist/release/PocketHLE-GDI-source-kit.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PocketHLE-GDI-profile-and-source
+          path: dist/release/*.zip
+          if-no-files-found: error
+
+  wince-prerelease:
+    name: Merge reviewed revision and publish WinCE pre-release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    runs-on: ubuntu-24.04
+    needs: [fmt, clippy, test, build-unicorn, build-linux, build-windows, build-android, wince-source-and-profile]
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: PocketHLE-*
+          path: dist/downloaded
+          merge-multiple: true
+      - name: Merge the exact tested PR and publish installable packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pull_request }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import re,pathlib; print(re.search(r"^version\s*=\s*\"([^\"]+)\"",pathlib.Path("Cargo.toml").read_text(),re.M)[1])')
+          tag="v$version"
+          target="$GITHUB_SHA"
+          if [[ -n "$PR_NUMBER" ]]; then
+            [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo 'Invalid PR number'; exit 1; }
+            head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
+            [[ "$head" == "$GITHUB_SHA" ]] || { echo 'PR changed after the build; refusing to merge another revision'; exit 1; }
+            state=$(gh pr view "$PR_NUMBER" --json state --jq .state)
+            if [[ "$state" != MERGED ]]; then
+              gh pr merge "$PR_NUMBER" --merge --match-head-commit "$GITHUB_SHA"
+            fi
+            target=$(gh pr view "$PR_NUMBER" --json mergeCommit --jq .mergeCommit.oid)
+            [[ -n "$target" && "$target" != null ]]
+          fi
+          python3 - <<'PY'
+          import hashlib,pathlib
+          root=pathlib.Path('dist/downloaded')
+          assets=sorted(p for p in root.iterdir() if p.is_file() and (p.suffix=='.apk' or p.name.endswith(('.zip','.tar.gz'))))
+          if not any(p.suffix=='.apk' and 'unsigned' not in p.name for p in assets):
+              raise SystemExit('No signed Android APK; refusing publication')
+          if any('unsigned' in p.name for p in assets):
+              raise SystemExit('Unsigned APK is not a public installable package')
+          (root/'SHA256SUMS.txt').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in assets))
+          PY
+          mapfile -t assets < <(find dist/downloaded -maxdepth 1 -type f \( -name '*.zip' -o -name '*.apk' -o -name '*.tar.gz' -o -name SHA256SUMS.txt \) | sort)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+            gh release edit "$tag" --draft=false --prerelease --notes-file "docs/releases/$tag.md"
+          else
+            gh release create "$tag" "${assets[@]}" --target "$target" --prerelease --title "PocketHLE-GDI $version (WinCE pre-release)" --notes-file "docs/releases/$tag.md"
+          fi

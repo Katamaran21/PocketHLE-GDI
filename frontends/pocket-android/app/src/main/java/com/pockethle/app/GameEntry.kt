@@ -87,6 +87,7 @@ data class GameSettings(
     val pocketpcGapiColumns: Boolean = false,
     val pocketpcEglRgba8888Only: Boolean = false,
     val storageCardDir: String? = null,
+    val windowsCe: WindowsCeSettings? = null,
     val originalJson: String = "{}",
 ) {
     fun toJson(): JSONObject = JSONObject(originalJson).apply {
@@ -117,6 +118,7 @@ data class GameSettings(
         put("pocketpc_gapi_columns", pocketpcGapiColumns)
         put("pocketpc_egl_rgba8888_only", pocketpcEglRgba8888Only)
         if (storageCardDir == null) remove("storage_card_dir") else put("storage_card_dir", storageCardDir)
+        put("windows_ce", windowsCe?.toJson() ?: JSONObject.NULL)
     }
 
     fun controlsMode() = pocketpcControls ?: if(pocketpcTouchSteering) "zones" else "normal"
@@ -159,6 +161,38 @@ data class GameSettings(
             pocketpcGapiColumns = obj.optBoolean("pocketpc_gapi_columns", false),
             pocketpcEglRgba8888Only = obj.optBoolean("pocketpc_egl_rgba8888_only", false),
             storageCardDir = if (obj.isNull("storage_card_dir")) null else obj.optString("storage_card_dir"),
+            windowsCe = obj.optJSONObject("windows_ce")?.let(WindowsCeSettings::fromJson),
+            originalJson = obj.toString(),
+        )
+    }
+}
+
+/** Paths are relative to the Android library, so backups remain portable. */
+data class WindowsCeSettings(
+    val profileName: String = "Windows CE",
+    val imageRoot: String? = null,
+    val dataDir: String? = null,
+    val appPrefix: String = "\\Application\\",
+    val commandLine: String = "",
+    val classicWindows: Boolean = true,
+    val originalJson: String = "{}",
+) {
+    fun toJson() = JSONObject(originalJson).apply {
+        put("profile_name", profileName)
+        put("image_root", imageRoot ?: JSONObject.NULL)
+        put("data_dir", dataDir ?: JSONObject.NULL)
+        put("app_prefix", appPrefix)
+        put("command_line", commandLine)
+        put("classic_windows", classicWindows)
+    }
+    companion object {
+        fun fromJson(obj: JSONObject) = WindowsCeSettings(
+            profileName = obj.optString("profile_name", "Windows CE"),
+            imageRoot = if (obj.isNull("image_root")) null else obj.optString("image_root"),
+            dataDir = if (obj.isNull("data_dir")) null else obj.optString("data_dir"),
+            appPrefix = obj.optString("app_prefix", "\\Application\\"),
+            commandLine = obj.optString("command_line", ""),
+            classicWindows = obj.optBoolean("classic_windows", true),
             originalJson = obj.toString(),
         )
     }

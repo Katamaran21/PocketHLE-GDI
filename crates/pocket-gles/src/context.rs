@@ -4421,6 +4421,7 @@ mod tests {
         ])
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires native OpenGL/GLES; client-state lifetime and texture caches"]
     fn client_state_reset_preserves_surface_policy_and_invalidates_reused_texture_names() {
@@ -4473,6 +4474,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires native OpenGL/GLES; native pixmap interop"]
     fn native_rgb565_upload_preserves_depth_odd_rows_and_internal_scale() {
@@ -5063,6 +5065,7 @@ mod tests {
         combiner_discard_preserves_color_and_depth(false);
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires native desktop GL and GLES"]
     fn gpu_combiner_discard_preserves_color_and_depth() {
@@ -5139,6 +5142,7 @@ mod tests {
         assert_eq!(feedback_alpha_case(false, false), [64, 64, 64, 128]);
         assert_eq!(feedback_alpha_case(false, true), [72, 72, 72, 200]);
     }
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires native desktop GL and GLES"]
     fn gpu_feedback_stable_alpha_batches_without_losing_overlapping_order() {
@@ -5161,6 +5165,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires native desktop GL and GLES; sparse high NV sampler"]
     fn gpu_nv_sparse_sampler_four_keeps_coordinate_one_and_fixed_function_transitions() {
@@ -5319,6 +5324,7 @@ mod tests {
         literal_normalization(false);
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires native desktop GL and GLES"]
     fn gpu_ar11_literals_preserve_sign_and_fraction_through_arithmetic() {
@@ -5423,6 +5429,7 @@ mod tests {
         assert_eq!(c.active_texture, 5);
         fixed_sixth_texture_stage(false);
     }
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires native desktop GL and GLES"]
     fn gpu_nv_sixth_stage_and_return_to_four_stage_variants() {
@@ -5548,6 +5555,7 @@ mod tests {
         swizzled_combiner_coordinates(false);
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires native desktop GL and GLES"]
     fn gpu_combiner_swizzles_axes_and_uses_six_coordinate_sets() {
@@ -5568,6 +5576,7 @@ mod tests {
         combiner_samples_coordinates_from_the_program_route(false);
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires native OpenGL"]
     fn gpu_combiner_samples_coordinates_from_the_program_route() {
@@ -5642,6 +5651,7 @@ mod tests {
         assert_eq!(pixel(&c, 32, 32), [128, 128, 255, 255]);
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires native OpenGL"]
     fn gpu_combiner_reads_overlapping_primitives_in_draw_order() {

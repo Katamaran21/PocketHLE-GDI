@@ -188,12 +188,31 @@ impl KernelState {
         let Some(index) = self.modules.iter().position(|module| module.handle == base) else {
             return Ok(());
         };
+        let strings: Vec<_> = self
+            .gdi
+            .resource_strings
+            .iter()
+            .filter_map(|(&resource, &copy)| {
+                self.modules[index]
+                    .resident_regions
+                    .iter()
+                    .any(|&(start, size)| {
+                        resource >= start
+                            && u64::from(resource) < u64::from(start) + u64::from(size)
+                    })
+                    .then_some((resource, copy))
+            })
+            .collect();
         while let Some(&(start, size)) = self.modules[index].resident_regions.last() {
             if size != 0 {
                 cpu.unmap_region(start, size)?;
             }
             self.heap.release_resident(start, size);
             self.modules[index].resident_regions.pop();
+        }
+        for (resource, copy) in strings {
+            self.gdi.resource_strings.remove(&resource);
+            self.heap.free(copy);
         }
         let satellites = self.modules.remove(index).satellites;
         for satellite in satellites {

@@ -3,7 +3,21 @@ Copyright (C) 2026 PocketHLE Emulator Project
 SPDX-License-Identifier: Apache-2.0 OR MIT
 -->
 
-# PocketHLE
+# PocketHLE-GDI
+
+Windows CE desktop fork of [guizmox/PocketHLE](https://github.com/guizmox/PocketHLE),
+with classic GDI window frames, a shared Explorer/application desktop, CE image
+profiles and Windows/Android launchers. The existing GTShell history and Android
+SD Card support are retained.
+
+Download this fork from [PocketHLE-GDI releases](https://github.com/Katamaran21/PocketHLE-GDI/releases).
+See [Windows CE setup](docs/WINDOWS-CE.md) for profiles and Android import, and
+[the pre-release notes](docs/releases/v0.4.6-wince.1.md) for the current scope.
+
+The emulator implements CE APIs in Rust. An extracted image supplies files,
+fonts, resources and registry hives; it does not boot the original CE kernel.
+Public packages contain the emulator and profile templates. Supply your own CE
+image and application binaries.
 
 <p align="center">
   <img src="./frontends/pocket-desktop/assets/pockethle_logo.png" width="25%" alt="PocketHLE logo" />

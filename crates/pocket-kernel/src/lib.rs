@@ -37,6 +37,8 @@ pub mod async_keys;
 pub mod audio;
 pub mod bluetooth;
 pub mod camera;
+pub mod ce;
+pub mod ce_hive;
 pub mod cedb;
 pub mod classic_sip;
 pub mod colors;
@@ -80,6 +82,9 @@ pub mod touch_steering;
 pub mod tracker;
 pub mod vfs;
 pub mod vibration;
+mod window_cleanup;
+mod window_compositor;
+pub mod windowing;
 pub mod zlib;
 
 pub use audio::{AudioEngine, AudioTap, GuestFormat, VoiceParams};
@@ -718,6 +723,7 @@ pub struct ModalDialog {
 /// the HLE has to both remember the parts and draw them.
 #[derive(Debug, Clone, Default)]
 pub struct StatusBar {
+    pub simple: bool,
     /// Parent window the bar is docked to the bottom of.
     pub parent: u32,
     /// Height in pixels, from the `CreateStatusWindow` call.
@@ -780,6 +786,50 @@ impl StatusBar {
             self.height
         } else {
             Self::DEFAULT_HEIGHT
+        }
+    }
+
+    /// A classic CE status control belongs to its parent client, not the
+    /// display's bottom edge. Portable Explorer keeps its taskbar below it.
+    pub fn render_at(
+        &self,
+        surface: &mut gdi::Surface<'_>,
+        rect: (i32, i32, i32, i32),
+        face: Option<&gdi::Font>,
+        background: Option<u16>,
+    ) {
+        let (x, y, width, height) = rect;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        surface.fill_rect(x, y, width, height, background.unwrap_or(Self::BG));
+        surface.fill_rect(x, y, width, 1, Self::EDGE);
+        for (i, text) in self.part_text.iter().enumerate() {
+            if self.simple && i != 255 {
+                continue;
+            }
+            if !self.simple && i == 255 {
+                continue;
+            }
+            let (left, right) = if self.simple {
+                (0, width)
+            } else {
+                self.part_span(i, width)
+            };
+            if left >= right {
+                continue;
+            }
+            if left > 0 {
+                surface.fill_rect(x + left, y + 3, 1, (height - 6).max(0), 0x8410);
+            }
+            let layout = text::layout(face, &text.encode_utf16().collect::<Vec<_>>());
+            layout.draw(
+                surface,
+                x + left + 3,
+                y + (height - layout.height) / 2,
+                Self::FG,
+                [x + left + 2, y + 1, x + right - 2, y + height],
+            );
         }
     }
 
@@ -914,7 +964,7 @@ pub struct ControlNotifyFrame {
 /// in the `WM_SIZE` arm, so a title that draws immediately after
 /// `CreateWindowExW` — before it ever reaches its message pump — sees a
 /// zeroed layout and refuses to paint.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MenuItem {
     pub id: u32,
     pub kind: u32,
@@ -1049,6 +1099,8 @@ impl Dispatcher for NullDispatcher {
 /// code, patched imports, and exports registered in `dynamic_exports`.
 #[derive(Debug, Clone)]
 pub struct LoadedModule {
+    /// LOAD_LIBRARY_AS_DATAFILE: resources only, never exports or callbacks.
+    pub data_file: bool,
     /// Native import edges; lifetime follows reachability from explicit loads.
     pub dependencies: Vec<u32>,
     pub attached: bool,
@@ -1169,6 +1221,7 @@ pub struct KernelState {
     pub framebuffer: framebuffer::deferred::DeferredFramebuffer,
     /// Tracked GDI objects (DCs, bitmaps, brushes, pens, fonts).
     pub gdi: GdiState,
+    pub ce: ce::State,
     /// Flat resource table for `FindResourceW` / `LoadResource`.
     pub resources: Vec<ResourceEntry>,
     /// Image base for resource RVA → VA conversion.
@@ -1755,6 +1808,48 @@ impl KernelState {
         }
     }
 
+    /// Explorer and Control Panel use one device registry across processes.
+    /// Apply changed settings at input polling boundaries, without repeatedly
+    /// overwriting volume or SIP changes made through an application's APIs.
+    pub fn sync_ce_settings(&mut self) {
+        if self.ce.version.is_none() {
+            return;
+        }
+        let number = |key: &str, name: &str, fallback: u32| match self.registry.value(key, name) {
+            Some(crate::registry::RegistryValue::Dword(value)) => value,
+            _ => fallback,
+        };
+        self.controls.double_click_time_ms =
+            u64::from(number(r"HKCU\ControlPanel\Pen", "DoubleTapTimeout", 500).clamp(1, 5000));
+        self.ce.settings.key_repeat_delay_ms =
+            u64::from(number(r"HKCU\ControlPanel\Keyboard", "InitialDelay", 400).clamp(100, 2000));
+        self.ce.settings.key_repeat_interval_ms =
+            u64::from(number(r"HKCU\ControlPanel\Keyboard", "RepeatRate", 33).clamp(10, 1000));
+        let audio = (
+            number(r"HKCU\ControlPanel\Volume", "Volume", u32::MAX),
+            number(r"HKCU\ControlPanel\Volume", "Mute", 2) & 2 != 0,
+        );
+        if self.ce.settings.audio != Some(audio) {
+            self.audio
+                .set_wave_volume(0, if audio.1 { audio.0 } else { 0 });
+            self.ce.settings.audio = Some(audio);
+        }
+        if let Some(crate::registry::RegistryValue::Dword(visible)) =
+            self.registry.value(r"HKCU\ControlPanel\SIP", "Visible")
+        {
+            let visible = visible != 0;
+            if self.ce.settings.sip_visible != Some(visible) {
+                self.ce.settings.sip_visible = Some(visible);
+                self.shell_keyboard.sip = true;
+                self.shell_keyboard.requested = visible;
+                if !visible && self.shell_keyboard.visible {
+                    self.shell_keyboard.visible = false;
+                    self.invalidate_presentation();
+                }
+            }
+        }
+    }
+
     pub fn take_process_launch(&mut self) -> Option<ProcessLaunch> {
         if self.pending_process_launch.is_some() {
             return self.pending_process_launch.take();
@@ -1810,6 +1905,7 @@ impl KernelState {
         })
     }
     pub fn reclaim_finished_stacks(&mut self, cpu: &mut dyn Cpu) -> Result<(), KernelError> {
+        self.reclaim_finished_windows();
         self.reclaim_finished_tls();
         // An interrupted guest enumeration owns its scratch buffer. Retire it
         // with its thread even if other threads keep the process alive.
@@ -2116,7 +2212,12 @@ impl KernelState {
         &mut self,
     ) -> Result<std::borrow::Cow<'_, Framebuffer>, String> {
         if (!self.shell_keyboard.sip || !self.shell_keyboard.visible)
-            && self.gdi.shell_menus.tracking.is_none()
+            && self.gdi.shell_menus.active_handle().is_none()
+            && !self
+                .gdi
+                .image_drag
+                .as_ref()
+                .is_some_and(|drag| drag.visible)
         {
             return Ok(std::borrow::Cow::Borrowed(
                 self.framebuffer.presentation_cpu()?,
@@ -2125,9 +2226,9 @@ impl KernelState {
         let mut frame = self.framebuffer.presentation_cpu()?.clone();
         // Native GDI/SIP overlays use guest coordinates and take precedence.
         frame.clear_render_presentation();
-        if self.gdi.shell_menus.tracking.is_some() {
+        if let Some(menu_bar) = self.gdi.shell_menus.active_handle() {
             self.gdi.shell_menus.render(
-                shell_menu::TRACKING_HANDLE,
+                menu_bar,
                 &mut gdi::Surface::Screen(&mut frame),
                 &self.gdi,
                 &self.menu_items,
@@ -2136,6 +2237,33 @@ impl KernelState {
         }
         self.shell_keyboard
             .render(&mut gdi::Surface::Screen(&mut frame));
+        if let Some(drag) = self.gdi.image_drag.as_ref().filter(|drag| drag.visible) {
+            let origin = if drag.window == 0 {
+                (0, 0)
+            } else {
+                self.native_window_screen_rect(drag.window)
+                    .map(|r| (r.0, r.1))
+                    .or_else(|| self.controls.screen_rect(drag.window).map(|r| (r.0, r.1)))
+                    .unwrap_or_default()
+            };
+            let x = origin
+                .0
+                .saturating_add(drag.position.0)
+                .saturating_sub(drag.hotspot.0);
+            let y = origin
+                .1
+                .saturating_add(drag.position.1)
+                .saturating_sub(drag.hotspot.1);
+            let clip = [0, 0, frame.width as i32, frame.height as i32];
+            drag.image.draw(
+                &mut gdi::Surface::Screen(&mut frame),
+                x,
+                y,
+                drag.image.width,
+                drag.image.height,
+                clip,
+            );
+        }
         Ok(std::borrow::Cow::Owned(frame))
     }
 
@@ -2230,6 +2358,9 @@ impl KernelState {
             let r = self.window_rects.get(&hwnd)?;
             x = x.saturating_add(r.0);
             y = y.saturating_add(r.1);
+            let inset = self.window_metrics(hwnd).insets();
+            x = x.saturating_add(inset[0]);
+            y = y.saturating_add(inset[1]);
             if !self
                 .window_styles
                 .get(&hwnd)
@@ -2252,6 +2383,21 @@ impl KernelState {
             .filter_map(|&h| self.window_client_origin(h).map(|p| (h, p)))
             .collect();
         self.controls.set_native_origins(origins);
+        let bar_bounds: Vec<_> = self
+            .gdi
+            .shell_menus
+            .bars
+            .iter()
+            .filter(|(_, bar)| bar.bounds.is_some())
+            .filter_map(|(&h, _)| {
+                self.controls
+                    .screen_rect(h)
+                    .map(|(x, y, w, t)| (h, [x, y, x + w, y + t]))
+            })
+            .collect();
+        for (h, bounds) in bar_bounds {
+            self.gdi.shell_menus.bars.get_mut(&h).unwrap().bounds = Some(bounds);
+        }
         let hidden = self
             .controls
             .window_handles()
@@ -2273,7 +2419,8 @@ impl KernelState {
 
     fn composite_window_layers(&mut self, present_windows: bool) {
         self.refresh_control_visibility();
-        if !present_windows
+        if !self.ce.windows.enabled
+            && !present_windows
             && self.controls.is_empty()
             && self.modal.is_none()
             && self.active_shell_bar().is_none()
@@ -2338,6 +2485,7 @@ impl KernelState {
                 .hash(&mut hash);
             c.list_items.hash(&mut hash);
             c.list_images.hash(&mut hash);
+            c.list_states.hash(&mut hash);
             c.list_image_lists.hash(&mut hash);
             c.list_positions.hash(&mut hash);
             let stamp = hash.finish();
@@ -2447,6 +2595,10 @@ impl KernelState {
         }
         self.controls
             .layout_choice_popups(self.framebuffer.height as i32);
+        if self.ce.windows.enabled {
+            self.composite_classic_windows();
+            return;
+        }
         let frame_counter = self.framebuffer.frame_counter;
         let controls = self.controls.clone();
         let modal = self.modal.clone();
@@ -2647,7 +2799,12 @@ impl KernelState {
     /// is compared, case-insensitively.
     pub fn module_by_name(&self, name: &str) -> Option<&LoadedModule> {
         let key = module_file_name(name);
-        self.modules.iter().find(|m| m.name == key)
+        self.modules.iter().find(|m| !m.data_file && m.name == key)
+    }
+
+    pub fn data_file_module_by_name(&self, name: &str) -> Option<&LoadedModule> {
+        let key = module_file_name(name);
+        self.modules.iter().find(|m| m.data_file && m.name == key)
     }
 
     /// Resources and image base to search for a given `hModule`.
@@ -3839,6 +3996,14 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
                 .entry(NOTE_PRJ_MODULE_HANDLE)
                 .or_insert_with(HashMap::new)
                 .insert(name, thunk.thunk_va);
+        } else if let Some((_, handle)) = ce::CPL_MODULES
+            .iter()
+            .find(|(dll, _)| thunk.dll.eq_ignore_ascii_case(dll))
+        {
+            exports
+                .entry(*handle)
+                .or_insert_with(HashMap::new)
+                .insert(name, thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("ole32.dll") {
             ole32.insert(name.clone(), thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("libegl.dll") {
@@ -4148,6 +4313,7 @@ impl Process {
             "ws2.dll",
             "wininet.dll",
             "note_prj.dll",
+            "cplmain.cpl",
         ] {
             dynamic_exports_to_add.extend(
                 dispatcher
@@ -4405,6 +4571,7 @@ impl Process {
                 random_seed: 0x1234_abcd,
                 framebuffer: framebuffer::deferred::DeferredFramebuffer::default(),
                 gdi: GdiState::new(),
+                ce: ce::State::default(),
                 resources,
                 image_base: img_base,
                 image_size: img_size,
@@ -5385,6 +5552,7 @@ pub fn run_main_loop_with_hook(
             if due || input_due {
                 last_frontend_poll = Some(now);
                 process.state.sync_backlight();
+                process.state.sync_ce_settings();
                 process.state.sync_power_notifications();
                 let action = hook.on_frame(&mut process.state);
                 last_presented_frame = process.state.framebuffer.frame_counter;
@@ -5621,6 +5789,7 @@ mod tests {
                 menu: 0,
                 sip: true,
                 background: 0xf800,
+                bounds: None,
             },
         );
         assert!(k.controls.is_empty());

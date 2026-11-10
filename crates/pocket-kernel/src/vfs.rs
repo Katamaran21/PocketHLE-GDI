@@ -259,6 +259,13 @@ struct Mount {
     fallback_files: RefCell<Option<Vec<PathBuf>>>,
 }
 
+/// A child inherits the exact namespace, including read-only and private
+/// overlays. Open descriptions and quotas travel separately through VfsShared.
+#[derive(Debug, Clone)]
+pub struct VfsNamespace {
+    mounts: Vec<Mount>,
+}
+
 /// The Gizmondo registration service device exposed as `REG1:`.
 const REGISTRATION_SERVICE_DEVICE: &str = "reg1:";
 
@@ -709,6 +716,13 @@ impl Vfs {
         self.mount_with_options(guest_prefix, host_dir, true);
     }
 
+    /// A CE system image has exact device paths, rather than archive resource
+    /// aliases. Explorer must not find a missing file elsewhere by basename.
+    pub fn mount_read_only_filesystem(&mut self, guest_prefix: &str, host_dir: impl Into<PathBuf>) {
+        self.mount_read_only(guest_prefix, host_dir);
+        self.mounts.last_mut().unwrap().resource_fallback = false;
+    }
+
     pub fn mount_save_dir(&mut self, guest_prefix: &str, host_dir: impl Into<PathBuf>) {
         let host_dir = host_dir.into();
         if let Err(error) = std::fs::create_dir_all(&host_dir) {
@@ -908,6 +922,16 @@ impl Vfs {
             .iter()
             .map(|m| (m.prefix.clone(), m.host_dir.clone()))
             .collect()
+    }
+
+    pub fn namespace_snapshot(&self) -> VfsNamespace {
+        VfsNamespace {
+            mounts: self.mounts.clone(),
+        }
+    }
+
+    pub fn inherit_namespace(&mut self, namespace: &VfsNamespace) {
+        self.mounts.clone_from(&namespace.mounts);
     }
 
     fn normalise_guest_path(&self, guest_path: &str) -> String {
@@ -3138,6 +3162,9 @@ mod tests {
     #[test]
     fn device_paths_do_not_fall_back_to_basename_files() {
         let dir = tempfile::tempdir().unwrap();
+        // ':' cannot occur in a Windows host filename; the guest device
+        // refusal still applies there without a colon-named fallback fixture.
+        #[cfg(not(windows))]
         std::fs::write(dir.path().join("ACS1:"), b"not a device").unwrap();
         let mut v = Vfs::new();
         v.mount("\\Application\\", dir.path());

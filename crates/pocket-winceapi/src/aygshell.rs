@@ -400,6 +400,7 @@ fn sh_create_menu_bar(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     ctx.kernel.gdi.shell_menus.bars.insert(
         hwnd,
         pocket_kernel::shell_menu::Bar {
+            bounds: None,
             owner: parent,
             menu,
             sip: flags & 8 == 0 && !ctx.kernel.gdi.shell_menus.sip_button_hidden,

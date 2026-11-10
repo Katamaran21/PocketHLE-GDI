@@ -582,6 +582,10 @@ impl GameEntry {
 /// Runtime settings stored per game.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameSettings {
+    /// Optional classic CE desktop session, shared by the Windows GUI runner
+    /// and its children. Ordinary PocketPC games retain their current profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_ce: Option<WindowsCeSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_heap: Option<bool>,
     /// Optional Gizmondo SD Card/Storage Card host directory for both frontends.
@@ -787,6 +791,7 @@ impl GameSettings {
 impl Default for GameSettings {
     fn default() -> Self {
         Self {
+            windows_ce: None,
             executable_heap: None,
             storage_card_dir: None,
             frame_rate_limit: None,
@@ -810,6 +815,31 @@ impl Default for GameSettings {
             screen: ScreenPref::default(),
             rotation: RotationPref::default(),
             dpad_deadzone: DpadDeadzone::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowsCeSettings {
+    pub profile_name: String,
+    pub image_root: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
+    /// Guest directory under which the supplied EXE and its siblings appear.
+    pub app_prefix: String,
+    pub command_line: String,
+    pub classic_windows: bool,
+}
+
+impl Default for WindowsCeSettings {
+    fn default() -> Self {
+        Self {
+            profile_name: String::new(),
+            image_root: None,
+            data_dir: None,
+            app_prefix: "\\Application\\".into(),
+            command_line: String::new(),
+            classic_windows: true,
         }
     }
 }

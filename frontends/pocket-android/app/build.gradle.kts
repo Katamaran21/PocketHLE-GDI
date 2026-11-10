@@ -25,10 +25,10 @@ android {
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
-        applicationId = "com.pockethle.app"
+        applicationId = "com.pockethle.gdi"
         minSdk = 24
         targetSdk = 34
-        versionCode = 19
+        versionCode = 20
         versionName = pocketReleaseVersion
         buildConfigField("String", "UPDATE_VERSION", "\"$pocketReleaseVersion\"")
 

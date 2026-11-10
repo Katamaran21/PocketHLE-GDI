@@ -41,6 +41,7 @@ struct Domain {
     held_start: HashSet<u32>,
     entries: HashMap<(u32, u32), Option<HandleObject>>,
     names: HashMap<String, HandleObject>,
+    clipboard_formats: HashMap<String, u32>,
     next: u32,
     next_pid: u32,
     active: HashSet<u32>,
@@ -84,6 +85,19 @@ impl Default for HandleTable {
 impl HandleTable {
     pub fn process_id(&self) -> u32 {
         self.pid
+    }
+    pub fn register_clipboard_format(&self, name: &str) -> Option<u32> {
+        let name = name.to_lowercase();
+        let mut domain = self.domain.lock().unwrap();
+        if let Some(&id) = domain.clipboard_formats.get(&name) {
+            return Some(id);
+        }
+        let id = 0xc000 + domain.clipboard_formats.len() as u32;
+        if id > 0xffff {
+            return None;
+        }
+        domain.clipboard_formats.insert(name, id);
+        Some(id)
     }
     pub fn execution_gate(&self) -> Arc<Mutex<()>> {
         self.domain.lock().unwrap().api_gate.clone()

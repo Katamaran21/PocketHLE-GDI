@@ -889,9 +889,10 @@ PROCESS_ATTACH callback. HLE imports retain their existing hooks; native
 imports bind directly to relocated guest exports, by name or ordinal. Resolve
 new dependencies beside the importing DLL first (case-insensitive filename),
 then through the existing module search. Publish exports before traversing
-imports so cycles bind without allocating duplicate copies. Native forwarder
-exports remain rejected by prepare_runtime_module; static EXE import loading
-is not added by this runtime loader. Image page commitment follows §19.
+imports so cycles bind without allocating duplicate copies. Forwarder exports
+resolve through the complete native/HLE graph by name or ordinal, with bounded
+recursion and cycle detection. Invalid targets fail transactionally; static EXE
+import loading is not added by this runtime loader. Image page commitment follows §19.
 
 LoadedModule.dependencies stores unique native import edges. Its refcount
 counts explicit LoadLibrary references, not imported edges. A dependency first
@@ -1044,8 +1045,10 @@ exit signals the appropriate object and releases stacks/TLS/abandoned mutexes.
 A child may outlive its parent: drop the parent's emulator before joining
 children, while shared handles/RAM remain alive through child references.
 
-The desktop session shares stop/input but only its foreground process submits
-frames. All process jobs must finish before completing the session. API state
+The desktop session shares stop/input. Ordinary game sessions publish from the
+foreground process; opt-in CE desktop sessions compose immutable captures from
+all visible processes through pocket-core::ce_desktop. All process jobs must
+finish before completing the session. API state
 is per process; thread-local multimedia stays on the owning host thread.
 ARM v7 verifies all 132 RAM checks plus the separate process/orphan reports in
 three exit variants; the real desktop runner executes the same process probes.

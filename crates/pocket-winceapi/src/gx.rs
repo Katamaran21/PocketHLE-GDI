@@ -555,6 +555,7 @@ pub(crate) mod tests {
             pending_startup: std::collections::VecDeque::new(),
             framebuffer: pocket_kernel::framebuffer::deferred::DeferredFramebuffer::default(),
             gdi: GdiState::new(),
+            ce: pocket_kernel::ce::State::default(),
             resources: vec![],
             image_base: 0,
             image_size: 0,

@@ -34,6 +34,8 @@ pub enum ControlClass {
     Progress,
     Tab,
     Toolbar,
+    Rebar,
+    StatusBar,
     ScrollBar,
 }
 
@@ -59,6 +61,12 @@ impl ControlClass {
             Some(Self::TrackBar)
         } else if name.eq_ignore_ascii_case("ToolbarWindow32") {
             Some(Self::Toolbar)
+        } else if name.eq_ignore_ascii_case("ReBarWindow32") {
+            Some(Self::Rebar)
+        } else if name.eq_ignore_ascii_case("msctls_statusbar32")
+            || name.eq_ignore_ascii_case("msctls_statusbar")
+        {
+            Some(Self::StatusBar)
         } else if name.eq_ignore_ascii_case("SCROLLBAR") {
             Some(Self::ScrollBar)
         } else if name.eq_ignore_ascii_case("SysTabControl32") {
@@ -262,7 +270,7 @@ impl DialogPanel {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
 
-    fn render(&self, surf: &mut Surface<'_>) {
+    pub(crate) fn render(&self, surf: &mut Surface<'_>) {
         if !self.visible || self.w <= 0 || self.h <= 0 {
             return;
         }
@@ -405,6 +413,9 @@ pub struct ChildWindow {
     pub checked: bool,
     pub list_items: Vec<(String, u32)>,
     pub list_images: Vec<i32>,
+    pub list_states: Vec<u32>,
+    pub list_text_callbacks: Vec<bool>,
+    pub list_image_callbacks: Vec<bool>,
     pub list_image_lists: [u32; 3],
     pub list_image_sizes: [(u32, u32); 3],
     /// Cached selected-font cell height, shared by row layout and hit testing.
@@ -431,6 +442,7 @@ pub struct ChildWindow {
     pub track_tick_freq: u32,
     pub track_ticks: Vec<i32>,
     pub toolbar: ToolbarState,
+    pub status_bar: crate::StatusBar,
     pub tab: TabState,
 }
 
@@ -490,6 +502,9 @@ pub struct ToolbarState {
     pub bitmaps: Vec<(u32, u32)>,
     pub native_paint: bool,
     pub pressed: Option<usize>,
+    pub strings: Vec<Vec<u16>>,
+    pub tooltips: Vec<Vec<u16>>,
+    pub owned_bitmaps: std::collections::HashSet<u32>,
 }
 impl Default for ToolbarState {
     fn default() -> Self {
@@ -500,8 +515,24 @@ impl Default for ToolbarState {
             bitmaps: Vec::new(),
             native_paint: false,
             pressed: None,
+            strings: Vec::new(),
+            tooltips: Vec::new(),
+            owned_bitmaps: Default::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RebarBand {
+    pub info: [u32; 19],
+    pub text: Vec<u16>,
+    pub rect: [i32; 4],
+}
+#[derive(Debug, Default)]
+pub struct RebarState {
+    pub bands: Vec<RebarBand>,
+    pub notification: u32,
+    pub command_bands: bool,
 }
 const LIST_VIEW_ROW_HEIGHT: i32 = 14;
 
@@ -647,6 +678,29 @@ impl ChildWindow {
             .and_then(|cells| cells.get(&column))
             .map_or("", String::as_str)
     }
+    pub fn list_item_state(&self, index: usize) -> u32 {
+        (self.list_states.get(index).copied().unwrap_or(0) & !3)
+            | if self.list_selected == Some(index) {
+                3
+            } else {
+                0
+            }
+    }
+    pub fn set_list_item_state(&mut self, index: usize, state: u32, mask: u32) -> bool {
+        if index >= self.list_items.len() {
+            return false;
+        }
+        self.list_states.resize(self.list_items.len(), 0);
+        self.list_states[index] = (self.list_states[index] & !mask) | (state & mask);
+        if mask & 2 != 0 {
+            if state & 2 != 0 {
+                self.list_selected = Some(index);
+            } else if self.list_selected == Some(index) {
+                self.list_selected = None;
+            }
+        }
+        true
+    }
     pub fn set_list_text(&mut self, row: usize, column: u32, text: String) -> bool {
         let Some(item) = self.list_items.get_mut(row) else {
             return false;
@@ -752,7 +806,7 @@ impl ChildWindow {
                 self.list_images
                     .get(index)
                     .and_then(|i| usize::try_from(*i).ok())
-                    .and_then(|i| l.images.get(i))
+                    .and_then(|i| l.image(i, self.list_item_state(index)))
             }) {
                 image.draw(
                     surf,
@@ -837,6 +891,7 @@ impl ChildWindow {
             let mut item = self.clone();
             item.list_items = self.list_items.get(index).cloned().into_iter().collect();
             item.list_images = self.list_images.get(index).copied().into_iter().collect();
+            item.list_states = self.list_states.get(index).copied().into_iter().collect();
             item.list_subitems = self.list_subitems.get(index).cloned().into_iter().collect();
             item.style |= 0x4000; // The header belongs to the full control paint.
             item.list_selected = (self.list_selected == Some(index)).then_some(0);
@@ -905,7 +960,7 @@ impl ChildWindow {
                 self.list_images
                     .get(index)
                     .and_then(|i| usize::try_from(*i).ok())
-                    .and_then(|i| l.images.get(i))
+                    .and_then(|i| l.image(i, self.list_item_state(index)))
             }) {
                 image.draw(
                     surf,
@@ -1165,6 +1220,14 @@ impl ChildWindow {
                     (Self::LIGHT, Self::SHADOW)
                 };
                 draw_edge(surf, x, self.y, width, self.toolbar.button_size.1, tl, br);
+                if b[1] == 0xf060 {
+                    crate::windowing::draw_frame_control(
+                        surf,
+                        [x, self.y, x + width, self.y + self.toolbar.button_size.1],
+                        1,
+                        if pressed { 0x200 } else { 0 },
+                    );
+                }
                 let mut index = b[0];
                 for &(handle, count) in &self.toolbar.bitmaps {
                     if index >= count {
@@ -1583,6 +1646,14 @@ impl ChildWindow {
         match self.class {
             ControlClass::Tab => self.render_tabs(surf),
             ControlClass::Toolbar => self.render_toolbar(surf, gdi),
+            ControlClass::Rebar => surf.fill_rect(self.x, self.y, self.w, self.h, Self::FACE),
+            ControlClass::StatusBar => self.status_bar.render_at(
+                surf,
+                (self.x, self.y, self.w, self.h),
+                face.as_ref(),
+                self.background_color
+                    .map(crate::framebuffer::colorref_to_rgb565),
+            ),
             ControlClass::ScrollBar => self.render_scrollbar(surf),
             ControlClass::TrackBar => self.render_track(surf, focused),
             ControlClass::Progress => self.render_progress(surf),
@@ -2007,6 +2078,9 @@ pub struct FileDialog {
     pub directory: String,
     pub entries: Vec<(String, bool)>,
     pub filters: Vec<String>,
+    pub filter_choices: Vec<(String, Vec<String>)>,
+    pub filter_combo: u32,
+    pub image_list: u32,
     pub extension: String,
     pub flags: u32,
     pub save: bool,
@@ -2020,6 +2094,8 @@ pub struct FileDialog {
 /// Every built-in control the guest has created, plus the focus.
 #[derive(Debug, Clone)]
 pub struct Controls {
+    /// CE Control Panel's double-tap timeout, shared with GetDoubleClickTime.
+    pub double_click_time_ms: u64,
     /// Latest consumed stylus position in screen coordinates.
     pub cursor_position: (i32, i32),
     /// Guest cursor selected by SetCursor. Zero means no selected cursor.
@@ -2055,11 +2131,14 @@ pub struct Controls {
     /// here: releasing outside the button cancels the click instead of
     /// notifying the parent.
     capture: u32,
+    /// A single stylus can double-click a list item across two release edges.
+    last_list_click: Option<(u32, usize, i32, i32, std::time::Instant)>,
 }
 
 impl Default for Controls {
     fn default() -> Self {
         Self {
+            double_click_time_ms: 500,
             cursor_position: (0, 0),
             cursor_handle: 0,
             ime_open_contexts: Default::default(),
@@ -2079,6 +2158,7 @@ impl Default for Controls {
             direct_surface_hwnd: 0,
             next_hwnd: Self::HWND_BASE,
             capture: 0,
+            last_list_click: None,
         }
     }
 }
@@ -2137,6 +2217,9 @@ impl Controls {
             checked: false,
             list_items: Vec::new(),
             list_images: Vec::new(),
+            list_states: Vec::new(),
+            list_text_callbacks: Vec::new(),
+            list_image_callbacks: Vec::new(),
             list_image_lists: [0; 3],
             list_image_sizes: [(0, 0); 3],
             list_font_height: 0,
@@ -2166,6 +2249,11 @@ impl Controls {
             track_tick_freq: 1,
             track_ticks: Vec::new(),
             toolbar: ToolbarState::default(),
+            status_bar: crate::StatusBar {
+                parent,
+                height: h,
+                ..Default::default()
+            },
             tab: TabState::default(),
         });
         hwnd
@@ -2300,7 +2388,15 @@ impl Controls {
     pub fn screen_rect(&self, hwnd: u32) -> Option<(i32, i32, i32, i32)> {
         let child = self.get(hwnd)?;
         let (ox, oy) = self.parent_origin(child.parent);
-        Some((child.x + ox, child.y + oy, child.w, child.h))
+        // Explorer uses GetWindowRect to set its address band's cyMinChild.
+        // The combobox creation height includes the drop-down list; its
+        // window rectangle reports only the closed field on Windows CE.
+        let height = if child.class == ControlClass::ComboBox {
+            child.choice_closed_height()
+        } else {
+            child.h
+        };
+        Some((child.x + ox, child.y + oy, child.w, height))
     }
 
     pub fn get(&self, hwnd: u32) -> Option<&ChildWindow> {
@@ -2367,6 +2463,9 @@ impl Controls {
 
     /// Drop a control and anything that referred to it.
     pub fn destroy(&mut self, hwnd: u32) {
+        if self.last_list_click.is_some_and(|click| click.0 == hwnd) {
+            self.last_list_click = None;
+        }
         self.recognized_holds
             .retain(|(_, owner, _, _)| *owner != hwnd);
         self.pointer_capture.retain(|_, owner| *owner != hwnd);
@@ -2509,7 +2608,18 @@ impl Controls {
 
     /// Stylus down. Takes the focus, and arms a push button.
     pub fn pointer_down(&mut self, x: i32, y: i32) -> Option<ControlAction> {
-        let hwnd = self.hit_test(x, y)?;
+        let hit = self.hit_test(x, y);
+        let same_item = self.last_list_click.is_some_and(|(owner, index, _, _, _)| {
+            hit == Some(owner)
+                && self.get(owner).is_some_and(|c| {
+                    let (ox, oy) = self.parent_origin(c.parent);
+                    c.enabled && c.list_item_at_point(x - ox - c.x, y - oy - c.y) == Some(index)
+                })
+        });
+        if !same_item {
+            self.last_list_click = None;
+        }
+        let hwnd = hit?;
         let origin = self
             .get(hwnd)
             .map(|c| self.parent_origin(c.parent))
@@ -2635,17 +2745,37 @@ impl Controls {
         if let Some(c) = self.get(hwnd).filter(|c| c.class == ControlClass::ListView) {
             let (ox, oy) = self.parent_origin(c.parent);
             let row = c.list_item_at_point(x - ox - c.x, y - oy - c.y);
-            let action = match row {
+            let click = match row {
                 Some(index) if c.enabled && c.list_selected == Some(index) => {
-                    ControlAction::Notify {
-                        parent: c.parent,
-                        id: c.id,
-                        hwnd,
-                        code: (-2i32) as u32,
-                        index: index as i32,
-                    }
+                    Some((index, c.parent, c.id))
                 }
-                _ => ControlAction::Consumed,
+                _ => None,
+            };
+            let previous = self.last_list_click.take();
+            let action = if let Some((index, parent, id)) = click {
+                let now = std::time::Instant::now();
+                // Portable Explorer opens folders on NM_DBLCLK, while NM_CLICK
+                // only selects. Frontends supply raw down/up edges to both.
+                let double = previous.is_some_and(|(owner, row, px, py, at)| {
+                    owner == hwnd
+                        && row == index
+                        && x.abs_diff(px) <= 4
+                        && y.abs_diff(py) <= 4
+                        && now.duration_since(at)
+                            <= std::time::Duration::from_millis(self.double_click_time_ms)
+                });
+                if !double {
+                    self.last_list_click = Some((hwnd, index, x, y, now));
+                }
+                ControlAction::Notify {
+                    parent,
+                    id,
+                    hwnd,
+                    code: (if double { -3i32 } else { -2i32 }) as u32,
+                    index: index as i32,
+                }
+            } else {
+                ControlAction::Consumed
             };
             self.capture = 0;
             return Some(action);
@@ -2725,6 +2855,7 @@ impl Controls {
         if let Some(panel) = self.panel_mut(parent) {
             if panel.ok_box_contains(x, y) {
                 panel.ok_pressed = true;
+                self.last_list_click = None;
                 return Some(ControlAction::Consumed);
             }
         }
@@ -2732,7 +2863,10 @@ impl Controls {
             Some(hwnd) if self.get(hwnd).map(|c| c.parent) == Some(parent) => {
                 self.pointer_down(x, y)
             }
-            _ => Some(ControlAction::Consumed),
+            _ => {
+                self.last_list_click = None;
+                Some(ControlAction::Consumed)
+            }
         }
     }
 
@@ -2778,6 +2912,7 @@ impl Controls {
 
     /// [`Self::key_down`] restricted to the children of `parent`.
     pub fn key_down_in(&mut self, parent: u32, vk: u16) -> Option<ControlAction> {
+        self.last_list_click = None;
         // Dialog-manager keys apply even when WM_INITDIALOG left no child
         // focused. Never borrow a default button from the window underneath.
         if vk == 0x1B {
@@ -2810,6 +2945,12 @@ impl Controls {
             return Some(ControlAction::Consumed);
         }
         if vk == 0x0D {
+            if self
+                .get(self.focus)
+                .is_some_and(|c| c.parent == parent && c.class == ControlClass::ListView)
+            {
+                return self.key_down(vk);
+            }
             let focused = self.get(self.focus).filter(|c| {
                 c.parent == parent
                     && self.is_showing(c)
@@ -2856,6 +2997,7 @@ impl Controls {
         const VK_RETURN: u16 = 0x0D;
         const VK_SPACE: u16 = 0x20;
 
+        self.last_list_click = None;
         let focus = self.focus;
         if !self.get(focus).is_some_and(|c| self.is_showing(c)) {
             return None;
@@ -2933,6 +3075,15 @@ impl Controls {
                     hwnd: child.hwnd,
                     code: 1,
                     index: next as i32,
+                })
+            }
+            ControlClass::ListView if vk == 0x0d => {
+                child.list_selected.map(|index| ControlAction::Notify {
+                    parent: child.parent,
+                    id: child.id,
+                    hwnd: child.hwnd,
+                    code: (-4i32) as u32,
+                    index: index as i32,
                 })
             }
             ControlClass::ListView if matches!(vk, 0x25..=0x28) => {
@@ -3066,6 +3217,45 @@ impl Controls {
             self.render_children_of(surf, |parent| parent == panel.hwnd, gdi, layer);
             self.render_open_choices(surf, |parent| parent == panel.hwnd, gdi);
         }
+    }
+
+    /// Classic CE top-level windows are composited separately in native z order.
+    pub fn render_owner_with_images(
+        &self,
+        owner: u32,
+        surface: &mut Surface<'_>,
+        gdi: &crate::gdi::GdiState,
+        mut layer: impl FnMut(u32, &mut Surface<'_>),
+    ) {
+        self.render_children_of(surface, |parent| parent == owner, Some(gdi), &mut layer);
+        self.render_open_choices(surface, |parent| parent == owner, Some(gdi));
+    }
+
+    pub fn render_owner_tree_with_images(
+        &self,
+        owner: u32,
+        surface: &mut Surface<'_>,
+        gdi: &crate::gdi::GdiState,
+        mut layer: impl FnMut(u32, &mut Surface<'_>),
+    ) {
+        fn tree(
+            controls: &Controls,
+            owner: u32,
+            surface: &mut Surface<'_>,
+            gdi: &crate::gdi::GdiState,
+            layer: &mut impl FnMut(u32, &mut Surface<'_>),
+            depth: usize,
+        ) {
+            if depth > 64 {
+                return;
+            }
+            controls.render_children_of(surface, |p| p == owner, Some(gdi), &mut |h, s| {
+                layer(h, s);
+                tree(controls, h, s, gdi, layer, depth + 1);
+            });
+            controls.render_open_choices(surface, |p| p == owner, Some(gdi));
+        }
+        tree(self, owner, surface, gdi, &mut layer, 0);
     }
 
     fn render_open_choices(
@@ -3908,6 +4098,61 @@ mod tests {
         assert_eq!(controls.pointer_up(12, 1), Some(ControlAction::Consumed));
         controls.pointer_down(12, header + 1);
         assert_eq!(controls.pointer_up(12, 59), Some(ControlAction::Consumed));
+    }
+
+    #[test]
+    fn list_activation_requires_two_matching_clicks_or_enter() {
+        let mut controls = Controls::default();
+        let list = controls.create(
+            PARENT,
+            ControlClass::ListView,
+            7,
+            String::new(),
+            WS_VISIBLE | 1,
+            0,
+            0,
+            120,
+            100,
+        );
+        controls.get_mut(list).unwrap().list_items =
+            vec![("Folder".into(), 11), ("File".into(), 22)];
+        button(&mut controls, 8, 160, 0);
+        let tap = |controls: &mut Controls, x, y| {
+            controls.pointer_down(x, y);
+            controls.pointer_up(x, y)
+        };
+        let notification = |index, code| {
+            Some(ControlAction::Notify {
+                parent: PARENT,
+                id: 7,
+                hwnd: list,
+                index,
+                code: code as u32,
+            })
+        };
+        assert_eq!(tap(&mut controls, 10, 8), notification(0, -2i32));
+        assert_eq!(tap(&mut controls, 10, 8), notification(0, -3i32));
+        assert_eq!(tap(&mut controls, 10, 8), notification(0, -2i32));
+        tap(&mut controls, 170, 8);
+        assert_eq!(tap(&mut controls, 10, 8), notification(0, -2i32));
+        let second_y = controls.get(list).unwrap().list_row_height() + 8;
+        assert_eq!(tap(&mut controls, 10, second_y), notification(1, -2i32));
+        assert_eq!(tap(&mut controls, 10, second_y), notification(1, -3i32));
+        assert_eq!(tap(&mut controls, 10, second_y), notification(1, -2i32));
+        tap(&mut controls, 350, 140);
+        assert_eq!(tap(&mut controls, 10, second_y), notification(1, -2i32));
+        controls.last_list_click.as_mut().unwrap().4 =
+            std::time::Instant::now() - std::time::Duration::from_millis(600);
+        assert_eq!(tap(&mut controls, 10, second_y), notification(1, -2i32));
+        assert_eq!(tap(&mut controls, 16, second_y), notification(1, -2i32));
+        assert_eq!(controls.key_down(13), notification(1, -4i32));
+        assert_eq!(controls.key_down_in(PARENT, 13), notification(1, -4i32));
+        assert_eq!(tap(&mut controls, 16, second_y), notification(1, -2i32));
+        controls.pointer_down(10, 8);
+        assert_eq!(controls.pointer_up(10, 90), Some(ControlAction::Consumed));
+        assert_eq!(tap(&mut controls, 10, 8), notification(0, -2i32));
+        controls.destroy(list);
+        assert!(controls.last_list_click.is_none());
     }
 
     #[test]

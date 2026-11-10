@@ -29,6 +29,8 @@ pub enum RegistryValue {
     Dword(u32),
     /// `REG_BINARY`.
     Binary(Vec<u8>),
+    /// Other CE registry types retain their original type and wire bytes.
+    Raw { kind: u32, bytes: Vec<u8> },
 }
 
 impl RegistryValue {
@@ -38,6 +40,7 @@ impl RegistryValue {
             RegistryValue::Sz(_) => 1,
             RegistryValue::Binary(_) => 3,
             RegistryValue::Dword(_) => 4,
+            RegistryValue::Raw { kind, .. } => *kind,
         }
     }
 
@@ -51,6 +54,7 @@ impl RegistryValue {
                 .collect(),
             RegistryValue::Dword(value) => value.to_le_bytes().to_vec(),
             RegistryValue::Binary(bytes) => bytes.clone(),
+            RegistryValue::Raw { bytes, .. } => bytes.clone(),
         }
     }
 }
