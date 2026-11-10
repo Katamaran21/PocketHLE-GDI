@@ -2,29 +2,38 @@ package com.pockethle.app
 
 internal data class DisplayRect(val left: Int, val top: Int, val width: Int, val height: Int)
 
-/** Pixel-exact rectangle, shared with inverse touch mapping and GL readback. */
-internal fun displayRect(viewW: Int, viewH: Int, shownW: Int, shownH: Int, factor: Int): DisplayRect {
+/** Largest whole-image step that fits; small viewports fit proportionally. */
+internal fun displayRect(viewW: Int, viewH: Int, shownW: Int, shownH: Int): DisplayRect {
     require(shownW > 0 && shownH > 0)
-    // Auto uses the largest whole-pixel scale that fits. A viewport smaller
-    // than the native screen clips at x1; it never introduces fractional scaling.
-    val fit=minOf(viewW/shownW,viewH/shownH).coerceAtLeast(1)
-    val scale=if(factor<=0) fit else minOf(fit,factor)
-    val w=shownW*scale
-    val h=shownH*scale
+    if (shownW > viewW || shownH > viewH) return aspectDisplayRect(viewW,viewH,shownW,shownH)
+    val scale=minOf(viewW/shownW,viewH/shownH)
+    val w=shownW*scale;val h=shownH*scale
     return DisplayRect((viewW-w)/2,(viewH-h)/2,w,h)
 }
-/** VGA uses the same QVGA presentation grid: e.g. 640x480 -> 960x720 at x3.
- * This changes display size only; touch still addresses all native source pixels. */
-internal fun pocketPcDisplayRect(viewW: Int,viewH: Int,nativeW: Int,nativeH: Int,factor: Int): DisplayRect {
-    val vga=(nativeW==640 && nativeH==480) || (nativeW==480 && nativeH==640)
-    val unit=if(vga) 2 else 1
-    return displayRect(viewW,viewH,nativeW/unit,nativeH/unit,if(factor<=0) 4 else factor.coerceAtMost(4))
+
+/** PocketPC standard-aspect presentation steps use QVGA, independent of native LCD or GLES density.
+ * The produced high-density texture is sampled directly at the chosen size.
+ * Fullscreen retains aspect fit; Gizmondo retains produced-image integer fitting.
+ */
+internal fun renderedDisplayRect(viewW:Int,viewH:Int,nativeW:Int,nativeH:Int,renderW:Int,renderH:Int,turn:Int,pocketPc:Boolean=false,fullscreen:Boolean=false):DisplayRect {
+    require(nativeW>0 && nativeH>0 && renderW>0 && renderH>0)
+    val quarter=turn==90 || turn==270
+    val w=if(quarter) renderH else renderW;val h=if(quarter) renderW else renderH
+    if(fullscreen) return aspectDisplayRect(viewW,viewH,w,h)
+    val logicalW=if(quarter) nativeH else nativeW
+    val logicalH=if(quarter) nativeW else nativeH
+    val standardLandscape=logicalW.toLong()*3==logicalH.toLong()*4
+    val standardPortrait=logicalW.toLong()*4==logicalH.toLong()*3
+    val stepW=if(standardLandscape)320 else if(standardPortrait)240 else logicalW
+    val stepH=if(standardLandscape)240 else if(standardPortrait)320 else logicalH
+    return if(pocketPc) displayRect(viewW,viewH,stepW,stepH)
+        else displayRect(viewW,viewH,w,h)
 }
-internal fun displayPointToGuest(x: Float,y: Float,viewW: Int,viewH: Int,nativeW: Int,nativeH: Int,turn: Int,factor: Int,pocketPc: Boolean=false,fullscreen: Boolean=false): Pair<Int,Int>? {
-    if(viewW<=0 || viewH<=0 || nativeW<=0 || nativeH<=0) return null
+internal fun displayPointToGuest(x: Float,y: Float,viewW: Int,viewH: Int,nativeW: Int,nativeH: Int,turn: Int,pocketPc: Boolean=false,fullscreen: Boolean=false,renderW:Int=nativeW,renderH:Int=nativeH): Pair<Int,Int>? {
+    if(viewW<=0 || viewH<=0 || nativeW<=0 || nativeH<=0 || renderW<=0 || renderH<=0) return null
     val quarter=turn==90 || turn==270
     val w=if(quarter) nativeH else nativeW;val h=if(quarter) nativeW else nativeH
-    val rect=if(fullscreen) aspectDisplayRect(viewW,viewH,w,h) else if(pocketPc) pocketPcDisplayRect(viewW,viewH,w,h,factor) else displayRect(viewW,viewH,w,h,factor)
+    val rect=renderedDisplayRect(viewW,viewH,nativeW,nativeH,renderW,renderH,turn,pocketPc,fullscreen)
     val dx=x-rect.left;val dy=y-rect.top
     if(dx<0 || dy<0 || dx>=rect.width || dy>=rect.height) return null
     val px=(dx*w/rect.width).toInt().coerceIn(0,w-1);val py=(dy*h/rect.height).toInt().coerceIn(0,h-1)

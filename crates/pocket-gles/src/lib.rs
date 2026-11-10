@@ -13,10 +13,12 @@
 
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
+pub mod combiner_program;
 pub mod consts;
 pub mod context;
 pub mod fixed;
 pub mod gpu;
+pub mod graphics_diagnostic;
 pub mod lighting;
 pub mod matrix;
 pub mod ordinals;

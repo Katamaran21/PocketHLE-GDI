@@ -20,7 +20,7 @@ internal class StylusControlsDialog(
 ):Dialog(context) {
     private val testing=settings.controlsMode()=="zones"
     private val grid=StylusGridConfig.parse(settings.pocketpcStylusGridJson)
-    private val bindings=InputBindings(config)
+    private val bindings=InputBindings(config,false)
     private val fullscreen=JSONObject(config.originalJson).optString("gamepad_fullscreen").takeIf{it.isNotEmpty() && it!="null"}
     private var virtualDialog:Dialog?=null
     private var waiting:Int?=null
@@ -90,7 +90,7 @@ internal class StylusControlsDialog(
         val ratio=if(portrait) .75f else 4f/3f
         val width=minOf(available,(context.resources.displayMetrics.heightPixels*.5f*ratio).toInt())
         for(cell in 0 until grid.columns*grid.rows) {
-            val label=if(waiting==cell) "Press input…" else grid.bindings.firstOrNull{it.cell==cell}?.input?.label() ?: "${cell+1}"
+            val label=if(waiting==cell) "Press input…" else grid.bindings.firstOrNull{it.cell==cell}?.input?.let { ControllerLabels.grid(it) } ?: "${cell+1}"
             val button=Button(context).apply {
                 text=label;isAllCaps=false;textSize=10f;minWidth=0;minimumWidth=0;minHeight=0;minimumHeight=0
                 setPadding(2,2,2,2);tag=cell
@@ -107,6 +107,7 @@ internal class StylusControlsDialog(
         virtualDialog?.dismiss()
         val dialog=object:Dialog(context) {
             override fun dispatchKeyEvent(event:KeyEvent):Boolean {
+        ControllerLabels.observe(event)
                 if(event.keyCode==KeyEvent.KEYCODE_BACK || event.keyCode==KeyEvent.KEYCODE_ESCAPE) {
                     if(event.action==KeyEvent.ACTION_UP)dismiss()
                     return true
@@ -120,7 +121,7 @@ internal class StylusControlsDialog(
         val screen=FrameLayout(context).apply{id=R.id.content_column}
         val bank=PocketPcControls(context).apply{id=R.id.game_controls;configure(config, settings)}
         root.addView(screen);root.addView(bank)
-        root.setDisplaySize(if(portrait)240 else 320,if(portrait)320 else 240,4)
+        root.setDisplaySize(if(portrait)240 else 320,if(portrait)320 else 240)
         val test=if(testing)TestSurface(context) else null
         if(test!=null)screen.addView(test,FrameLayout.LayoutParams(-1,-1))
         val hint=TextView(context).apply {
@@ -164,6 +165,7 @@ internal class StylusControlsDialog(
     override fun dismiss(){virtualDialog?.dismiss();super.dismiss()}
 
     override fun dispatchKeyEvent(event:KeyEvent):Boolean {
+        ControllerLabels.observe(event)
         val down=event.action==KeyEvent.ACTION_DOWN
         if(event.keyCode==KeyEvent.KEYCODE_BACK || event.keyCode==KeyEvent.KEYCODE_ESCAPE) {
             if(down && event.repeatCount==0){if(waiting!=null){waiting=null;status.text="Assignment cancelled.";refreshCells()}else dismiss()};return true
@@ -187,8 +189,10 @@ internal class StylusControlsDialog(
     }
     private fun capture(input:GridInput) {
         val cell=waiting ?: return
-        val error=grid.bind(cell,input,fullscreen)
-        if(error==null){waiting=null;status.text="Assigned ${input.label()}. Press Done to save.";refreshCells();virtualDialog?.dismiss()}else{status.text=error}
+        val error=if(input.source=="keyboard" && bindings.stylusKeyboardReserved(input.name))
+            "This key is currently assigned to the stylus. Reassign it in Keyboard bindings before using it in a grid."
+            else grid.bind(cell,input,fullscreen)
+        if(error==null){waiting=null;status.text="Assigned ${ControllerLabels.grid(input)}. Press Done to save.";refreshCells();virtualDialog?.dismiss()}else{status.text=error}
     }
     override fun onGenericMotionEvent(event:MotionEvent):Boolean {
         if(event.action!=MotionEvent.ACTION_MOVE)return super.onGenericMotionEvent(event)

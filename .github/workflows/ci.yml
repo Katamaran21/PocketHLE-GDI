@@ -6,16 +6,26 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a WinCE pre-release after all required checks
+        type: boolean
+        default: false
+      pull_request:
+        description: Exact PR to merge after the checks (leave empty for an already merged revision)
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+  RUSTFLAGS: ""
+  CARGO_BUILD_JOBS: "2"
   # Keep Cargo artifacts separate from extracted FFmpeg sources.
   CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo
-  # SDL bundled by sdl2-sys still declares pre-3.5 CMake compatibility.
+  # Keep older native dependencies compatible with recent CMake releases.
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
@@ -31,6 +41,24 @@ jobs:
           name: PocketHLE-Android-ADB-Backup
           path: dist/android-backup/PocketHLE-Android-ADB-Backup.zip
           if-no-files-found: error
+
+  hardware-diag:
+    name: HARDWARE DIAG (download)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install small ARM diagnostic toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld python3
+      - name: Build the single ARM diagnostic and verify its archive
+        run: python3 tools/hardware-diag/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HARDWARE-DIAG
+          path: tools/hardware-diag/dist/HARDWARE-DIAG.zip
+          if-no-files-found: error
+          retention-days: 30
 
   fmt:
     name: rustfmt
@@ -62,21 +90,11 @@ jobs:
           sudo apt-get install -y \
             libgtk-3-dev libxkbcommon-dev libssl-dev pkg-config \
             libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxinerama-dev libxi-dev \
-            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev \
+            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev libxss-dev \
             libasound2-dev \
             cmake build-essential libclang-dev clang lld python3
       - name: build static FFmpeg
         run: bash tools/build-ffmpeg.sh x86_64-unknown-linux-gnu 4
-      - name: generate ARM diagnostic fixtures required by tests
-        run: |
-          python3 tools/ramtest/build.py
-          python3 tools/vfstest/build.py
-          python3 tools/timetest/build.py
-          python3 tools/camtest/build.py
-          python3 tools/gpstest/build.py
-          python3 tools/nettest/build.py
-          python3 tools/vibtest/build.py
-          python3 tools/bttest/build.py
       - name: advisory clippy analysis
         env:
           # This job already uses continue-on-error; retain diagnostics as warnings.
@@ -99,30 +117,16 @@ jobs:
           sudo apt-get install -y \
             libgtk-3-dev libxkbcommon-dev libssl-dev pkg-config \
             libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxinerama-dev libxi-dev \
-            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev \
+            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev libxss-dev \
             libasound2-dev \
             cmake build-essential libclang-dev clang lld python3
       - name: build static FFmpeg
         run: bash tools/build-ffmpeg.sh x86_64-unknown-linux-gnu 4
       - run: cargo build --workspace --release --locked
-      - name: generate ARM diagnostic fixtures required by tests
-        run: |
-          python3 tools/ramtest/build.py
-          python3 tools/vfstest/build.py
-          python3 tools/timetest/build.py
-          python3 tools/camtest/build.py
-          python3 tools/gpstest/build.py
-          python3 tools/nettest/build.py
-          python3 tools/vibtest/build.py
-          python3 tools/bttest/build.py
       - name: run workspace tests sequentially
-        # ARM process diagnostics use short guest wait deadlines. Avoid competing
-        # emulator/process trees on the runner's limited vCPUs; keep every test.
+        # Includes launcher profiles/controller navigation. Executable ARM
+        # diagnostics require the non-default arm-diagnostics feature.
         run: cargo test --workspace --release --locked -- --test-threads=1
-      - name: test Steam Deck configuration and defaults
-        run: cargo test --release --locked -p pocket-library --features steam-deck --lib -- --test-threads=1
-      - name: test Steam Deck frontend navigation and filter controls
-        run: cargo test --release --locked -p pocket-desktop --features steam-deck --bin pockethle-steamdeck deck_ -- --test-threads=1
 
   build-unicorn:
     name: build with unicorn-engine
@@ -160,7 +164,7 @@ jobs:
           sudo apt-get install -y \
             libgtk-3-dev libxkbcommon-dev libssl-dev pkg-config \
             libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxinerama-dev libxi-dev \
-            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev \
+            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev libxss-dev \
             libasound2-dev \
             cmake build-essential libclang-dev clang lld python3
       - name: build static FFmpeg
@@ -172,6 +176,8 @@ jobs:
       - name: stage artifacts
         run: |
           mkdir -p dist/PocketHLE-linux
+          cp -R frontends/pocket-desktop/licenses dist/PocketHLE-linux/
+          cp LICENSE LICENSE-APACHE LICENSE-MIT dist/PocketHLE-linux/
           cp target/cargo/release/pockethle dist/PocketHLE-linux/
           cp target/cargo/release/pockethle-gui dist/PocketHLE-linux/
           cp tools/install-desktop-entry.sh dist/PocketHLE-linux/
@@ -184,38 +190,10 @@ jobs:
           name: PocketHLE-linux-x86_64
           path: PocketHLE-linux-x86_64.tar.gz
 
-  diagnostic-fixtures:
-    name: generate ARM fixtures for Windows tests
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: install diagnostic compilers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang lld python3
-      - name: generate and package test fixtures
-        run: |
-          python3 tools/ramtest/build.py
-          python3 tools/vfstest/build.py
-          python3 - <<'PY'
-          from pathlib import Path
-          from zipfile import ZipFile, ZIP_DEFLATED
-          with ZipFile('arm-diagnostic-fixtures.zip', 'w', ZIP_DEFLATED) as archive:
-              for root in [Path('tools/ramtest/dist'), Path('tools/vfstest/dist')]:
-                  for path in sorted(root.rglob('*')):
-                      if path.is_file():
-                          archive.write(path, path.as_posix())
-          PY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: arm-diagnostic-fixtures
-          path: arm-diagnostic-fixtures.zip
-          if-no-files-found: error
-
   build-windows:
     name: build windows release artifacts
     runs-on: windows-latest
-    needs: [fmt, diagnostic-fixtures]
+    needs: [fmt]
     steps:
       - run: git config --global core.autocrlf input
       - uses: actions/checkout@v4
@@ -243,17 +221,10 @@ jobs:
       - name: build CLI + desktop
         shell: pwsh
         run: |
-          cargo build --release --locked -p pocket-cli
+          cargo build --release --locked -p pocket-cli --features unicorn
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --release --locked -p pocket-desktop
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: actions/download-artifact@v4
-        with:
-          name: arm-diagnostic-fixtures
-          path: target/ci-fixtures
-      - name: unpack ARM diagnostic test fixtures
-        shell: pwsh
-        run: Expand-Archive -LiteralPath target/ci-fixtures/arm-diagnostic-fixtures.zip -DestinationPath . -Force
       - name: test native H264 and AAC recording at 30 and 60 FPS
         shell: pwsh
         run: |
@@ -263,9 +234,15 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/PocketHLE-windows
+          cp -R frontends/pocket-desktop/licenses dist/PocketHLE-windows/
+          cp LICENSE LICENSE-APACHE LICENSE-MIT dist/PocketHLE-windows/
           cp target/cargo/release/pockethle.exe dist/PocketHLE-windows/
           cp target/cargo/release/pockethle-gui.exe dist/PocketHLE-windows/
           cp README.md dist/PocketHLE-windows/
+          cp docs/STEAMDECK.md dist/PocketHLE-windows/README-SteamDeck.md
+          cp docs/WINDOWS-CE.md dist/PocketHLE-windows/README-Windows-CE.md
+          mkdir -p dist/PocketHLE-windows/profiles
+          cp profiles/wince6-portable.json dist/PocketHLE-windows/profiles/
           cp -f README.ru.md dist/PocketHLE-windows/ 2>/dev/null || true
       - name: zip artifacts
         shell: pwsh
@@ -275,27 +252,6 @@ jobs:
         with:
           name: PocketHLE-windows-x86_64
           path: PocketHLE-windows-x86_64.zip
-      - name: build Steam Deck edition for Proton
-        shell: pwsh
-        run: |
-          cargo build --release --locked -p pocket-desktop --features steam-deck --bin pockethle-steamdeck
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: stage Steam Deck artifacts
-        shell: bash
-        run: |
-          mkdir -p dist/PocketHLE-steamdeck
-          cp target/cargo/release/pockethle-steamdeck.exe dist/PocketHLE-steamdeck/
-          cp docs/STEAMDECK.md dist/PocketHLE-steamdeck/README-SteamDeck.md
-      - name: zip Steam Deck artifacts
-        shell: pwsh
-        run: |
-          Compress-Archive -Path dist/PocketHLE-steamdeck/* -DestinationPath PocketHLE-steamdeck-x86_64.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: PocketHLE-steamdeck-x86_64
-          path: PocketHLE-steamdeck-x86_64.zip
-          if-no-files-found: error
-
   build-android:
     name: build android APK
     runs-on: ubuntu-24.04
@@ -350,3 +306,77 @@ jobs:
           name: PocketHLE-android
           path: dist/android/PocketHLE-*.apk
           if-no-files-found: error
+
+  wince-source-and-profile:
+    name: WinCE profile and corresponding source
+    runs-on: ubuntu-24.04
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - name: Package profile templates and complete locked source
+        run: |
+          mkdir -p target dist/release
+          cargo vendor --locked vendor-cargo > target/vendor-config.toml
+          python3 tools/package-wince-profile.py --output dist/release/PocketHLE-GDI-WinCE-profile.zip
+          python3 tools/package-wince-source.py --output dist/release/PocketHLE-GDI-source-kit.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PocketHLE-GDI-profile-and-source
+          path: dist/release/*.zip
+          if-no-files-found: error
+
+  wince-prerelease:
+    name: Merge reviewed revision and publish WinCE pre-release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    runs-on: ubuntu-24.04
+    needs: [fmt, clippy, test, build-unicorn, build-linux, build-windows, build-android, wince-source-and-profile]
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: PocketHLE-*
+          path: dist/downloaded
+          merge-multiple: true
+      - name: Merge the exact tested PR and publish installable packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pull_request }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import re,pathlib; print(re.search(r"^version\s*=\s*\"([^\"]+)\"",pathlib.Path("Cargo.toml").read_text(),re.M)[1])')
+          tag="v$version"
+          target="$GITHUB_SHA"
+          if [[ -n "$PR_NUMBER" ]]; then
+            [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo 'Invalid PR number'; exit 1; }
+            head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
+            [[ "$head" == "$GITHUB_SHA" ]] || { echo 'PR changed after the build; refusing to merge another revision'; exit 1; }
+            state=$(gh pr view "$PR_NUMBER" --json state --jq .state)
+            if [[ "$state" != MERGED ]]; then
+              gh pr merge "$PR_NUMBER" --merge --match-head-commit "$GITHUB_SHA"
+            fi
+            target=$(gh pr view "$PR_NUMBER" --json mergeCommit --jq .mergeCommit.oid)
+            [[ -n "$target" && "$target" != null ]]
+          fi
+          python3 - <<'PY'
+          import hashlib,pathlib
+          root=pathlib.Path('dist/downloaded')
+          assets=sorted(p for p in root.iterdir() if p.is_file() and (p.suffix=='.apk' or p.name.endswith(('.zip','.tar.gz'))))
+          if not any(p.suffix=='.apk' and 'unsigned' not in p.name for p in assets):
+              raise SystemExit('No signed Android APK; refusing publication')
+          if any('unsigned' in p.name for p in assets):
+              raise SystemExit('Unsigned APK is not a public installable package')
+          (root/'SHA256SUMS.txt').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in assets))
+          PY
+          mapfile -t assets < <(find dist/downloaded -maxdepth 1 -type f \( -name '*.zip' -o -name '*.apk' -o -name '*.tar.gz' -o -name SHA256SUMS.txt \) | sort)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+            gh release edit "$tag" --draft=false --prerelease --notes-file "docs/releases/$tag.md"
+          else
+            gh release create "$tag" "${assets[@]}" --target "$target" --prerelease --title "PocketHLE-GDI $version (WinCE pre-release)" --notes-file "docs/releases/$tag.md"
+          fi

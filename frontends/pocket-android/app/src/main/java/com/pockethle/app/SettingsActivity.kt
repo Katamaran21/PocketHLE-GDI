@@ -1,7 +1,6 @@
 package com.pockethle.app
 
 import android.os.Bundle
-import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
 import androidx.preference.ListPreference
 import androidx.preference.Preference
@@ -11,7 +10,7 @@ import androidx.preference.SwitchPreferenceCompat
 import org.json.JSONObject
 
 /** Global launcher settings (default backend, log verbosity). */
-class SettingsActivity : AppCompatActivity() {
+class SettingsActivity : HostKeyActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
@@ -29,7 +28,7 @@ class SettingsActivity : AppCompatActivity() {
         return true
     }
 
-    class GlobalPreferencesFragment : PreferenceFragmentCompat() {
+    class GlobalPreferencesFragment : ScrollingTitlePreferenceFragment() {
         private lateinit var rootDir: String
         private var current: LauncherConfig = LauncherConfig.default()
         override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
@@ -86,28 +85,6 @@ class SettingsActivity : AppCompatActivity() {
                     }
                 })
             }
-            val emulator = findPreference<androidx.preference.PreferenceScreen>("emulator_options")!!
-            val optimizations=androidx.preference.PreferenceCategory(requireContext()).apply { title="Optimizations" }
-            optimizations.order = 10000
-            emulator.addPreference(optimizations)
-            fun optimization(name: String, label: String, help: String, enabledByDefault: Boolean = true) {
-                optimizations.addPreference(SwitchPreferenceCompat(requireContext()).apply {
-                    key="optimization_$name"; title=label; isPersistent=false
-                    isChecked=current.toJson().optJSONObject("optimizations")?.optBoolean(name,enabledByDefault) ?: enabledByDefault
-                    summary="$help ${if (enabledByDefault) "Enabled" else "Disabled"} by default; applies next launch."
-                    setOnPreferenceChangeListener { _, value ->
-                        val config=current.toJson()
-                        val settings=config.optJSONObject("optimizations") ?: JSONObject()
-                        settings.put(name,value as Boolean)
-                        current=current.copy(originalJson=config.put("optimizations",settings).toString())
-                        writeConfig();true
-                    }
-                })
-            }
-            optimization("fast_memory_access","Fast memory access","Reduce overhead when writing to private RAM. Code invalidation, memory hooks and permissions remain active.")
-            optimization("extended_tlb_cache","Extended memory translation cache","Remember more guest-to-host address translations to avoid repeated lookups. Uses additional host memory.")
-            optimization("responsive_scheduling","Responsive thread scheduling","Resume ready guest workers sooner while the main thread waits for messages. Disable for compatibility comparisons.")
-            optimization("extended_jump_cache","Extended jump cache","Remember more translated-code destinations to reduce jump lookups. Disabling restores the smaller active cache; allocated storage stays unchanged.")
             val touch = androidx.preference.PreferenceCategory(requireContext()).apply { title = "Touch controls" }
             ppc.addPreference(touch)
             touch.addPreference(ListPreference(requireContext()).apply {
@@ -141,6 +118,32 @@ class SettingsActivity : AppCompatActivity() {
             })
             identityField(ppc, "device_preset_id", "Device name (Preset ID — WinCE)")
             identityField(ppc, "device_platform_id", "Console identifier (Platform ID — hexadecimal, WinCE)")
+            val ppcGraphics = androidx.preference.PreferenceCategory(requireContext()).apply { title = "Graphics compatibility" }
+            ppc.addPreference(ppcGraphics)
+            ppcGraphics.addPreference(SwitchPreferenceCompat(requireContext()).apply {
+                key = "pocketpc_intel2700g_depth_bias"
+                title = "Intel 2700G depth-bias compatibility"
+                summary = "Use if projected lights or ground decals show through foreground objects. Reproduces the original WinCE driver's integer constant bias without its slope term, with 24-bit depth. Applies next launch, in software and GPU modes."
+                isPersistent = false
+                isChecked = current.toJson().optBoolean("pocketpc_intel2700g_depth_bias", false)
+                setOnPreferenceChangeListener { _, value ->
+                    current = current.copy(originalJson = current.toJson().put("pocketpc_intel2700g_depth_bias", value as Boolean).toString())
+                    writeConfig()
+                    true
+                }
+            })
+            ppcGraphics.addPreference(SwitchPreferenceCompat(requireContext()).apply {
+                key = "pocketpc_nv_combiners"
+                title = "NVIDIA GoForce 5500 AR10/AR11 combiners"
+                summary = "Enable NVIDIA GoForce 5500 combiner programs for PocketPC games that request them. Applies next launch, in software and GPU modes."
+                isPersistent = false
+                isChecked = current.toJson().optBoolean("pocketpc_nv_combiners", true)
+                setOnPreferenceChangeListener { _, value ->
+                    current = current.copy(originalJson = current.toJson().put("pocketpc_nv_combiners", value as Boolean).toString())
+                    writeConfig()
+                    true
+                }
+            })
             identityField(giz, "gizmondo_preset_id", "Device name (Preset ID — Gizmondo)")
             identityField(giz, "gizmondo_platform_id", "Console identifier (Platform ID — hexadecimal, Gizmondo)")
             fun toggle(keyName: String, label: String, checked: Boolean, update: (Boolean) -> Unit) {
@@ -153,17 +156,10 @@ class SettingsActivity : AppCompatActivity() {
             val display = findPreference<androidx.preference.PreferenceScreen>("display_options")!!
             display.addPreference(ListPreference(requireContext()).apply {
                 key = "upscale_filter"; title = "Filter"; isPersistent = false
-                entries = arrayOf("Reconstruction", "SMAA", "SMAA Soft", "xBRZ", "Bicubic", "Lanczos", "Bilinear", "Nearest")
-                entryValues = arrayOf("reconstruction", "smaa", "smaa_soft", "xbrz", "bicubic", "lanczos", "bilinear", "nearest")
+                entries = arrayOf("No filter", "Reconstruction", "SMAA", "SMAA Soft", "xBRZ", "Bicubic", "Lanczos", "Bilinear", "Nearest")
+                entryValues = arrayOf("none", "reconstruction", "smaa", "smaa_soft", "xbrz", "bicubic", "lanczos", "bilinear", "nearest")
                 value = current.upscaleFilter; summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
                 setOnPreferenceChangeListener { _, v -> current = current.copy(upscaleFilter = v.toString()); writeConfig(); true }
-            })
-            display.addPreference(ListPreference(requireContext()).apply {
-                key = "android_display_scale"; title = "Display scale"; isPersistent = false
-                entries = arrayOf("Auto (largest integer scale that fits)", "QVGA ×1", "QVGA ×2", "QVGA ×3", "QVGA ×4")
-                entryValues = arrayOf("0", "1", "2", "3", "4"); value = current.displayScale.toString()
-                summary = "Pocket PC: multiples of the QVGA grid, including VGA games. Gizmondo: native multiples. Limited to the available space."
-                setOnPreferenceChangeListener { _, v -> current = current.copy(displayScale = v.toString().toInt()); writeConfig(); true }
             })
             giz.addPreference(SwitchPreferenceCompat(requireContext()).apply {
                 key = "bluetooth_enabled"
@@ -230,118 +226,14 @@ class SettingsActivity : AppCompatActivity() {
                     writeConfig(); true
                 }
             })
-            val keyboard = androidx.preference.PreferenceScreen(requireContext(), null).apply { key="keyboard_options";title="Physical keyboard" }
-            val gamepad = androidx.preference.PreferenceScreen(requireContext(), null).apply { key="gamepad_options";title="Physical controller" }
-            input.addPreference(keyboard);input.addPreference(gamepad)
-            val controlGroups = listOf(
-                "Shared controls — Pocket PC and Gizmondo",
-                "Emulator shortcuts",
-                "Gizmondo only — console system buttons",
-                "Pocket PC only — hardware buttons"
-            )
-            fun categories(screen: androidx.preference.PreferenceScreen) = controlGroups.associateWith { group ->
-                androidx.preference.PreferenceCategory(requireContext()).apply {
-                    title = group
-                    screen.addPreference(this)
-                }
-            }
-            val keyboardGroups = categories(keyboard)
-            val gamepadGroups = categories(gamepad)
-            val stylusScreen=androidx.preference.PreferenceScreen(requireContext(),null).apply {
-                title="Pocket PC only — stylus stick";key="stylus_options"
-            }
-            ppc.addPreference(stylusScreen)
-            fun stylusJson()=current.toJson().optJSONObject("stylus_stick") ?: org.json.JSONObject().apply {
-                put("enabled",true);put("speed",240)
-                put("keyboard",org.json.JSONArray().apply { listOf("O","L","K","M").forEach { put(org.json.JSONArray().put(it)) } })
-                put("controller",org.json.JSONArray().apply { StylusBindings.directions.forEach { put(org.json.JSONArray().put("RightStick$it")) } })
-            }
-            fun saveStylus(value:org.json.JSONObject) {
-                current=current.copy(originalJson=current.toJson().put("stylus_stick",value).toString());writeConfig()
-            }
-            stylusScreen.addPreference(SwitchPreferenceCompat(requireContext()).apply {
-                title="Enable stylus stick";summary="Emulates stylus drags; lifts and recentres at screen edges. Pocket PC only."
-                isPersistent=false;isChecked=stylusJson().optBoolean("enabled",true)
-                setOnPreferenceChangeListener { _,v -> saveStylus(stylusJson().put("enabled",v as Boolean));true }
-            })
-            stylusScreen.addPreference(androidx.preference.SeekBarPreference(requireContext()).apply {
-                title="Stylus speed (pixels/s)";min=30;max=1200;showSeekBarValue=true;isPersistent=false
-                value=stylusJson().optInt("speed",240)
-                setOnPreferenceChangeListener { _,v -> saveStylus(stylusJson().put("speed",v as Int));true }
-            })
-            StylusBindings.directions.forEachIndexed { i,direction ->
-                stylusScreen.addPreference(Preference(requireContext()).apply {
-                    title="Stylus $direction — keyboard";isPersistent=false
-                    summary=stylusJson().getJSONArray("keyboard").getJSONArray(i).join(", ")
+            for ((controller, label) in listOf(false to "Keyboard bindings", true to "External controller bindings")) {
+                input.addPreference(Preference(requireContext()).apply {
+                    key = if (controller) "controller_bindings" else "keyboard_bindings"
+                    title = label
+                    summary = if (controller) "Inspect and edit external controller assignments." else "Inspect and edit keyboard assignments."
                     setOnPreferenceClickListener {
-                        val dialog=androidx.appcompat.app.AlertDialog.Builder(requireContext()).setTitle("Press a key")
-                            .setNegativeButton("Cancel",null).setNeutralButton("Clear") { _,_ ->
-                                val j=stylusJson();j.getJSONArray("keyboard").put(i,org.json.JSONArray());saveStylus(j);summary="Unbound"
-                            }.create()
-                        dialog.setOnKeyListener { _,code,event ->
-                            val name=InputBindings.keyName(event)
-                            if(code==android.view.KeyEvent.KEYCODE_BACK) false
-                            else if(event.action==android.view.KeyEvent.ACTION_DOWN && name!=null && name!="F10") {
-                                val j=stylusJson();val a=j.getJSONArray("keyboard")
-                                for(k in 0..3) {
-                                    val old=a.getJSONArray(k);val next=org.json.JSONArray()
-                                    for(n in 0 until old.length()) if(!InputBindings.canonical(old.getString(n)).equals(InputBindings.canonical(name),true)) next.put(old.getString(n))
-                                    a.put(k,next)
-                                }
-                                a.put(i,org.json.JSONArray().put(name));saveStylus(j);summary=name;dialog.dismiss();true
-                            } else false
-                        };dialog.show();true
-                    }
-                })
-                stylusScreen.addPreference(ListPreference(requireContext()).apply {
-                    title="Stylus $direction — controller";isPersistent=false
-                    val names=listOf("")+InputBindings.controls
-                    entries=names.map { if(it.isEmpty()) "Unbound" else it }.toTypedArray();entryValues=names.toTypedArray()
-                    value=stylusJson().getJSONArray("controller").getJSONArray(i).optString(0,"")
-                    summaryProvider=ListPreference.SimpleSummaryProvider.getInstance()
-                    setOnPreferenceChangeListener { _,v ->
-                        val j=stylusJson();val a=j.getJSONArray("controller");val name=v.toString()
-                        for(k in 0..3) { val old=a.getJSONArray(k);val next=org.json.JSONArray();for(n in 0 until old.length()) if(old.getString(n)!=name) next.put(old.getString(n));a.put(k,next) }
-                        a.put(i,org.json.JSONArray().apply { if(name.isNotEmpty()) put(name) });saveStylus(j);true
-                    }
-                })
-            }
-            InputBindings.buttons.forEach { (button,info) ->
-                val group = when {
-                    button.startsWith("pocket_pc_app") -> controlGroups[3]
-                    button.startsWith("giz_piano") -> controlGroups[2]
-                    button == "turbo" -> controlGroups[1]
-                    else -> controlGroups[0]
-                }
-                keyboardGroups.getValue(group).addPreference(Preference(requireContext()).apply {
-                    key="keyboard_$button";title=info.first;isPersistent=false
-                    val snapshot=InputBindings(current)
-                    val existing=(0 until snapshot.keyboard.length()).map { snapshot.keyboard.getJSONObject(it) }.find { it.optString("button")==button }?.optJSONArray("keys")
-                    summary=existing?.let { (0 until it.length()).joinToString(", ") { i -> it.getString(i) } }?.ifEmpty { "Unassigned" } ?: "Unassigned"
-                    setOnPreferenceClickListener {
-                        val dialog=androidx.appcompat.app.AlertDialog.Builder(requireContext()).setTitle(info.first).setMessage("Press a keyboard key (F10 is reserved for screenshots).")
-                            .setNegativeButton("Cancel",null).setNeutralButton("Clear") { _,_-> saveKeyboardBinding(button,null);summary="Unassigned" }.create()
-                        dialog.setOnKeyListener { _,code,event ->
-                            val name=InputBindings.keyName(event)
-                            if(code==android.view.KeyEvent.KEYCODE_BACK) false
-                            else if(event.action==android.view.KeyEvent.ACTION_DOWN && name!=null && name!="F10") {
-                                saveKeyboardBinding(button,name);summary=name;dialog.dismiss();true
-                            } else false
-                        }
-                        dialog.show();true
-                    }
-                })
-                gamepadGroups.getValue(group).addPreference(ListPreference(requireContext()).apply {
-                    key="gamepad_$button";title=info.first;isPersistent=false
-                    entries=(listOf("Unassigned")+InputBindings.controls).toTypedArray();entryValues=(listOf("")+InputBindings.controls).toTypedArray()
-                    val map=InputBindings(current).controller
-                    value=map.keys().asSequence().firstOrNull { map.optString(it)==button } ?: ""
-                    summaryProvider=ListPreference.SimpleSummaryProvider.getInstance()
-                    setOnPreferenceChangeListener { _,v ->
-                        val next=InputBindings(current).controller
-                        next.keys().asSequence().toList().filter { next.optString(it)==button }.forEach { next.remove(it) }
-                        if(v.toString().isNotEmpty()) next.put(v.toString(),button)
-                        current=current.copy(originalJson=current.toJson().put("gamepad_bindings",next).toString());writeConfig();true
+                        startActivity(android.content.Intent(requireContext(), InputSettingsActivity::class.java).putExtra("controller", controller))
+                        true
                     }
                 })
             }
@@ -353,14 +245,36 @@ class SettingsActivity : AppCompatActivity() {
             findPreference<androidx.preference.PreferenceCategory>("graphics_options")!!.addPreference(SwitchPreferenceCompat(requireContext()).apply {
                 key="gpu_renderer"; title="GPU rendering"; isPersistent=false; isChecked=current.gpuRenderer
                 summary="Host OpenGL; takes effect on the next launch. Can be overridden per game."
-                setOnPreferenceChangeListener { _,v -> current=current.copy(gpuRenderer=v as Boolean);findPreference<ListPreference>("anisotropic_filtering")?.isEnabled=current.gpuRenderer;writeConfig();true }
+                setOnPreferenceChangeListener { _,v -> current=current.copy(gpuRenderer=v as Boolean);findPreference<ListPreference>("gles_internal_resolution")?.isEnabled=current.gpuRenderer;writeConfig();true }
             })
             findPreference<androidx.preference.PreferenceCategory>("graphics_options")!!.addPreference(ListPreference(requireContext()).apply {
-                key="anisotropic_filtering"; title="Anisotropic filtering (GPU only)"; isPersistent=false
-                entries=arrayOf("Off", "2×", "4×", "8×"); entryValues=arrayOf("0", "2", "4", "8")
-                value=current.anisotropicFiltering.toString(); isEnabled=current.gpuRenderer
-                summaryProvider=ListPreference.SimpleSummaryProvider.getInstance()
-                setOnPreferenceChangeListener { _, v -> current=current.copy(anisotropicFiltering=v.toString().toInt());writeConfig();true }
+                key="gles_internal_resolution"; title="OpenGLES internal resolution (GPU only)"; isPersistent=false
+                entries=arrayOf("Native (1×)", "2x - only for 320x240 games", "3x - only for 320x240 games", "4x - only for 320x240 games", "2x - also for 640x480 games"); entryValues=arrayOf("1", "3", "4", "5", "2")
+                value=current.glesInternalResolution.toString(); isEnabled=current.gpuRenderer
+                summary="Includes portrait equivalents (240x320 and 480x640). QVGA-only 2x/3x/4x modes leave larger surfaces native; the other 2x mode doubles them. Display size is automatic; PocketPC fits whole logical-screen multiples regardless of internal resolution. Touch coordinates stay logical. More GPU/readback work; no extra detail for 2D assets. Applies next launch."
+                setOnPreferenceChangeListener { _, v -> current=current.copy(glesInternalResolution=v.toString().toInt());writeConfig();true }
+            })
+            findPreference<androidx.preference.PreferenceCategory>("graphics_options")!!.addPreference(ListPreference(requireContext()).apply {
+                key="frame_rate_limit"; title="Frame rate limit"; isPersistent=false
+                entries=arrayOf("10 fps", "15 fps", "20 fps", "30 fps", "45 fps", "60 fps", "120 fps", "Unlimited")
+                entryValues=arrayOf("10", "15", "20", "30", "45", "60", "120", "unlimited")
+                value=current.frameRateLimit
+                summaryProvider=Preference.SummaryProvider<ListPreference> { pref -> "${pref.entry ?: "60 fps"}. Default maximum game FPS (or Unlimited); each game can inherit or override it. Applies next launch." }
+                setOnPreferenceChangeListener { _, v -> current=current.copy(frameRateLimit=v.toString());writeConfig();true }
+            })
+
+
+            findPreference<androidx.preference.PreferenceCategory>("misc_options")!!.addPreference(SwitchPreferenceCompat(requireContext()).apply {
+                key = "executable_heap"
+                title = "Executable heap"
+                isPersistent = false
+                isChecked = current.executableHeap
+                setSummary(R.string.executable_heap_help)
+                setOnPreferenceChangeListener { _, value ->
+                    current = current.copy(executableHeap = value as Boolean)
+                    writeConfig()
+                    true
+                }
             })
             findPreference<androidx.preference.PreferenceCategory>("misc_options")!!.addPreference(SwitchPreferenceCompat(requireContext()).apply {
                 key = "show_fps"; title = "Show FPS"; isPersistent = false; isChecked = current.showFps
@@ -371,6 +285,22 @@ class SettingsActivity : AppCompatActivity() {
                     true
                 }
             })
+            findPreference<androidx.preference.PreferenceCategory>("misc_options")!!.addPreference(SwitchPreferenceCompat(requireContext()).apply {
+                key = "show_ips"; title = "Show IPS"; isPersistent = false; isChecked = current.showIps
+                summary = "Shows changed images per second at the top right. Applies on next launch. Uses CPU pixel readback for OpenGL ES."
+                setOnPreferenceChangeListener { _, value ->
+                    current = current.copy(showIps = value as Boolean)
+                    writeConfig()
+                    true
+                }
+            })
+            findPreference<SwitchPreferenceCompat>("android_graphics_diagnostics")?.apply {
+                isChecked = current.graphicsDiagnostics
+                setOnPreferenceChangeListener { _, value ->
+                    current = current.copy(graphicsDiagnostics = value as Boolean)
+                    writeConfig(); true
+                }
+            }
             findPreference<SeekBarPreference>("verbosity")?.apply {
                 value = current.verbosity
                 setOnPreferenceChangeListener { _, newValue ->
@@ -397,6 +327,7 @@ class SettingsActivity : AppCompatActivity() {
 
         override fun onResume() {
             super.onResume()
+            // Reload independently saved visual bindings before any later preference write.
             current=readConfig() ?: current
         }
 
@@ -408,20 +339,6 @@ class SettingsActivity : AppCompatActivity() {
                 return true
             }
             return super.onPreferenceTreeClick(preference)
-        }
-
-        private fun saveKeyboardBinding(button: String, name: String?) {
-            val old=InputBindings(current).keyboard
-            val next=org.json.JSONArray()
-            var found=false
-            for(i in 0 until old.length()) {
-                val entry=old.getJSONObject(i)
-                if(entry.optString("button")==button) { entry.put("keys",org.json.JSONArray().apply { if(name!=null) put(name) });found=true }
-                else if(name!=null) { val keys=entry.optJSONArray("keys") ?: org.json.JSONArray();entry.put("keys",org.json.JSONArray().apply { for(j in 0 until keys.length()) if(!InputBindings.canonical(keys.getString(j)).equals(InputBindings.canonical(name),true)) put(keys.getString(j)) }) }
-                next.put(entry)
-            }
-            if(!found) next.put(JSONObject().put("button",button).put("keys",org.json.JSONArray().apply { if(name!=null) put(name) }))
-            current=current.copy(keybindingsJson=next.toString());writeConfig()
         }
 
         private fun readConfig(): LauncherConfig? {
@@ -439,24 +356,22 @@ class SettingsActivity : AppCompatActivity() {
             if (result?.optBoolean("ok", false) == true && saved?.optString("android_pocketpc_touch_layout", "") != current.pocketpcTouchLayout) {
                 android.widget.Toast.makeText(context, "Touch layout could not be saved. Please update PocketHLE and try again.", android.widget.Toast.LENGTH_LONG).show()
             }
-            val wantedOptimizations=current.toJson().optJSONObject("optimizations")
-            if (result?.optBoolean("ok", false) == true && wantedOptimizations != null) {
-                val actual=saved?.optJSONObject("optimizations")
-                if(listOf("fast_memory_access","extended_tlb_cache","responsive_scheduling","extended_jump_cache").any {
-                    actual == null || !actual.has(it) || actual.optBoolean(it,true) != wantedOptimizations.optBoolean(it,true)
-                }) android.widget.Toast.makeText(context,"Optimization settings were not saved. Rebuild the native libraries and APK together.",android.widget.Toast.LENGTH_LONG).show()
-            }
             if (result?.optBoolean("ok", false) == true &&
                 (saved == null || !saved.has("android_gizmondo_maximize_screen") ||
                     saved.optBoolean("android_gizmondo_maximize_screen") != current.gizmondoMaximizeScreen)) {
                 android.widget.Toast.makeText(context, "Screen size setting was not saved. Rebuild the native libraries and APK together.", android.widget.Toast.LENGTH_LONG).show()
             }
-            val gpuSaved = saved != null && saved.has("gpu_renderer") && saved.optBoolean("gpu_renderer") == current.gpuRenderer && saved.has("anisotropic_filtering") && saved.optInt("anisotropic_filtering") == current.anisotropicFiltering
+            val gpuSaved = saved != null && saved.optString("frame_rate_limit", "") == current.frameRateLimit && saved.has("gpu_renderer") && saved.optBoolean("gpu_renderer") == current.gpuRenderer && saved.has("gles_internal_resolution") && saved.optInt("gles_internal_resolution") == current.glesInternalResolution
             if (result?.optBoolean("ok", false) == true && saved?.optString("android_gizmondo_controls_size", "") != current.gizmondoControlsSize) {
                 android.widget.Toast.makeText(context, "Control size could not be saved. Please update PocketHLE and try again.", android.widget.Toast.LENGTH_LONG).show()
             }
             if (result?.optBoolean("ok", false) == true && saved?.optString("android_pocketpc_controls_size", "") != current.pocketpcControlsSize) {
                 android.widget.Toast.makeText(context, "Control size was not saved. Rebuild and install the updated native libraries and APK.", android.widget.Toast.LENGTH_LONG).show()
+            }
+            if (result?.optBoolean("ok", false) == true &&
+                (saved == null || !saved.has("executable_heap") ||
+                    saved.optBoolean("executable_heap") != current.executableHeap)) {
+                android.widget.Toast.makeText(context, "Executable heap setting was not saved. Rebuild the native libraries and APK together.", android.widget.Toast.LENGTH_LONG).show()
             }
             if (!gpuSaved) android.widget.Toast.makeText(context, "GPU setting was not saved. Rebuild and install the updated native libraries and APK.", android.widget.Toast.LENGTH_LONG).show()
             if(result?.optBoolean("ok",false)!=true) android.widget.Toast.makeText(context,result?.optString("error") ?: "Could not save settings",android.widget.Toast.LENGTH_LONG).show()

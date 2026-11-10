@@ -100,20 +100,10 @@ impl Viewer {
             }
             return false;
         }
-        let (dimensions, duration, mut position, ready, error) = {
+        let (image, dimensions, duration, mut position, ready, error) = {
             let mut state = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(image) = state.image.take() {
-                if let Some(texture) = &mut self.texture {
-                    texture.set(image, egui::TextureOptions::LINEAR);
-                } else {
-                    self.texture = Some(ctx.load_texture(
-                        "capture-player-frame",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
-                }
-            }
             (
+                state.image.take(),
                 state.dimensions,
                 state.duration,
                 state.position,
@@ -121,6 +111,17 @@ impl Viewer {
                 state.error.clone(),
             )
         };
+        if let Some(image) = image {
+            if let Some(texture) = &mut self.texture {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.texture = Some(ctx.load_texture(
+                    "capture-player-frame",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
         if let Some(scrub) = self.scrub_position {
             position = scrub;
         }
@@ -234,9 +235,9 @@ impl Viewer {
                 close = crate::controller_ui::button(
                     ui,
                     if self.fullscreen {
-                        "Close viewer"
+                        "Close viewer".to_owned()
                     } else {
-                        "Close (B)"
+                        crate::controller_labels::text(ctx, "Close ({East})")
                     },
                 )
                 .clicked();
@@ -296,7 +297,7 @@ fn play_video(
 ) -> Result<(), String> {
     use pocket_core::winceapi::media_static::Decoder;
     use std::time::Instant;
-    let mut video = Decoder::open(path, true, 0, 0)?.ok_or("No video stream")?;
+    let mut video = Decoder::open_rgba(path)?.ok_or("No video stream")?;
     let (duration, width, height, _, _) = video.info();
     if width == 0 || height == 0 {
         return Err("Invalid video dimensions".into());
@@ -304,7 +305,7 @@ fn play_video(
     let mut audio = Decoder::open(path, false, 0, 0)?;
     // SDL is already bundled for controllers. AudioQueue copies PCM and remains
     // on this worker; no host executable, file association or child process.
-    // The controller worker owns Rust-SDL2's main-thread context. Initialize
+    // The controller worker owns Rust-SDL3's main-thread context. Initialize
     // only SDL's independent audio subsystem here, with balanced C refcounts.
     let queue = if audio.is_some() {
         Some(AudioOutput::open()?)
@@ -318,6 +319,7 @@ fn play_video(
     let mut audio_end = audio.is_none();
     let mut audio_trim = 0.0;
     let mut seeking = false;
+    let mut pending_command = None;
     {
         let mut state = slot.lock().unwrap_or_else(|e| e.into_inner());
         state.dimensions = [width as usize, height as usize];
@@ -327,7 +329,11 @@ fn play_video(
     loop {
         let mut target = None;
         loop {
-            match commands.try_recv() {
+            match pending_command
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| commands.try_recv())
+            {
                 Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
                 Ok(Command::Seek(seconds)) => target = Some(seconds.clamp(0.0, duration.max(0.0))),
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -411,27 +417,21 @@ fn play_video(
             }
         }
         let updated = due.is_some();
+        // Convert before acquiring the shared slot. At X4, doing per-pixel work
+        // under this mutex blocks UI progress and texture presentation.
+        let image = if let Some((pixels, _)) = due {
+            let dimensions = [width as usize, height as usize];
+            if pixels.len() != dimensions[0] * dimensions[1] * 4 {
+                return Err("Invalid decoded video frame".into());
+            }
+            Some(ColorImage::from_rgba_unmultiplied(dimensions, &pixels))
+        } else {
+            None
+        };
         {
             let mut state = slot.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((pixels, _)) = due {
-                let expected = width as usize * height as usize * 2;
-                if pixels.len() != expected {
-                    return Err("Invalid decoded video frame".into());
-                }
-                let mut rgb = Vec::with_capacity(expected / 2 * 3);
-                for p in pixels.chunks_exact(2) {
-                    let v = u16::from_le_bytes([p[0], p[1]]);
-                    let (r, g, b) = ((v >> 11) as u8, ((v >> 5) & 63) as u8, (v & 31) as u8);
-                    rgb.extend_from_slice(&[
-                        (r << 3) | (r >> 2),
-                        (g << 2) | (g >> 4),
-                        (b << 3) | (b >> 2),
-                    ]);
-                }
-                state.image = Some(ColorImage::from_rgb(
-                    [width as usize, height as usize],
-                    &rgb,
-                ));
+            if let Some(image) = image {
+                state.image = Some(image);
             }
             state.position = if duration > 0.0 {
                 position.min(duration)
@@ -449,65 +449,99 @@ fn play_video(
                 slot.lock().unwrap_or_else(|e| e.into_inner()).position = duration;
             }
         }
-        std::thread::sleep(Duration::from_millis(5));
+        // Wait for the next timestamp, not an extra fixed sleep after decode.
+        // A late frame gets no additional delay; commands interrupt the wait.
+        let wait = playback_wait(
+            frame.as_ref().map(|(_, pts)| *pts),
+            offset + anchor.elapsed().as_secs_f64(),
+        );
+        match commands.recv_timeout(wait) {
+            Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Ok(command) => pending_command = Some(command),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
     }
 }
 
+#[cfg(any(feature = "video-static", test))]
+fn playback_wait(next_pts: Option<f64>, position: f64) -> Duration {
+    let remaining = next_pts
+        .filter(|pts| pts.is_finite())
+        .map_or(0.02, |pts| (pts - position).clamp(0.0, 0.02));
+    Duration::from_secs_f64(remaining)
+}
+
 #[cfg(feature = "video-static")]
-struct AudioOutput(u32);
+struct AudioOutput {
+    stream: std::ptr::NonNull<sdl3::sys::audio::SDL_AudioStream>,
+}
 #[cfg(feature = "video-static")]
 impl AudioOutput {
     fn open() -> Result<Self, String> {
-        // SDL_AudioSpec is a C POD: zero is valid for every field, including
-        // callback=None (queued audio). This device is owned by this worker.
-        unsafe {
-            if sdl2::sys::SDL_InitSubSystem(sdl2::sys::SDL_INIT_AUDIO) != 0 {
-                return Err(sdl2::get_error());
-            }
-            let mut desired: sdl2::sys::SDL_AudioSpec = std::mem::zeroed();
-            desired.freq = 44100;
-            desired.format = sdl2::sys::AUDIO_S16SYS as u16;
-            desired.channels = 2;
-            desired.samples = 1024;
-            let mut obtained = std::mem::zeroed();
-            let device =
-                sdl2::sys::SDL_OpenAudioDevice(std::ptr::null(), 0, &desired, &mut obtained, 0);
-            if device == 0 {
-                let error = sdl2::get_error();
-                sdl2::sys::SDL_QuitSubSystem(sdl2::sys::SDL_INIT_AUDIO);
-                return Err(error);
-            }
-            Ok(Self(device))
+        // SDL audio may be initialized from this worker; do not try to acquire
+        // a second Rust-SDL main-thread context on the playback thread.
+        if !unsafe { sdl3::sys::init::SDL_InitSubSystem(sdl3::sys::init::SDL_INIT_AUDIO) } {
+            return Err(sdl3::get_error().to_string());
         }
+        let desired = sdl3::sys::audio::SDL_AudioSpec {
+            freq: 44100,
+            format: sdl3::sys::audio::SDL_AUDIO_S16,
+            channels: 2,
+        };
+        // This worker owns the stream and its device. SDL converts the queued
+        // signed-16 stereo source to the hardware format without changing our
+        // source-byte queue accounting. A new device stream starts paused.
+        let stream = unsafe {
+            sdl3::sys::audio::SDL_OpenAudioDeviceStream(
+                sdl3::sys::audio::SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+                &desired,
+                None,
+                std::ptr::null_mut(),
+            )
+        };
+        let Some(stream) = std::ptr::NonNull::new(stream) else {
+            let error = sdl3::get_error().to_string();
+            unsafe {
+                sdl3::sys::init::SDL_QuitSubSystem(sdl3::sys::init::SDL_INIT_AUDIO);
+            }
+            return Err(error);
+        };
+        Ok(Self { stream })
     }
     fn pause(&self) {
         unsafe {
-            sdl2::sys::SDL_PauseAudioDevice(self.0, 1);
+            sdl3::sys::audio::SDL_PauseAudioStreamDevice(self.stream.as_ptr());
         }
     }
     fn resume(&self) {
         unsafe {
-            sdl2::sys::SDL_PauseAudioDevice(self.0, 0);
+            sdl3::sys::audio::SDL_ResumeAudioStreamDevice(self.stream.as_ptr());
         }
     }
     fn clear(&self) {
         unsafe {
-            sdl2::sys::SDL_ClearQueuedAudio(self.0);
+            sdl3::sys::audio::SDL_ClearAudioStream(self.stream.as_ptr());
         }
     }
     fn size(&self) -> u32 {
-        unsafe { sdl2::sys::SDL_GetQueuedAudioSize(self.0) }
+        unsafe { sdl3::sys::audio::SDL_GetAudioStreamQueued(self.stream.as_ptr()).max(0) as u32 }
     }
     fn queue_audio(&self, samples: &[i16]) -> Result<(), String> {
         let length = samples
             .len()
             .checked_mul(2)
-            .and_then(|v| u32::try_from(v).ok())
+            .and_then(|v| i32::try_from(v).ok())
             .ok_or("Audio block too large")?;
-        if unsafe { sdl2::sys::SDL_QueueAudio(self.0, samples.as_ptr().cast(), length) } != 0 {
-            Err(sdl2::get_error())
-        } else {
+        if unsafe {
+            sdl3::sys::audio::SDL_PutAudioStreamData(
+                self.stream.as_ptr(),
+                samples.as_ptr().cast(),
+                length,
+            )
+        } {
             Ok(())
+        } else {
+            Err(sdl3::get_error().to_string())
         }
     }
 }
@@ -515,8 +549,8 @@ impl AudioOutput {
 impl Drop for AudioOutput {
     fn drop(&mut self) {
         unsafe {
-            sdl2::sys::SDL_CloseAudioDevice(self.0);
-            sdl2::sys::SDL_QuitSubSystem(sdl2::sys::SDL_INIT_AUDIO);
+            sdl3::sys::audio::SDL_DestroyAudioStream(self.stream.as_ptr());
+            sdl3::sys::init::SDL_QuitSubSystem(sdl3::sys::init::SDL_INIT_AUDIO);
         }
     }
 }
@@ -538,7 +572,16 @@ fn scrub_target(state: &mut Option<f64>, value: f64, held: bool, user_edit: bool
 
 #[cfg(test)]
 mod tests {
-    use super::scrub_target;
+    use super::{playback_wait, scrub_target};
+    use std::time::Duration;
+    #[test]
+    fn playback_wait_uses_pts_and_never_sleeps_when_late() {
+        assert_eq!(playback_wait(Some(1.0), 1.1), Duration::ZERO);
+        assert_eq!(playback_wait(Some(1.0), 1.0), Duration::ZERO);
+        assert_eq!(playback_wait(Some(0.016), 0.012), Duration::from_millis(4));
+        assert_eq!(playback_wait(Some(10.0), 1.0), Duration::from_millis(20));
+        assert_eq!(playback_wait(None, 1.0), Duration::from_millis(20));
+    }
     #[test]
     fn playback_updates_never_seek_and_drag_seeks_once_on_release() {
         let mut state = None;

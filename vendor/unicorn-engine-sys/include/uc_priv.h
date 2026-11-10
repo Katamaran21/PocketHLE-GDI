@@ -269,7 +269,22 @@ static inline bool _hook_exists_bounded(struct list_item *cur, uint64_t addr)
 typedef struct TargetPageBits TargetPageBits;
 typedef struct TCGContext TCGContext;
 
+/* Per-engine code-hook lookup cache. Entries retain list order, not callbacks. */
+#define UC_CODE_HOOK_CACHE_SIZE 256
+struct code_hook_cache_entry {
+    uint64_t address;
+    uint64_t generation;
+    struct list_item *first;
+    struct list_item *last;
+};
+
 struct uc_struct {
+    uint64_t code_hook_generation;
+    struct code_hook_cache_entry code_hook_cache[UC_CODE_HOOK_CACHE_SIZE];
+    /* Private opt-in: caller guarantees identity virtual mappings. */
+    bool ph_arm_identity_chaining;
+    bool ph_mips_mapping_tlb;
+
     uc_arch arch;
     uc_mode mode;
     uc_err errnum; // qemu/cpu-exec.c
@@ -432,13 +447,6 @@ struct uc_struct {
     bool thread_executable_entry;
     bool current_executable;
     bool skip_sync_pc_on_exit;
-    /* PocketHLE policy, selected before lazy CPU initialization. */
-    unsigned pockethle_tlb_initial_bits;
-    unsigned pockethle_tlb_floor_bits;
-    uint32_t pockethle_ram_policy;
-    unsigned pockethle_jump_bits;
-    void *pockethle_jump_helper;
-    uint32_t pockethle_optimization_flags;
 };
 
 // Metadata stub for the variable-size cpu context used with uc_context_*()

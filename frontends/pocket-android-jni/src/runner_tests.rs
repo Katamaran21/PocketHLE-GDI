@@ -34,7 +34,7 @@ fn report(root: &Path, name: &str) -> String {
     fs::read_to_string(path).unwrap()
 }
 fn run_diagnostic(root: &Path, id: &str) {
-    let session = start(root.to_path_buf(), id.to_string()).unwrap();
+    let session = start_with_presentation(root.to_path_buf(), id.to_string(), None).unwrap();
     let deadline = Instant::now() + Duration::from_secs(90);
     while session.is_running() && Instant::now() < deadline {
         // Dismiss only the diagnostic's final modal; input is routed by the runner.
@@ -82,12 +82,30 @@ fn android_runner_ramtest_processes_and_orphan_complete() {
     let id = lib
         .import_zip(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tools/ramtest/dist/PocketHLE-RAMTEST.zip"),
+                .join("../../tools/hardware-diag/suites/ram/dist/PocketHLE-RAMTEST.zip"),
         )
         .unwrap()
         .id
         .clone();
     run_diagnostic(&files.0, &id);
+    // Print every ARM report before asserting the parent result. Otherwise a
+    // parent process-suite failure hides PROCTEST/ORPHANTEST's actual cause.
+    let mut reports: Vec<_> = fs::read_dir(files.0.join("flash"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+        })
+        .collect();
+    reports.sort();
+    for path in reports {
+        match fs::read_to_string(&path) {
+            Ok(text) => println!("{}:\n{text}", path.display()),
+            Err(error) => println!("{}: report read failed: {error}", path.display()),
+        }
+    }
     for (name, result) in [
         (
             "RAMTEST.TXT",
@@ -99,7 +117,6 @@ fn android_runner_ramtest_processes_and_orphan_complete() {
         ("DEPTEST.TXT", "DEPTEST_RESULT PASS"),
     ] {
         let text = report(&files.0, name);
-        println!("{text}");
         assert!(text.contains(result) && !text.contains("FAIL"), "{text}");
     }
 }
@@ -111,7 +128,7 @@ fn android_runner_vfstest_sharing_rename_quota_and_repeat_cleanup() {
     let id = lib
         .import_zip(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tools/vfstest/dist/PocketHLE-VFSTEST.zip"),
+                .join("../../tools/hardware-diag/suites/vfs/dist/PocketHLE-VFSTEST.zip"),
         )
         .unwrap()
         .id
@@ -178,7 +195,7 @@ fn disabled_process_launch_reproduces_android_vfs_report() {
     let entry = lib
         .import_zip(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tools/vfstest/dist/PocketHLE-VFSTEST.zip"),
+                .join("../../tools/hardware-diag/suites/vfs/dist/PocketHLE-VFSTEST.zip"),
         )
         .unwrap()
         .clone();

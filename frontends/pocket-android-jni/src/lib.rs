@@ -7,16 +7,12 @@
 //!
 //! * `banner()` — sanity string showing the loaded version.
 //! * `listGames(libraryRoot)` — JSON array of [`pocket_library::GameEntry`].
-//! * `importCab(libraryRoot, cabPath)` — JSON of the freshly-imported entry.
+//! * `prepareImport` / cabinet-platform choice / `commitPreparedImport` — transactional import.
 //! * `removeGame(libraryRoot, id)` — `"ok"` or `"err: ..."`.
 //! * `readConfig(libraryRoot)` — JSON of [`pocket_library::LauncherConfig`].
 //! * `writeConfig(libraryRoot, json)` — overwrite config with a JSON blob.
 //! * `readGameSettings(libraryRoot, id)` — JSON of per-game settings.
 //! * `writeGameSettings(libraryRoot, id, json)` — persist per-game settings.
-//! * `runGame(libraryRoot, id)` — legacy single-shot emulator run that
-//!   only ever returns the *final* framebuffer. Kept around for
-//!   compatibility but the GUI no longer drives it because it looks
-//!   like a hang to the user; see [`runner`].
 //! * `nativeStartGame` / `nativePollFrame` / `nativeSendInput` /
 //!   `nativeRequestStop` / `nativeFinishGame` — session-based
 //!   replacement that streams framebuffers to the UI as the guest
@@ -28,6 +24,7 @@ mod bluetooth;
 mod camera;
 mod colors_trace;
 mod gps;
+mod graphics;
 mod internet;
 mod managed_game;
 mod power;
@@ -44,13 +41,11 @@ use jni::sys::{jbyteArray, jint, jlong, jshortArray, jstring};
 use jni::JNIEnv;
 
 use pocket_core::kernel::InputEvent;
-use pocket_core::Emulator;
 use pocket_library::{GameSettings, Library};
-use serde::Serialize;
 
 use crate::runner::{InputCommand, Session};
 
-// A running or still-joining session can write saves. Keep backups exclusive
+// A running or still-joining session can write saves. Keep backups/removal exclusive
 // with session creation, and retain the count until the worker has joined.
 static LIBRARY_SESSIONS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 
@@ -90,13 +85,17 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_libraryBackup<'local>
     )
 }
 
+fn about_banner() -> String {
+    format!("PocketHLE v{} (Android)\nFork: https://github.com/guizmox/PocketHLE\nOriginal project — j92580498-max\nhttps://github.com/j92580498-max/PocketHLE\n\nGTShell support — Katamaran21\nhttps://github.com/Katamaran21/PocketHLE-GTShell\n\nThanks\nNekomo\nOLego\nTimofeyLednev\nBenoît (FX-man)\nJérôme (SoldatGG)\nTim (Firefly)\nMarat\ntorrenia", env!("CARGO_PKG_VERSION"))
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_pockethle_app_NativeBridge_banner<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
     init_logger();
-    let banner = format!("PocketHLE v{} (Android)\nGTShell fork: https://github.com/Katamaran21/PocketHLE-GTShell\nBased on: https://github.com/guizmox/PocketHLE\nOriginal project: https://github.com/j92580498-max/PocketHLE", env!("CARGO_PKG_VERSION"));
+    let banner = about_banner();
     new_jstring(&env, banner)
 }
 
@@ -106,10 +105,7 @@ pub extern "system" fn Java_com_pockethle_app_MainActivity_banner<'local>(
     _class: JClass<'local>,
 ) -> jstring {
     init_logger();
-    new_jstring(
-        &env,
-        format!("PocketHLE v{} (Android)\nFork: https://github.com/guizmox/PocketHLE\nOriginal project: https://github.com/j92580498-max/PocketHLE", env!("CARGO_PKG_VERSION")),
-    )
+    new_jstring(&env, about_banner())
 }
 
 /// Explicit offline save action from Colors' startup dialog, before game launch.
@@ -186,11 +182,17 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_listGames<'local>(
             .iter()
             .map(|game| {
                 let mut value = serde_json::to_value(game)?;
+                value["is_gizmondo"] = pocket_library::is_gizmondo_game(game, &root).into();
                 value["title_id"] =
                     serde_json::to_value(pocket_library::game_gizmondo_title_id(game, &root))?;
                 let (width, height) = game.resolved_screen_size(&root);
                 value["screen_width"] = width.into();
                 value["screen_height"] = height.into();
+                value["custom_settings"] = game.settings.has_custom_settings(lib.config()).into();
+                value["graphics_api"] =
+                    serde_json::to_value(pocket_library::analysis::detect_graphics_api_cached(
+                        &game.executable_path(&root),
+                    ))?;
                 Ok(value)
             })
             .collect::<Result<Vec<serde_json::Value>, serde_json::Error>>()?;
@@ -346,115 +348,103 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_cancelPreparedImport<
     }
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_pockethle_app_NativeBridge_importCab<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    library_root: JString<'local>,
-    cab_path: JString<'local>,
-) -> jstring {
-    init_logger();
-    let root = match jstring_to_path(&mut env, library_root) {
-        Some(p) => p,
-        None => return new_jstring(&env, error_json("missing library root")),
-    };
-    let cab = match jstring_to_path(&mut env, cab_path) {
-        Some(p) => p,
-        None => return new_jstring(&env, error_json("missing cab path")),
-    };
-    let result = (|| -> anyhow::Result<String> {
-        let mut lib = Library::open(&root)?;
-        let entry = lib.import_cab(&cab)?;
-        Ok(serde_json::to_string(&entry)?)
-    })();
-    match result {
-        Ok(j) => new_jstring(&env, j),
-        Err(e) => new_jstring(&env, error_json(&format!("importCab: {e:#}"))),
-    }
+// A prepared addition owns its staged files until explicit Yes or Cancel.
+static PREPARED_DATA: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<u64, (PathBuf, pocket_library::add_data::PreparedData)>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn take_prepared_data(
+    root: &Path,
+    token: u64,
+) -> anyhow::Result<pocket_library::add_data::PreparedData> {
+    let mut pending = PREPARED_DATA.lock().unwrap_or_else(|e| e.into_inner());
+    anyhow::ensure!(
+        pending.get(&token).is_some_and(|(owner, _)| owner == root),
+        "Unknown data token or wrong library"
+    );
+    Ok(pending.remove(&token).unwrap().1)
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_pockethle_app_NativeBridge_importZip<'local>(
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_prepareGameData<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     library_root: JString<'local>,
-    zip_path: JString<'local>,
+    id: JString<'local>,
+    source: JString<'local>,
+    name: JString<'local>,
+    extract: jni::sys::jboolean,
 ) -> jstring {
-    init_logger();
-    let root = match jstring_to_path(&mut env, library_root) {
-        Some(p) => p,
-        None => return new_jstring(&env, error_json("missing library root")),
-    };
-    let zip = match jstring_to_path(&mut env, zip_path) {
-        Some(p) => p,
-        None => return new_jstring(&env, error_json("missing zip path")),
-    };
     let result = (|| -> anyhow::Result<String> {
-        let mut lib = Library::open(&root)?;
-        let entries = lib.import_zip_entries(&zip)?;
-        if entries.len() == 1 && !entries[0].source_cab.starts_with("gzga-collection:") {
-            Ok(serde_json::to_string(&entries[0])?)
-        } else {
-            Ok(serde_json::to_string(&entries)?)
-        }
+        let root = jstring_to_path(&mut env, library_root).context("Missing library root")?;
+        let id = jstring_to_string(&mut env, id).context("Missing game id")?;
+        let source = jstring_to_path(&mut env, source).context("Missing source")?;
+        let name = jstring_to_string(&mut env, name).context("Missing filename")?;
+        let sessions = LIBRARY_SESSIONS
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Library lock unavailable"))?;
+        anyhow::ensure!(*sessions == 0, "Stop the running game before adding data");
+        let pending = pocket_library::add_data::prepare(
+            &Library::open(&root)?,
+            &id,
+            &source,
+            &name,
+            extract != 0,
+        )?;
+        let token = NEXT_IMPORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let json = serde_json::json!({"ok": true, "token": token.to_string(), "conflicts": pending.conflicts(), "executables": pending.executables()}).to_string();
+        PREPARED_DATA
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(token, (root, pending));
+        Ok(json)
     })();
-    match result {
-        Ok(j) => new_jstring(&env, j),
-        Err(e) => new_jstring(&env, error_json(&format!("importZip: {e:#}"))),
-    }
+    new_jstring(
+        &env,
+        result.unwrap_or_else(|e| error_json(&format!("{e:#}"))),
+    )
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_pockethle_app_NativeBridge_importRar<'local>(
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_commitGameData<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     library_root: JString<'local>,
-    rar_path: JString<'local>,
+    token: jlong,
+    overwrite: jni::sys::jboolean,
+    executable: JString<'local>,
 ) -> jstring {
-    init_logger();
-    let root = match jstring_to_path(&mut env, library_root) {
-        Some(p) => p,
-        None => return new_jstring(&env, error_json("missing library root")),
-    };
-    let rar = match jstring_to_path(&mut env, rar_path) {
-        Some(p) => p,
-        None => return new_jstring(&env, error_json("missing rar path")),
-    };
     let result = (|| -> anyhow::Result<String> {
-        let mut lib = Library::open(&root)?;
-        let entry = lib.import_rar(&rar)?;
-        Ok(serde_json::to_string(&entry)?)
+        let root = jstring_to_path(&mut env, library_root).context("Missing library root")?;
+        let mut pending = take_prepared_data(&root, token as u64)?;
+        let executable =
+            jstring_to_string(&mut env, executable).context("Missing executable choice")?;
+        pending.choose_executable((!executable.is_empty()).then_some(executable.as_str()))?;
+        let sessions = LIBRARY_SESSIONS
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Library lock unavailable"))?;
+        anyhow::ensure!(*sessions == 0, "Stop the running game before adding data");
+        let destination = pending.destination().display().to_string();
+        pending.apply(&mut Library::open(&root)?, overwrite != 0)?;
+        Ok(serde_json::json!({"ok": true, "destination": destination}).to_string())
     })();
-    match result {
-        Ok(j) => new_jstring(&env, j),
-        Err(e) => new_jstring(&env, error_json(&format!("importRar: {e:#}"))),
-    }
+    new_jstring(
+        &env,
+        result.unwrap_or_else(|e| error_json(&format!("{e:#}"))),
+    )
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_pockethle_app_NativeBridge_importExe<'local>(
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_cancelGameData<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     library_root: JString<'local>,
-    exe_path: JString<'local>,
-) -> jstring {
-    init_logger();
-    let root = match jstring_to_path(&mut env, library_root) {
-        Some(p) => p,
-        None => return new_jstring(&env, error_json("missing library root")),
-    };
-    let exe = match jstring_to_path(&mut env, exe_path) {
-        Some(p) => p,
-        None => return new_jstring(&env, error_json("missing exe path")),
-    };
-    let result = (|| -> anyhow::Result<String> {
-        let mut lib = Library::open(&root)?;
-        let entry = lib.import_exe(&exe)?;
-        Ok(serde_json::to_string(&entry)?)
-    })();
-    match result {
-        Ok(j) => new_jstring(&env, j),
-        Err(e) => new_jstring(&env, error_json(&format!("importExe: {e:#}"))),
+    token: jlong,
+) {
+    if let Some(root) = jstring_to_path(&mut env, library_root) {
+        let _ = take_prepared_data(&root, token as u64);
     }
 }
 
@@ -475,6 +465,14 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_removeGame<'local>(
         None => return new_jstring(&env, error_json("missing game id")),
     };
     let result = (|| -> anyhow::Result<()> {
+        let sessions = LIBRARY_SESSIONS
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Library lock unavailable"))?;
+        anyhow::ensure!(
+            *sessions == 0,
+            "Stop the running game before removing a library entry"
+        );
+
         let mut lib = Library::open(&root)?;
         lib.remove(&id)?;
         Ok(())
@@ -622,138 +620,6 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_writeGameSettings<'lo
     }
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_pockethle_app_NativeBridge_runGame<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    library_root: JString<'local>,
-    id: JString<'local>,
-) -> jstring {
-    init_logger();
-    let root = match jstring_to_path(&mut env, library_root) {
-        Some(p) => p,
-        None => return new_jstring(&env, error_json("missing library root")),
-    };
-    let id = match jstring_to_string(&mut env, id) {
-        Some(s) => s,
-        None => return new_jstring(&env, error_json("missing game id")),
-    };
-    let outcome = run_game(&root, &id);
-    let payload = serde_json::to_string(&outcome)
-        .unwrap_or_else(|e| format!("{{\"ok\":false,\"error\":\"json: {e}\"}}"));
-    new_jstring(&env, payload)
-}
-
-#[derive(Serialize)]
-struct RunOutcomeJson {
-    ok: bool,
-    summary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    frame: Option<FrameJson>,
-}
-
-#[derive(Serialize)]
-struct FrameJson {
-    width: u32,
-    height: u32,
-    /// RGBA8888 bytes encoded as base64 (standard alphabet, padded).
-    rgba_b64: String,
-}
-
-fn run_game(root: &Path, id: &str) -> RunOutcomeJson {
-    let result = (|| -> anyhow::Result<RunOutcomeJson> {
-        let lib = Library::open(root)?;
-        let entry = lib.get(id).ok_or_else(|| anyhow::anyhow!("unknown game"))?;
-        let mut summary_lines = vec![
-            format!("Game: {}", entry.display_name),
-            format!("Backend: {}", entry.settings.cpu_backend.label()),
-        ];
-        let exe = entry.launch_path(root);
-        summary_lines.push(format!("Executable: {}", exe.display()));
-        let mut emu = build_unicorn().context("Unicorn unavailable")?;
-        emu.set_gpu_renderer(
-            entry
-                .settings
-                .gpu_renderer
-                .unwrap_or(lib.config().gpu_renderer),
-        );
-        emu.set_anisotropic_filtering(
-            entry
-                .settings
-                .anisotropic_filtering
-                .unwrap_or(lib.config().anisotropic_filtering),
-        );
-        emu.set_frame_rate_limit(entry.settings.frame_rate_limit.fps());
-        emu.max_slices = entry.settings.max_slices;
-        emu.instruction_budget_per_slice = entry.settings.instructions_per_slice;
-        emu.load_pe(&exe)?;
-        // Must follow `load_pe`, which creates the process that owns the
-        // framebuffer; before that the call is a no-op and the game runs
-        // at the 240x320 default whatever the user picked.
-        let (screen_w, screen_h) = entry.settings.screen.size();
-        emu.set_screen_size(screen_w, screen_h);
-        summary_lines.push(format!("Screen: {screen_w}x{screen_h}"));
-        for value in &entry.registry {
-            let registry_value = if let Some(text) = value.string.as_deref() {
-                pocket_core::kernel::registry::RegistryValue::Sz(text.to_string())
-            } else if let Some(number) = value.dword {
-                pocket_core::kernel::registry::RegistryValue::Dword(number)
-            } else {
-                continue;
-            };
-            emu.set_registry_value(&value.key, &value.name, registry_value);
-        }
-        emu.mount_dir("\\Application\\", entry.extracted_dir(root));
-        emu.mount_dir("\\Program Files\\", entry.extracted_dir(root));
-        emu.mount_dir("\\Program Files\\Game\\", entry.extracted_dir(root));
-        if let Some(install_dir) = &entry.install_dir {
-            emu.mount_dir(install_dir, entry.extracted_dir(root));
-        }
-        let run_status = match emu.run() {
-            Ok(()) => "Emulator exited cleanly.".to_string(),
-            Err(e) => format!("Emulator stopped: {e:#}"),
-        };
-        summary_lines.push(run_status);
-        let frame = emu.process().map(|p| {
-            let fb = &p.state.framebuffer;
-            FrameJson {
-                width: fb.width,
-                height: fb.height,
-                rgba_b64: base64_encode(&fb.snapshot_rgba8888()),
-            }
-        });
-        Ok(RunOutcomeJson {
-            ok: true,
-            summary: summary_lines.join("\n"),
-            error: None,
-            frame,
-        })
-    })();
-    match result {
-        Ok(j) => j,
-        Err(e) => RunOutcomeJson {
-            ok: false,
-            summary: "Run failed before emulator started".to_string(),
-            error: Some(format!("{e:#}")),
-            frame: None,
-        },
-    }
-}
-
-#[cfg(feature = "unicorn")]
-fn build_unicorn() -> anyhow::Result<Emulator> {
-    Emulator::with_unicorn_cpu()
-}
-
-#[cfg(not(feature = "unicorn"))]
-fn build_unicorn() -> anyhow::Result<Emulator> {
-    Err(anyhow::anyhow!(
-        "binary was not compiled with the `unicorn` feature"
-    ))
-}
-
 fn jstring_to_string<'a>(env: &mut JNIEnv<'a>, value: JString<'a>) -> Option<String> {
     if value.is_null() {
         return None;
@@ -789,38 +655,6 @@ fn error_json(msg: &str) -> String {
     format!("{{\"ok\":false,\"error\":\"{escaped}\"}}")
 }
 
-const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Tiny standalone base64 encoder so we don't need to add a `base64`
-/// dep just to ship the framebuffer over JNI.
-fn base64_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut i = 0;
-    while i + 3 <= input.len() {
-        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | input[i + 2] as u32;
-        out.push(B64_TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(B64_TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(B64_TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push(B64_TABLE[(n & 0x3f) as usize] as char);
-        i += 3;
-    }
-    let rem = input.len() - i;
-    if rem == 1 {
-        let n = (input[i] as u32) << 16;
-        out.push(B64_TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(B64_TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rem == 2 {
-        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
-        out.push(B64_TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(B64_TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(B64_TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push('=');
-    }
-    out
-}
-
 fn init_logger() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -836,12 +670,7 @@ fn init_logger() {
 // ---------------------------------------------------------------------------
 // Session-based emulator API
 //
-// `runGame` above is single-shot: it blocks until the emulator has run to
-// completion and only then returns the *final* framebuffer. With the trace
-// stub backend that is fast enough to look reasonable, but with the real
-// Unicorn backend the run lasts long enough that the user's UI sits on a
-// loading spinner for tens of seconds and they cannot push any input. The
-// methods below replace that with a streaming model:
+// A worker streams images and accepts input while the guest is running.
 //
 //  * `nativeStartGame` returns an opaque `jlong` handle (a pointer to a
 //    boxed [`Session`]).
@@ -876,6 +705,7 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeStartGame<'loca
     _class: JClass<'local>,
     library_root: JString<'local>,
     id: JString<'local>,
+    presentation: jlong,
 ) -> jlong {
     init_logger();
     if let Err(e) = bluetooth::install(&mut env, &_class) {
@@ -917,7 +747,7 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeStartGame<'loca
         }
     };
     let mut sessions = LIBRARY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    match runner::start(root, id) {
+    match runner::start_with_presentation(root, id, graphics::get(presentation)) {
         Ok(session) => {
             *sessions += 1;
             Box::into_raw(Box::new(session)) as jlong
@@ -930,14 +760,55 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeStartGame<'loca
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativePresentationFps(
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativePublishedImageIps(
     _env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
 ) -> jni::sys::jfloat {
     session_from_handle(handle)
-        .and_then(|session| session.presentation_fps())
+        .and_then(|session| session.published_image_ips())
         .unwrap_or(-1.0)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeSystemMedia(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+) -> jstring {
+    let Some(status) = session_from_handle(handle).and_then(Session::system_media) else {
+        return std::ptr::null_mut();
+    };
+    let progress = (status.duration.is_finite() && status.duration > 0.0)
+        .then(|| status.position() / status.duration);
+    new_jstring(
+        &env,
+        serde_json::json!({
+            "paused": status.paused,
+            "progress": progress,
+        })
+        .to_string(),
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeSystemMediaCommand(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    command: jint,
+) {
+    use pocket_core::winceapi::SystemMediaCommand;
+    let command = match command {
+        0 => SystemMediaCommand::TogglePause,
+        1 => SystemMediaCommand::Stop,
+        2 => SystemMediaCommand::Rewind,
+        3 => SystemMediaCommand::Forward,
+        _ => return,
+    };
+    if let Some(session) = session_from_handle(handle) {
+        session.send_input(InputCommand::SystemMedia(command));
+    }
 }
 
 #[no_mangle]
@@ -954,30 +825,74 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativePollFrame<'loca
         // showing the previous content of the SurfaceView.
         return std::ptr::null_mut();
     };
-    let total = 8usize.saturating_add(frame.rgba.len());
-    let array = match env.new_byte_array(total as i32) {
-        Ok(array) => array,
-        Err(e) => {
-            log::error!("could not allocate jbyteArray: {e}");
+    if frame.shared.is_some() {
+        let Some(bridge) = session.presentation() else {
+            return std::ptr::null_mut();
+        };
+        let words = [
+            u32::MAX - 1,
+            frame.width,
+            frame.height,
+            frame.texture_width,
+            frame.texture_height,
+        ];
+        let mut header: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let token = bridge.publish(frame);
+        header.extend_from_slice(&token.to_le_bytes());
+        return env
+            .byte_array_from_slice(&header)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+    }
+    let started = session.diagnostic_enabled().then(std::time::Instant::now);
+    let result = (|| {
+        // Native (1x) keeps the original eight-byte wire header. High resolution
+        // has a negative marker, logical dimensions and physical texture dimensions.
+        let words = if frame.rgb565 {
+            vec![u32::MAX - 2, frame.width, frame.height, frame.backlight]
+        } else if (frame.width, frame.height) == (frame.texture_width, frame.texture_height) {
+            vec![frame.width, frame.height]
+        } else {
+            vec![
+                u32::MAX,
+                frame.width,
+                frame.height,
+                frame.texture_width,
+                frame.texture_height,
+            ]
+        };
+        let header: Vec<i8> = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes().map(|byte| byte as i8))
+            .collect();
+        let total = header.len().saturating_add(frame.rgba.len());
+        let Ok(total) = i32::try_from(total) else {
+            return std::ptr::null_mut();
+        };
+        let array = match env.new_byte_array(total) {
+            Ok(array) => array,
+            Err(e) => {
+                log::error!("could not allocate jbyteArray: {e}");
+                return std::ptr::null_mut();
+            }
+        };
+        let rgba = unsafe {
+            std::slice::from_raw_parts(frame.rgba.as_ptr() as *const i8, frame.rgba.len())
+        };
+        if env.set_byte_array_region(&array, 0, &header).is_err()
+            || env
+                .set_byte_array_region(&array, header.len() as i32, rgba)
+                .is_err()
+        {
+            log::error!("could not fill jbyteArray");
             return std::ptr::null_mut();
         }
-    };
-    let mut header = [0i8; 8];
-    for (dst, src) in header[..4].iter_mut().zip(frame.width.to_le_bytes()) {
-        *dst = src as i8;
+        array.into_raw()
+    })();
+    if let Some(start) = started {
+        session.record_jni(start.elapsed());
     }
-    for (dst, src) in header[4..].iter_mut().zip(frame.height.to_le_bytes()) {
-        *dst = src as i8;
-    }
-    let rgba =
-        unsafe { std::slice::from_raw_parts(frame.rgba.as_ptr() as *const i8, frame.rgba.len()) };
-    if env.set_byte_array_region(&array, 0, &header).is_err()
-        || env.set_byte_array_region(&array, 8, rgba).is_err()
-    {
-        log::error!("could not fill jbyteArray");
-        return std::ptr::null_mut();
-    }
-    array.into_raw()
+    result
 }
 
 /// `nativeAudioFormat` — the guest PCM format packed as
@@ -1147,22 +1062,6 @@ fn session_from_handle<'a>(handle: jlong) -> Option<&'a Session> {
 
 fn clamp_u16(v: jint) -> u16 {
     v.clamp(0, u16::MAX as jint) as u16
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn base64_examples() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-    }
 }
 
 #[no_mangle]
@@ -1342,4 +1241,44 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativePollDependencyN
     env.new_string(message)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
+}
+
+/// Android exposes timer queries through EGL, but its Java GLES facade has no
+/// 64-bit query-result entry point. The GL-thread caller checks availability.
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeGpuQueryResult(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    query: jint,
+) -> jlong {
+    #[cfg(target_os = "android")]
+    {
+        type GetResult = unsafe extern "system" fn(u32, u32, *mut u64);
+        #[link(name = "EGL")]
+        unsafe extern "C" {
+            fn eglGetProcAddress(name: *const std::ffi::c_char) -> *const std::ffi::c_void;
+        }
+        static GET: std::sync::OnceLock<Option<GetResult>> = std::sync::OnceLock::new();
+        let get = GET.get_or_init(|| unsafe {
+            let p = eglGetProcAddress(c"glGetQueryObjectui64vEXT".as_ptr());
+            if p.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*const std::ffi::c_void, GetResult>(p))
+            }
+        });
+        if let Some(get) = get {
+            if query == 0 {
+                return 0;
+            }
+            let mut ns = 0;
+            unsafe {
+                get(query as u32, 0x8866, &mut ns);
+            }
+            return i64::try_from(ns).unwrap_or(-1);
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = query;
+    -1
 }

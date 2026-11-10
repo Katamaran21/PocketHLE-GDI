@@ -17,6 +17,197 @@ pub struct GameAnalysis {
     pub dependencies: Vec<(String, String)>,
 }
 
+/// Best-effort graphics label from PE imports and dynamic symbol references.
+/// This is an API hint, not proof of the active renderer. Unknown stays absent.
+/// Prefer framebuffer/3D APIs over GDI, which often only supplies menu text.
+pub fn detect_graphics_api(path: &std::path::Path) -> Option<&'static str> {
+    let bytes = std::fs::read(path).ok()?;
+    let image = pocket_pe::load_bytes(&bytes).ok()?;
+    let mut imports = image.imports;
+    // Use the same bundled COREDLL ordinal maps as the runtime, not game names.
+    static ARM: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    static MIPS: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let arm = ARM.get_or_init(|| {
+        serde_json::from_str(include_str!(
+            "../../pocket-winceapi/data/coredll-ordinals.json"
+        ))
+        .expect("bundled ordinals")
+    });
+    let mips = MIPS.get_or_init(|| {
+        serde_json::from_str(include_str!(
+            "../../pocket-winceapi/data/coredll-mips-ordinals.json"
+        ))
+        .expect("bundled MIPS ordinals")
+    });
+    for import in &mut imports {
+        if import.dll.eq_ignore_ascii_case("coredll.dll") {
+            if let pocket_pe::ImportBinding::Ordinal(ordinal) = import.binding {
+                let key = ordinal.to_string();
+                let name = if matches!(
+                    image.machine,
+                    pocket_pe::machine::MIPS_R3000 | pocket_pe::machine::MIPS_R4000
+                ) {
+                    mips["ordinals"][&key]
+                        .as_str()
+                        .or_else(|| arm["ordinals"][&key].as_str())
+                } else {
+                    arm["ordinals"][&key].as_str()
+                };
+                if let Some(name) = name {
+                    import.binding = pocket_pe::ImportBinding::Name(name.into());
+                }
+            }
+        }
+    }
+    let strings = binary_strings(&bytes);
+    graphics_api_from_evidence(&imports, &strings)
+}
+
+/// Process-local cache for catalogue refreshes. File metadata, not game names,
+/// invalidates both known and unknown API results after executable replacement.
+#[derive(Default)]
+struct GraphicsApiCache {
+    entries: std::collections::HashMap<
+        std::path::PathBuf,
+        (u64, std::time::SystemTime, Option<&'static str>),
+    >,
+}
+impl GraphicsApiCache {
+    fn get(
+        &mut self,
+        path: &std::path::Path,
+        detect: impl FnOnce(&std::path::Path) -> Option<&'static str>,
+    ) -> Option<&'static str> {
+        let stamp = std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok().map(|t| (m.len(), t)));
+        let Some((len, modified)) = stamp else {
+            self.entries.remove(path);
+            return detect(path);
+        };
+        if let Some((old_len, old_time, label)) = self.entries.get(path) {
+            if *old_len == len && *old_time == modified {
+                return *label;
+            }
+        }
+        let label = detect(path);
+        self.entries
+            .insert(path.to_path_buf(), (len, modified, label));
+        label
+    }
+}
+pub fn detect_graphics_api_cached(path: &std::path::Path) -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<GraphicsApiCache>> =
+        std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path, detect_graphics_api)
+}
+
+fn graphics_api_from_evidence(
+    imports: &[pocket_pe::ImportSymbol],
+    strings: &[String],
+) -> Option<&'static str> {
+    let mut imports = imports.to_vec();
+    let dynamic=imports.iter().any(|i| matches!(&i.binding,pocket_pe::ImportBinding::Name(name) if matches!(name.to_ascii_lowercase().as_str(),"getprocaddressw"|"getprocaddressa"|"getprocaddress")));
+    if dynamic {
+        let strings: Vec<_> = strings.iter().map(|s| s.to_ascii_lowercase()).collect();
+        let exact = |name: &str| strings.iter().any(|s| s == name);
+        let mut add = |name: &str| {
+            imports.push(pocket_pe::ImportSymbol {
+                dll: String::new(),
+                binding: pocket_pe::ImportBinding::Name(name.into()),
+                iat_va: 0,
+            })
+        };
+        if exact("eglinitialize") && exact("eglswapbuffers") {
+            add("eglSwapBuffers");
+        }
+        if strings.iter().any(|s| s.contains("gxbegindraw")) {
+            add("GXBeginDraw");
+        }
+        if exact("directdrawcreate") {
+            add("DirectDrawCreate");
+        }
+        if exact("direct3dmobilecreate") {
+            add("Direct3DMobileCreate");
+        }
+    }
+    graphics_api_from_imports(&imports)
+}
+
+fn graphics_api_from_imports(imports: &[pocket_pe::ImportSymbol]) -> Option<&'static str> {
+    let mut gles = false;
+    let mut d3dm = false;
+    let mut ddraw = false;
+    let mut gapi = false;
+    let mut gdi = false;
+    let mut sdl = false;
+    let mut gapidraw = false;
+    for import in imports {
+        let dll = import.dll.to_ascii_lowercase();
+        gles |= matches!(
+            dll.as_str(),
+            "libgles_cm.dll"
+                | "libgles_cl.dll"
+                | "libglesv1_cm.dll"
+                | "libglesv2.dll"
+                | "gles.dll"
+                | "libgles.dll"
+        );
+        d3dm |= dll == "d3dm.dll";
+        ddraw |= dll == "ddraw.dll";
+        if let pocket_pe::ImportBinding::Name(name) = &import.binding {
+            let name = name.to_ascii_lowercase();
+            gles |= matches!(
+                name.as_str(),
+                "eglswapbuffers" | "glclear" | "gldrawarrays" | "gldrawelements"
+            );
+            gapidraw |= name.contains("@cgapidisplay@@")
+                && (name.starts_with("?opendisplay@") || name.starts_with("?flip@"));
+            sdl |= matches!(
+                name.as_str(),
+                "sdl_setvideomode" | "sdl_updaterects" | "sdl_createrenderer"
+            );
+            d3dm |= name == "direct3dmobilecreate";
+            ddraw |= name == "directdrawcreate";
+            // GXOpenInput/GXGetDefaultKeys alone do not imply GAPI rendering.
+            gapi |= ["gxopendisplay", "gxbegindraw", "gxenddraw"]
+                .iter()
+                .any(|api| name == *api || name.starts_with(&format!("?{api}@@")));
+            gdi |= matches!(
+                name.as_str(),
+                "bitblt"
+                    | "stretchblt"
+                    | "stretchdibits"
+                    | "setdibitstodevice"
+                    | "textoutw"
+                    | "exttextoutw"
+                    | "patblt"
+            );
+        }
+    }
+    if gles {
+        Some("OpenGL ES")
+    } else if d3dm {
+        Some("Direct3D Mobile")
+    } else if ddraw {
+        Some("DirectDraw")
+    } else if gapi {
+        Some("GAPI")
+    } else if gapidraw {
+        Some("GapiDraw")
+    } else if sdl {
+        Some("SDL")
+    } else if gdi {
+        Some("GDI")
+    } else {
+        None
+    }
+}
+
 pub fn detect_gizmondo_title_id(root: &std::path::Path) -> Option<String> {
     fn scan(dir: &std::path::Path, depth: usize) -> Option<String> {
         if depth > 5 {
@@ -182,6 +373,30 @@ fn serial_gps_evidence(text: &str) -> Option<&'static str> {
     .iter()
     .any(|s| text.contains(s));
     (gps && transport).then_some("Serial/NMEA GPS (port string or serial API with GPS evidence)")
+}
+
+/// Identify the Gizmondo runtime that uses a rotated LCD framebuffer.
+pub fn uses_rotated_gizmondo_lcd(image: &pocket_pe::LoadedImage) -> bool {
+    use pocket_pe::resources::ResourceKey;
+    image
+        .resources
+        .iter()
+        .filter(|entry| entry.ty == ResourceKey::Id(16))
+        .any(|entry| {
+            let Some(bytes) = image.sections.iter().find_map(|section| {
+                let offset = entry.data_rva.checked_sub(section.virtual_address)? as usize;
+                section
+                    .data
+                    .get(offset..offset.checked_add(entry.size as usize)?)
+            }) else {
+                return false;
+            };
+            let strings = binary_strings(bytes);
+            ["InternalName", "ProductName"].into_iter().all(|key| {
+                version_value(&strings, key)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("mophun"))
+            })
+        })
 }
 
 fn version_value(strings: &[String], key: &str) -> Option<String> {
@@ -643,5 +858,134 @@ mod serial_gps_detection_tests {
         assert!(
             serial_gps_evidence(&binary_strings(&bytes).join(" ").to_ascii_lowercase()).is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod graphics_api_tests {
+    use super::*;
+    fn import(dll: &str, name: &str) -> pocket_pe::ImportSymbol {
+        pocket_pe::ImportSymbol {
+            dll: dll.into(),
+            binding: pocket_pe::ImportBinding::Name(name.into()),
+            iat_va: 0,
+        }
+    }
+    #[test]
+    fn graphics_labels_and_rendering_priority() {
+        let gdi = import("COREDLL.dll", "BitBlt");
+        let gapi = import("gx.dll", "?GXBeginDraw@@YAPAXXZ");
+        assert_eq!(graphics_api_from_imports(&[gdi.clone()]), Some("GDI"));
+        assert_eq!(
+            graphics_api_from_imports(&[gdi.clone(), gapi.clone()]),
+            Some("GAPI")
+        );
+        assert_eq!(
+            graphics_api_from_imports(&[gdi.clone(), import("DDRAW.dll", "DirectDrawCreate")]),
+            Some("DirectDraw")
+        );
+        assert_eq!(
+            graphics_api_from_imports(&[import("d3dm.dll", "Direct3DMobileCreate")]),
+            Some("Direct3D Mobile")
+        );
+        let gles = pocket_pe::ImportSymbol {
+            dll: "libGLES_CM.dll".into(),
+            binding: pocket_pe::ImportBinding::Ordinal(1),
+            iat_va: 0,
+        };
+        assert_eq!(
+            graphics_api_from_imports(&[gdi, gapi, gles]),
+            Some("OpenGL ES")
+        );
+    }
+    #[test]
+    fn dynamic_graphics_and_sdl_are_evidence_based() {
+        let resolver = import("COREDLL.dll", "GetProcAddressW");
+        let symbols = vec!["eglInitialize".into(), "eglSwapBuffers".into()];
+        assert_eq!(
+            graphics_api_from_evidence(&[resolver.clone()], &symbols),
+            Some("OpenGL ES")
+        );
+        assert_eq!(graphics_api_from_evidence(&[], &symbols), None);
+        assert_eq!(
+            graphics_api_from_evidence(
+                &[resolver],
+                &["GAPI: Calling GXBeginDraw() to retrieve framebuffer".into()]
+            ),
+            Some("GAPI")
+        );
+        assert_eq!(
+            graphics_api_from_imports(&[import("SDL.dll", "SDL_SetVideoMode")]),
+            Some("SDL")
+        );
+        assert_eq!(
+            graphics_api_from_imports(&[import("SDL.dll", "SDL_mutexP")]),
+            None
+        );
+        assert_eq!(
+            graphics_api_from_imports(&[import(
+                "GD101.dll",
+                "?OpenDisplay@CGapiDisplay@@QAAJPAUHWND__@@K@Z"
+            )]),
+            Some("GapiDraw")
+        );
+        assert_eq!(
+            graphics_api_from_imports(&[import("GD101.dll", "?StartTimer@CGapiTimer@@QAAJK@Z")]),
+            None
+        );
+    }
+
+    #[test]
+    fn no_renderer_guessed_from_input_or_unknown_ordinals() {
+        assert_eq!(
+            graphics_api_from_imports(&[import("gx.dll", "?GXOpenInput@@YAHXZ")]),
+            None
+        );
+        assert_eq!(
+            graphics_api_from_imports(&[pocket_pe::ImportSymbol {
+                dll: "coredll.dll".into(),
+                binding: pocket_pe::ImportBinding::Ordinal(1),
+                iat_va: 0
+            }]),
+            None
+        );
+        assert_eq!(
+            detect_graphics_api(std::path::Path::new("/nonexistent/pockethle.exe")),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod catalogue_cache_tests {
+    use super::*;
+    #[test]
+    fn executable_metadata_invalidates_cached_known_and_unknown_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("game.exe");
+        std::fs::write(&file, b"one").unwrap();
+        let mut cache = GraphicsApiCache::default();
+        assert_eq!(cache.get(&file, |_| Some("GDI")), Some("GDI"));
+        assert_eq!(
+            cache.get(&file, |_| panic!("unchanged executable was rescanned")),
+            Some("GDI")
+        );
+        std::fs::write(&file, b"changed").unwrap();
+        assert_eq!(cache.get(&file, |_| None), None);
+        assert_eq!(
+            cache.get(&file, |_| panic!("unknown result must also be cached")),
+            None
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(cache.get(&file, |_| Some("OpenGL ES")), Some("OpenGL ES"));
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(cache.get(&file, |_| None), None);
+        std::fs::write(&file, b"changed").unwrap();
+        assert_eq!(cache.get(&file, |_| Some("GAPI")), Some("GAPI"));
     }
 }

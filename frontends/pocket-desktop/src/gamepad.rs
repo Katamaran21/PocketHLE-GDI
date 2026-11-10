@@ -1,8 +1,8 @@
-//! Dedicated SDL2 controller worker. HIDAPI initializes the Switch Pro protocol;
+//! Dedicated SDL3 controller worker. HIDAPI initializes the Switch Pro protocol;
 //! only input subsystems are used, leaving egui's window and CPAL audio alone.
-use sdl2::{
-    controller::{Axis, Button, GameController},
+use sdl3::{
     event::Event as SdlEvent,
+    gamepad::{Axis, Button, Gamepad},
     joystick::{HatState, Joystick},
 };
 use std::{
@@ -36,25 +36,12 @@ pub enum Event {
     },
     Error(String),
 }
-pub fn label(control: &str) -> String {
-    match control {
-        "South" => "South (Switch B / Xbox A)".into(),
-        "East" => "East (Switch A / Xbox B)".into(),
-        "North" => "North (Switch X / Xbox Y)".into(),
-        "West" => "West (Switch Y / Xbox X)".into(),
-        "LeftTrigger" => "L / LB".into(),
-        "RightTrigger" => "R / RB".into(),
-        "LeftTrigger2" => "ZL / LT".into(),
-        "RightTrigger2" => "ZR / RT".into(),
-        other => other.into(),
-    }
-}
 fn button_name(button: Button) -> String {
     match button {
-        Button::A => "South",
-        Button::B => "East",
-        Button::X => "West",
-        Button::Y => "North",
+        Button::South => "South",
+        Button::East => "East",
+        Button::West => "West",
+        Button::North => "North",
         Button::Back => "Select",
         Button::Guide => "Mode",
         Button::Start => "Start",
@@ -66,6 +53,10 @@ fn button_name(button: Button) -> String {
         Button::DPadDown => "DPadDown",
         Button::DPadLeft => "DPadLeft",
         Button::DPadRight => "DPadRight",
+        Button::RightPaddle1 => "Paddle1",
+        Button::LeftPaddle1 => "Paddle2",
+        Button::RightPaddle2 => "Paddle3",
+        Button::LeftPaddle2 => "Paddle4",
         _ => return format!("{button:?}"),
     }
     .into()
@@ -177,10 +168,10 @@ impl Transitions {
 // Poll the same normalized controls used by SDL events. Dolphin likewise
 // refreshes gamepad state explicitly; keep events as well for short presses.
 const POLLED_BUTTONS: [Button; 21] = [
-    Button::A,
-    Button::B,
-    Button::X,
-    Button::Y,
+    Button::South,
+    Button::East,
+    Button::West,
+    Button::North,
     Button::Back,
     Button::Guide,
     Button::Start,
@@ -193,10 +184,10 @@ const POLLED_BUTTONS: [Button; 21] = [
     Button::DPadLeft,
     Button::DPadRight,
     Button::Misc1,
-    Button::Paddle1,
-    Button::Paddle2,
-    Button::Paddle3,
-    Button::Paddle4,
+    Button::RightPaddle1,
+    Button::LeftPaddle1,
+    Button::RightPaddle2,
+    Button::LeftPaddle2,
     Button::Touchpad,
 ];
 const POLLED_AXES: [Axis; 6] = [
@@ -207,8 +198,11 @@ const POLLED_AXES: [Axis; 6] = [
     Axis::TriggerLeft,
     Axis::TriggerRight,
 ];
-fn poll_controller(controller: &GameController, state: &mut Transitions) -> Vec<Event> {
-    let id = controller.instance_id() as usize;
+fn poll_controller(controller: &Gamepad, state: &mut Transitions) -> Vec<Event> {
+    let Ok(id) = controller.id() else {
+        return Vec::new();
+    };
+    let id = id.raw() as usize;
     let mut changes = Vec::new();
     for button in POLLED_BUTTONS {
         changes.extend(state.change(id, button_name(button), controller.button(button)));
@@ -219,72 +213,124 @@ fn poll_controller(controller: &GameController, state: &mut Transitions) -> Vec<
     changes
 }
 enum Device {
-    Controller(GameController),
+    Controller(Gamepad),
     Raw(Joystick),
 }
 impl Device {
-    fn id(&self) -> u32 {
+    fn id(&self) -> Option<u32> {
         match self {
-            Self::Controller(d) => d.instance_id(),
-            Self::Raw(d) => d.instance_id(),
+            Self::Controller(d) => d.id().ok().map(|id| id.raw()),
+            Self::Raw(d) => Some(d.id().raw()),
         }
     }
     fn name(&self) -> String {
         match self {
-            Self::Controller(d) => d.name(),
+            Self::Controller(d) => d.name().unwrap_or_else(|| "Controller".into()),
             Self::Raw(d) => d.name(),
         }
     }
     fn attached(&self) -> bool {
         match self {
-            Self::Controller(d) => d.attached(),
-            Self::Raw(d) => d.attached(),
+            Self::Controller(d) => d.connected(),
+            Self::Raw(d) => d.connected(),
         }
     }
     fn has_rumble(&self) -> bool {
         match self {
-            Self::Controller(d) => d.has_rumble(),
-            Self::Raw(d) => d.has_rumble(),
+            Self::Controller(d) => unsafe { d.has_rumble() },
+            Self::Raw(d) => unsafe { d.has_rumble() },
         }
     }
     fn rumble(&mut self, on: bool) -> Result<(), String> {
         let strength = if on { 32768 } else { 0 };
         match self {
-            Self::Controller(d) => d.set_rumble(strength, strength, 100),
-            Self::Raw(d) => d.set_rumble(strength, strength, 100),
+            Self::Controller(d) => d
+                .set_rumble(strength, strength, 100)
+                .map_err(|e| e.to_string()),
+            Self::Raw(d) => {
+                if d.set_rumble(strength, strength, 100) {
+                    Ok(())
+                } else {
+                    Err(sdl3::get_error().to_string())
+                }
+            }
         }
-        .map_err(|e| e.to_string())
     }
     fn raw(&self) -> bool {
         matches!(self, Self::Raw(_))
     }
 }
 fn scan(
-    controllers: &sdl2::GameControllerSubsystem,
-    joysticks: &sdl2::JoystickSubsystem,
+    controllers: &sdl3::GamepadSubsystem,
+    joysticks: &sdl3::JoystickSubsystem,
     devices: &mut BTreeMap<u32, Device>,
 ) -> Result<bool, String> {
     let mut changed = false;
-    for index in 0..joysticks.num_joysticks()? {
-        let device = if controllers.is_game_controller(index) {
+    for index in joysticks.joysticks().map_err(|e| e.to_string())? {
+        let device = if controllers.is_gamepad(index) {
             Device::Controller(controllers.open(index).map_err(|e| e.to_string())?)
         } else {
             Device::Raw(joysticks.open(index).map_err(|e| e.to_string())?)
         };
-        if let std::collections::btree_map::Entry::Vacant(entry) = devices.entry(device.id()) {
+        let Some(id) = device.id() else {
+            continue;
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) = devices.entry(id) {
             entry.insert(device);
             changed = true;
         }
     }
     Ok(changed)
 }
-fn publish(tx: &Sender<Event>, ctx: &egui::Context, event: Event) -> Result<(), String> {
+fn publish(
+    tx: &Sender<Event>,
+    ctx: &egui::Context,
+    event: Event,
+    gameplay: bool,
+) -> Result<(), String> {
+    let analog = matches!(&event, Event::SteeringAxis { .. } | Event::AimAxis { .. });
     tx.send(event)
         .map_err(|_| "controller receiver closed".to_owned())?;
+    // Small idle stick variations may arrive continuously over HID. Keep every
+    // event, but do not turn each analog report into a redundant game redraw.
+    // Incoming images and the Run fallback already service the input queue.
+    if gameplay && analog {
+        return Ok(());
+    }
+    if gameplay {
+        let native_wake = ctx.data(|data| {
+            data.get_temp::<Arc<dyn Fn() + Send + Sync>>(egui::Id::new(
+                "pockethle.native_image_wake",
+            ))
+        });
+        if let Some(wake) = native_wake {
+            wake();
+            return Ok(());
+        }
+    }
+    // Menus and button events without a native wake retain egui scheduling.
     ctx.request_repaint();
     Ok(())
 }
-fn list(devices: &BTreeMap<u32, Device>) -> Event {
+fn list(devices: &BTreeMap<u32, Device>, ctx: &egui::Context) -> Event {
+    crate::controller_labels::replace(
+        ctx,
+        devices.iter().map(|(id, device)| {
+            let labels = match device {
+                Device::Controller(pad) => {
+                    [Button::South, Button::East, Button::West, Button::North].map(|button| {
+                        use sdl3::gamepad::ButtonLabel;
+                        match pad.button_label_for_gamepad_type(button) {
+                            ButtonLabel::Unknown => None,
+                            label => Some(format!("{label:?}")),
+                        }
+                    })
+                }
+                Device::Raw(_) => Default::default(),
+            };
+            (*id as usize, labels)
+        }),
+    );
     Event::Devices(
         devices
             .iter()
@@ -300,29 +346,34 @@ fn worker(
     selected: &AtomicUsize,
     enabled: &AtomicBool,
     commands: &Receiver<crate::rumble::Command>,
+    steam_deck: bool,
 ) -> Result<(), String> {
     // egui's window is not an SDL window. SDL must receive reports even with
     // no SDL keyboard focus; guest input is still gated by egui's real focus.
-    sdl2::hint::set("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
-    sdl2::hint::set("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0");
-    sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "1");
-    sdl2::hint::set("SDL_JOYSTICK_HIDAPI_SWITCH", "1");
-    if cfg!(feature = "steam-deck") && crate::gamepad_host::is_wine() {
+    sdl3::hint::set("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+    sdl3::hint::set("SDL_JOYSTICK_HIDAPI", "1");
+    sdl3::hint::set("SDL_JOYSTICK_HIDAPI_SWITCH", "1");
+    if steam_deck && crate::gamepad_host::is_wine() {
         // Apply after normal defaults and before opening any SDL device.
         // Explicit environment overrides remain available for advanced setups.
         for (name, value) in crate::gamepad_host::PROTON_HINTS {
-            sdl2::hint::set(name, value);
+            sdl3::hint::set(name, value);
         }
         log::info!("Controller profile: Wine/Proton XInput");
     }
-    let sdl = sdl2::init()?;
-    let controllers = sdl.game_controller()?;
-    let joysticks = sdl.joystick()?;
-    let mut events = sdl.event_pump()?;
+    let sdl = sdl3::init().map_err(|e| e.to_string())?;
+    let controllers = sdl.gamepad().map_err(|e| e.to_string())?;
+    let joysticks = sdl.joystick().map_err(|e| e.to_string())?;
+    let mut events = sdl.event_pump().map_err(|e| e.to_string())?;
     let mut devices = BTreeMap::new();
     let mut state = Transitions::default();
     scan(&controllers, &joysticks, &mut devices)?;
-    publish(tx, ctx, list(&devices))?;
+    publish(
+        tx,
+        ctx,
+        list(&devices, ctx),
+        enabled.load(Ordering::Relaxed),
+    )?;
     let mut motors = BTreeMap::<u64, Option<crate::rumble::Pattern>>::new();
     let mut playing: Option<u32> = None;
     let mut rumble_on = false;
@@ -427,38 +478,56 @@ fn worker(
         for event in events.poll_iter() {
             let mut changes = Vec::new();
             match event {
-                SdlEvent::JoyDeviceAdded { .. } | SdlEvent::ControllerDeviceAdded { .. } => {
+                SdlEvent::JoyDeviceAdded { .. } | SdlEvent::GamepadAdded { .. } => {
                     if scan(&controllers, &joysticks, &mut devices)? {
-                        publish(tx, ctx, list(&devices))?;
+                        publish(
+                            tx,
+                            ctx,
+                            list(&devices, ctx),
+                            enabled.load(Ordering::Relaxed),
+                        )?;
                     }
                 }
                 SdlEvent::JoyDeviceRemoved { which, .. }
-                | SdlEvent::ControllerDeviceRemoved { which, .. } => {
-                    if devices.remove(&which).is_some() {
-                        changes = state.disconnect(which as usize);
-                        publish(tx, ctx, list(&devices))?;
+                | SdlEvent::GamepadRemoved { which, .. } => {
+                    if devices.remove(&which.raw()).is_some() {
+                        changes = state.disconnect(which.raw() as usize);
+                        publish(
+                            tx,
+                            ctx,
+                            list(&devices, ctx),
+                            enabled.load(Ordering::Relaxed),
+                        )?;
                     }
                 }
-                SdlEvent::ControllerButtonDown { which, button, .. } => {
-                    changes.extend(state.change(which as usize, button_name(button), true));
+                SdlEvent::GamepadRemapped { .. } => {
+                    publish(
+                        tx,
+                        ctx,
+                        list(&devices, ctx),
+                        enabled.load(Ordering::Relaxed),
+                    )?;
                 }
-                SdlEvent::ControllerButtonUp { which, button, .. } => {
-                    changes.extend(state.change(which as usize, button_name(button), false));
+                SdlEvent::GamepadButtonDown { which, button, .. } => {
+                    changes.extend(state.change(which.raw() as usize, button_name(button), true));
                 }
-                SdlEvent::ControllerAxisMotion {
+                SdlEvent::GamepadButtonUp { which, button, .. } => {
+                    changes.extend(state.change(which.raw() as usize, button_name(button), false));
+                }
+                SdlEvent::GamepadAxisMotion {
                     which, axis, value, ..
                 } => {
-                    changes = state.controller_axis(which as usize, axis, value);
+                    changes = state.controller_axis(which.raw() as usize, axis, value);
                     if matches!(axis, Axis::LeftX | Axis::LeftY) {
                         changes.push(Event::SteeringAxis {
-                            device: which as usize,
+                            device: which.raw() as usize,
                             horizontal: axis == Axis::LeftX,
                             value: (value as f32 / 32767.0).clamp(-1.0, 1.0),
                         });
                     }
                     if matches!(axis, Axis::RightX | Axis::RightY) {
                         changes.push(Event::AimAxis {
-                            device: which as usize,
+                            device: which.raw() as usize,
                             horizontal: axis == Axis::RightX,
                             value: (value as f32 / 32767.0).clamp(-1.0, 1.0),
                         });
@@ -469,9 +538,9 @@ fn worker(
                 }
                 | SdlEvent::JoyButtonUp {
                     which, button_idx, ..
-                } if devices.get(&which).is_some_and(Device::raw) => {
+                } if devices.get(&which.raw()).is_some_and(Device::raw) => {
                     changes.extend(state.change(
-                        which as usize,
+                        which.raw() as usize,
                         format!("SdlRawButton:{button_idx}"),
                         matches!(event, SdlEvent::JoyButtonDown { .. }),
                     ));
@@ -481,9 +550,9 @@ fn worker(
                     axis_idx,
                     value,
                     ..
-                } if devices.get(&which).is_some_and(Device::raw) => {
+                } if devices.get(&which.raw()).is_some_and(Device::raw) => {
                     changes = state.axis(
-                        which as usize,
+                        which.raw() as usize,
                         &format!("SdlRawAxis:{axis_idx}-"),
                         &format!("SdlRawAxis:{axis_idx}+"),
                         value as f32 / 32767.0,
@@ -494,13 +563,13 @@ fn worker(
                     hat_idx,
                     state: hat,
                     ..
-                } if devices.get(&which).is_some_and(Device::raw) => {
-                    changes = state.hat(which as usize, hat_idx, hat);
+                } if devices.get(&which.raw()).is_some_and(Device::raw) => {
+                    changes = state.hat(which.raw() as usize, hat_idx, hat);
                 }
                 _ => {}
             }
             for change in changes {
-                publish(tx, ctx, change)?;
+                publish(tx, ctx, change, enabled.load(Ordering::Relaxed))?;
             }
         }
         // Explicit refresh also works when SDL's automatic event update is
@@ -514,7 +583,7 @@ fn worker(
             let changes = match device {
                 Device::Controller(controller) => poll_controller(controller, &mut state),
                 Device::Raw(joystick) => {
-                    let id = joystick.instance_id() as usize;
+                    let id = joystick.id().raw() as usize;
                     let mut changes = Vec::new();
                     for button in 0..joystick.num_buttons().min(256) {
                         if let Ok(down) = joystick.button(button) {
@@ -544,7 +613,7 @@ fn worker(
                 }
             };
             for change in changes {
-                publish(tx, ctx, change)?;
+                publish(tx, ctx, change, enabled.load(Ordering::Relaxed))?;
             }
         }
         if Instant::now() >= next_scan {
@@ -557,13 +626,18 @@ fn worker(
             for id in gone {
                 devices.remove(&id);
                 for change in state.disconnect(id as usize) {
-                    publish(tx, ctx, change)?;
+                    publish(tx, ctx, change, enabled.load(Ordering::Relaxed))?;
                 }
                 changed = true;
             }
             changed |= scan(&controllers, &joysticks, &mut devices)?;
             if changed {
-                publish(tx, ctx, list(&devices))?;
+                publish(
+                    tx,
+                    ctx,
+                    list(&devices, ctx),
+                    enabled.load(Ordering::Relaxed),
+                )?;
             }
             next_scan = Instant::now() + Duration::from_secs(1);
         }
@@ -610,7 +684,7 @@ impl Drop for Monitor {
         }
     }
 }
-pub fn start(ctx: egui::Context) -> Monitor {
+pub fn start(ctx: egui::Context, steam_deck: bool) -> Monitor {
     let (tx, rx) = mpsc::channel();
     let alive = Arc::new(AtomicBool::new(true));
     let worker_alive = alive.clone();
@@ -635,8 +709,9 @@ pub fn start(ctx: egui::Context) -> Monitor {
                 &worker_selected,
                 &worker_enabled,
                 &command_rx,
+                steam_deck,
             ) {
-                let _ = publish(&tx, &ctx, Event::Error(error));
+                let _ = publish(&tx, &ctx, Event::Error(error), false);
             }
         })
         .expect("spawn controller worker");
@@ -653,6 +728,125 @@ pub fn start(ctx: egui::Context) -> Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    fn context(native: bool) -> (egui::Context, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let c = egui::Context::default();
+        let normal = Arc::new(AtomicUsize::new(0));
+        let n = normal.clone();
+        c.set_request_repaint_callback(move |i| {
+            if i.delay.is_zero() {
+                n.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let _ = c.run(Default::default(), |_| {});
+        let _ = c.run(Default::default(), |_| {});
+        normal.store(0, Ordering::SeqCst);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        if native {
+            let n = wakes.clone();
+            let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                n.fetch_add(1, Ordering::SeqCst);
+            });
+            c.data_mut(|d| d.insert_temp(egui::Id::new("pockethle.native_image_wake"), wake));
+        }
+        (c, normal, wakes)
+    }
+    #[test]
+    fn idle_axis_burst_keeps_all_values_without_requesting_redraw() {
+        let (c, normal, native) = context(true);
+        let (tx, rx) = mpsc::channel();
+        for i in 0..1000 {
+            publish(
+                &tx,
+                &c,
+                Event::SteeringAxis {
+                    device: 1,
+                    horizontal: true,
+                    value: i as f32 / 32767.0,
+                },
+                true,
+            )
+            .unwrap();
+        }
+        for i in 0..1000 {
+            let Event::SteeringAxis { value, .. } = rx.recv().unwrap() else {
+                panic!()
+            };
+            assert_eq!(value, i as f32 / 32767.0);
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(normal.load(Ordering::SeqCst), 0);
+        assert_eq!(native.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn press_and_release_keep_order_and_wake_native_immediately() {
+        let (c, normal, native) = context(true);
+        let (tx, rx) = mpsc::channel();
+        for down in [true, false] {
+            publish(
+                &tx,
+                &c,
+                Event::Input {
+                    device: 1,
+                    control: "South".into(),
+                    down,
+                },
+                true,
+            )
+            .unwrap();
+        }
+        for expected in [true, false] {
+            assert!(matches!(rx.recv().unwrap(),Event::Input{down,..}if down==expected));
+        }
+        assert_eq!(native.load(Ordering::SeqCst), 2);
+        assert_eq!(normal.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn menu_axes_keep_normal_egui_repaint() {
+        let (c, normal, native) = context(true);
+        let (tx, rx) = mpsc::channel();
+        publish(
+            &tx,
+            &c,
+            Event::AimAxis {
+                device: 1,
+                horizontal: false,
+                value: 0.001,
+            },
+            false,
+        )
+        .unwrap();
+        assert!(matches!(rx.recv().unwrap(),Event::AimAxis{value,..}if value==0.001));
+        assert!(normal.load(Ordering::SeqCst) > 0);
+        assert_eq!(native.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn missing_native_bridge_keeps_button_fallback() {
+        let (c, normal, _) = context(false);
+        let (tx, _rx) = mpsc::channel();
+        publish(
+            &tx,
+            &c,
+            Event::Input {
+                device: 1,
+                control: "South".into(),
+                down: false,
+            },
+            true,
+        )
+        .unwrap();
+        assert!(normal.load(Ordering::SeqCst) > 0);
+    }
+    #[test]
+    fn closed_receiver_does_not_wake_ui() {
+        let (c, normal, native) = context(true);
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        assert!(publish(&tx, &c, Event::Error("closed".into()), true).is_err());
+        assert_eq!(normal.load(Ordering::SeqCst), 0);
+        assert_eq!(native.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn directional_presets_leave_digital_hat_contacts_direct() {
         for zone in pocket_library::DpadDeadzone::ALL {
@@ -696,10 +890,10 @@ mod tests {
     }
     #[test]
     fn position_buttons_y_direction_triggers_and_diagonal_hats() {
-        assert_eq!(button_name(Button::A), "South");
-        assert_eq!(button_name(Button::B), "East");
-        assert_eq!(button_name(Button::X), "West");
-        assert_eq!(button_name(Button::Y), "North");
+        assert_eq!(button_name(Button::South), "South");
+        assert_eq!(button_name(Button::East), "East");
+        assert_eq!(button_name(Button::West), "West");
+        assert_eq!(button_name(Button::North), "North");
         let mut state = Transitions::default();
         assert!(
             matches!(&state.controller_axis(1,Axis::LeftY,-25000)[..],[Event::Input{control,down:true,..}] if control=="LeftStickUp")
@@ -714,44 +908,51 @@ mod tests {
     }
     #[test]
     fn native_sdl_virtual_controller_queues_short_press_and_release() {
-        sdl2::hint::set("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
-        sdl2::hint::set("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0");
-        let sdl = sdl2::init().unwrap();
+        use sdl3::joystick::{JoystickType, VirtualJoystickDescription};
+        sdl3::hint::set("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+        let sdl = sdl3::init().unwrap();
         let joysticks = sdl.joystick().unwrap();
-        let controllers = sdl.game_controller().unwrap();
-        let index = unsafe {
-            sdl2::sys::SDL_JoystickAttachVirtual(
-                sdl2::sys::SDL_JoystickType::SDL_JOYSTICK_TYPE_GAMECONTROLLER,
-                6,
-                15,
-                0,
+        let controllers = sdl.gamepad().unwrap();
+        // These call SDL's label API; PocketHLE has no controller-type table.
+        use sdl3::gamepad::{ButtonLabel, GamepadType};
+        assert_eq!(
+            controllers
+                .button_label_for_gamepad_type(GamepadType::NintendoSwitchPro, Button::South),
+            ButtonLabel::B
+        );
+        assert_eq!(
+            controllers.button_label_for_gamepad_type(GamepadType::NintendoSwitchPro, Button::East),
+            ButtonLabel::A
+        );
+        assert_eq!(
+            controllers.button_label_for_gamepad_type(GamepadType::XboxOne, Button::South),
+            ButtonLabel::A
+        );
+
+        let connection = joysticks
+            .attach_virtual_joystick(
+                VirtualJoystickDescription::new()
+                    .joystick_type(JoystickType::Gamepad)
+                    .with_axes(POLLED_AXES)
+                    .with_buttons(POLLED_BUTTONS),
             )
-        };
-        assert!(index >= 0, "{}", sdl2::get_error());
-        let joystick = joysticks.open(index as u32).unwrap();
-        let controller = controllers.open(index as u32).unwrap();
-        let id = controller.instance_id();
+            .unwrap();
+        let id = connection.id();
+        let joystick = joysticks.open(id).unwrap();
+        let controller = controllers.open(id).unwrap();
         let mut events = sdl.event_pump().unwrap();
         events.poll_iter().for_each(drop);
-        let pointer = unsafe { sdl2::sys::SDL_JoystickFromInstanceID(id as i32) };
-        assert!(!pointer.is_null());
-        assert_eq!(
-            unsafe { sdl2::sys::SDL_JoystickSetVirtualButton(pointer, 0, 1) },
-            0
-        );
+        joystick.set_virtual_button(0, true).unwrap();
         joysticks.update();
-        assert_eq!(
-            unsafe { sdl2::sys::SDL_JoystickSetVirtualButton(pointer, 0, 0) },
-            0
-        );
+        joystick.set_virtual_button(0, false).unwrap();
         joysticks.update();
         let queued: Vec<_> = events
             .poll_iter()
-            .filter_map(|event| match event {
-                SdlEvent::ControllerButtonDown { which, button, .. } if which == id => {
+            .filter_map(|e| match e {
+                SdlEvent::GamepadButtonDown { which, button, .. } if which == id => {
                     Some((button_name(button), true))
                 }
-                SdlEvent::ControllerButtonUp { which, button, .. } if which == id => {
+                SdlEvent::GamepadButtonUp { which, button, .. } if which == id => {
                     Some((button_name(button), false))
                 }
                 _ => None,
@@ -761,34 +962,34 @@ mod tests {
             queued,
             vec![("South".into(), true), ("South".into(), false)]
         );
-        // Direct-state fallback: capture still works if no queued
-        // button event reaches the consumer, without duplicating a later event.
         let mut state = Transitions::default();
-        assert_eq!(
-            unsafe { sdl2::sys::SDL_JoystickSetVirtualButton(pointer, 0, 1) },
-            0
-        );
+        joystick.set_virtual_button(0, true).unwrap();
         joysticks.update();
         events.poll_iter().for_each(drop);
-        let down = poll_controller(&controller, &mut state);
         assert!(
-            matches!(&down[..], [Event::Input { control, down: true, .. }] if control == "South")
+            matches!(&poll_controller(&controller,&mut state)[..],[Event::Input{control,down:true,..}] if control=="South")
         );
         assert!(poll_controller(&controller, &mut state).is_empty());
-        assert!(state.change(id as usize, "South".into(), true).is_none());
-        assert_eq!(
-            unsafe { sdl2::sys::SDL_JoystickSetVirtualButton(pointer, 0, 0) },
-            0
-        );
+        joystick.set_virtual_button(0, false).unwrap();
         joysticks.update();
         events.poll_iter().for_each(drop);
-        let up = poll_controller(&controller, &mut state);
         assert!(
-            matches!(&up[..], [Event::Input { control, down: false, .. }] if control == "South")
+            matches!(&poll_controller(&controller,&mut state)[..],[Event::Input{control,down:false,..}] if control=="South")
         );
-        assert!(poll_controller(&controller, &mut state).is_empty());
-        drop(controller);
+        let ctx = egui::Context::default();
+        let devices = BTreeMap::from([(id.raw(), Device::Controller(controller))]);
+        list(&devices, &ctx);
+        crate::controller_labels::activate(&ctx, id.raw() as usize);
+        let reported = match devices.get(&id.raw()).unwrap() {
+            Device::Controller(pad) => {
+                format!("{:?}", pad.button_label_for_gamepad_type(Button::South))
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(crate::controller_labels::text(&ctx, "{South}"), reported);
+        drop(devices);
         drop(joystick);
-        assert_eq!(unsafe { sdl2::sys::SDL_JoystickDetachVirtual(index) }, 0);
+        drop(connection);
+        assert!(!joysticks.joysticks().unwrap().contains(&id));
     }
 }

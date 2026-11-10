@@ -225,6 +225,7 @@ pub struct Dc {
     pub selected_font: u32,
     pub selected_palette: u32,
     pub brush_color: u32,
+    pub brush_origin: (i32, i32),
     pub pen_color: u32,
     pub text_color: u32,
     pub text_align: u32,
@@ -244,6 +245,7 @@ impl Default for Dc {
             selected_font: STOCK_SYSTEM_FONT,
             selected_palette: STOCK_DEFAULT_PALETTE,
             brush_color: 0x00ff_ffff,
+            brush_origin: (0, 0),
             pen_color: 0,
             text_color: 0,
             text_align: 0,
@@ -265,11 +267,12 @@ pub struct Pen {
     pub width: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Font {
     pub height: i32,
     /// Original CE LOGFONTW, including face name, weight, charset and quality.
     pub logfont: [u8; 92],
+    pub resource: Option<ab_glyph::FontArc>,
 }
 impl Font {
     pub fn new(height: i32) -> Self {
@@ -281,6 +284,7 @@ impl Font {
         Self {
             height: i32::from_le_bytes(logfont[..4].try_into().unwrap()),
             logfont,
+            resource: None,
         }
     }
     pub fn field(&self, offset: usize) -> i32 {
@@ -336,6 +340,7 @@ pub struct ListPaintFrame {
     pub item: usize,
     pub flags: u32,
     pub item_flags: u32,
+    pub display_column: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -365,8 +370,27 @@ pub struct ImageRenderer {
     pub height: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct FontEnumFrame {
+    pub thread: usize,
+    pub thunk: u32,
+    pub frame: crate::GuestCallFrame,
+    pub callback: u32,
+    pub parameter: u32,
+    pub scratch: u32,
+    pub records: Vec<Vec<u8>>,
+    pub next: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct GdiState {
+    /// NUL-terminated copies for CE's pointer-return LoadString variant.
+    /// Keyed by resource VA; unloaded module regions release their copies.
+    pub resource_strings: HashMap<u32, u32>,
+    pub installed_fonts: Vec<crate::text::InstalledFont>,
+    pub installed_font_bytes: usize,
+    font_registrations: Vec<(std::path::PathBuf, usize, usize)>,
+    pub font_enum_frames: Vec<FontEnumFrame>,
     pub image_decode_frames: Vec<ImageDecodeFrame>,
     pub image_renderers: HashMap<u32, ImageRenderer>,
     saved_dcs: HashMap<u32, Vec<Dc>>,
@@ -378,6 +402,10 @@ pub struct GdiState {
     pub scroll_erases: HashMap<u32, Vec<[i32; 4]>>,
     pub icons: HashMap<u32, crate::imaging::Image>,
     pub image_lists: HashMap<u32, crate::imaging::ImageList>,
+    pub image_drag: Option<crate::imaging::ImageDrag>,
+    pub brush_patterns: HashMap<u32, std::sync::Arc<Bitmap>>,
+    pub rebars: HashMap<u32, crate::controls::RebarState>,
+    pub command_adornments: std::collections::HashSet<u32>,
     pub system_brushes: HashMap<i32, u32>,
     pub dialog_bitmaps: HashMap<(u32, u32), u32>,
     pub owner_draw_frames: Vec<OwnerDrawFrame>,
@@ -395,6 +423,11 @@ pub struct GdiState {
 impl GdiState {
     pub fn new() -> Self {
         let mut s = Self {
+            resource_strings: HashMap::new(),
+            installed_fonts: Vec::new(),
+            installed_font_bytes: 0,
+            font_registrations: Vec::new(),
+            font_enum_frames: Vec::new(),
             image_decode_frames: Vec::new(),
             image_renderers: HashMap::new(),
             saved_dcs: HashMap::new(),
@@ -406,6 +439,10 @@ impl GdiState {
             scroll_erases: HashMap::new(),
             icons: HashMap::new(),
             image_lists: HashMap::new(),
+            image_drag: None,
+            brush_patterns: HashMap::new(),
+            rebars: HashMap::new(),
+            command_adornments: Default::default(),
             system_brushes: HashMap::new(),
             dialog_bitmaps: HashMap::new(),
             owner_draw_frames: Vec::new(),
@@ -585,6 +622,18 @@ impl GdiState {
         h
     }
 
+    pub fn create_pattern_brush(&mut self, bitmap: Bitmap) -> u32 {
+        let color = bitmap.pixels.get(..2).map_or(0, |p| {
+            let p = u16::from_le_bytes([p[0], p[1]]);
+            (u32::from(p >> 11) * 255 / 31)
+                | ((u32::from((p >> 5) & 63) * 255 / 63) << 8)
+                | ((u32::from(p & 31) * 255 / 31) << 16)
+        });
+        let h = self.create_solid_brush(color);
+        self.brush_patterns.insert(h, std::sync::Arc::new(bitmap));
+        h
+    }
+
     pub fn create_pen(&mut self, color: u32, width: u32) -> u32 {
         let h = self.alloc_handle();
         self.objects.insert(h, GdiObject::Pen(Pen { color, width }));
@@ -604,10 +653,57 @@ impl GdiState {
         self.create_logfont(font)
     }
 
-    pub fn create_logfont(&mut self, font: Font) -> u32 {
+    pub fn create_logfont(&mut self, mut font: Font) -> u32 {
+        crate::text::bind_resource(&self.installed_fonts, &mut font);
         let h = self.alloc_handle();
         self.objects.insert(h, GdiObject::Font(font));
         h
+    }
+
+    pub fn install_fonts(
+        &mut self,
+        path: std::path::PathBuf,
+        fonts: Vec<crate::text::InstalledFont>,
+        bytes: usize,
+    ) {
+        self.font_registrations.push((path, fonts.len(), bytes));
+        self.installed_font_bytes += bytes;
+        self.installed_fonts.extend(fonts);
+        for object in self.objects.values_mut() {
+            if let GdiObject::Font(font) = object {
+                crate::text::bind_resource(&self.installed_fonts, font);
+            }
+        }
+    }
+
+    pub fn remove_fonts(&mut self, path: &std::path::Path) -> bool {
+        let Some(index) = self
+            .font_registrations
+            .iter()
+            .rposition(|entry| entry.0 == path)
+        else {
+            return false;
+        };
+        let start: usize = self.font_registrations[..index]
+            .iter()
+            .map(|entry| entry.1)
+            .sum();
+        let (_, count, bytes) = self.font_registrations.remove(index);
+        self.installed_fonts.drain(start..start + count);
+        self.installed_font_bytes -= bytes;
+        // Existing GDI font objects retain their owned font references.
+        true
+    }
+
+    pub fn clear_guest_fonts(&mut self) {
+        self.installed_fonts.clear();
+        self.font_registrations.clear();
+        self.installed_font_bytes = 0;
+        for object in self.objects.values_mut() {
+            if let GdiObject::Font(font) = object {
+                font.resource = None;
+            }
+        }
     }
 
     pub fn create_font(&mut self, height: i32) -> u32 {
@@ -632,6 +728,7 @@ impl GdiState {
             return false;
         }
         self.saved_dcs.remove(&handle);
+        self.brush_patterns.remove(&handle);
         self.regions.remove(&handle).is_some() || self.objects.remove(&handle).is_some()
     }
 

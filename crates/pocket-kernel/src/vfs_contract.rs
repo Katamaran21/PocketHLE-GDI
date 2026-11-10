@@ -39,6 +39,16 @@ pub(super) struct Lease {
     share: u32,
     pub(super) volume: Option<(PathBuf, u64)>,
 }
+/// Metadata query independent of open handles and their sharing mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInfo {
+    pub attributes: u32,
+    /// Creation, last access and last write, in 100 ns ticks since 1601.
+    /// Zero means the backing store does not provide that timestamp.
+    pub times: [u64; 3],
+    pub size: u64,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct OpenResult {
     pub handle: u32,
@@ -177,6 +187,7 @@ impl Vfs {
         let normal = self.normalise_guest_path(path);
         let mounts = self.matching_mounts(&normal);
         let first = *mounts.first().ok_or(3u32)?;
+        let spelling = self.spelled_guest_path(path);
         // A more specific read-only mount cannot be bypassed through a broader writable root.
         let mount = if write {
             mounts
@@ -184,10 +195,14 @@ impl Vfs {
                 .find(|m| m.prefix == first.prefix && !m.read_only)
                 .ok_or(5u32)?
         } else {
-            first
+            // Private backing inside a save overlay must not hide installed
+            // assets at the same guest path, or expose the private host files.
+            mounts
+                .into_iter()
+                .find(|mount| self.host_path_for_mount(mount, &spelling).is_some())
+                .ok_or(5u32)?
         };
         // Case folding is a lookup key, never the spelling of a newly created file.
-        let spelling = self.spelled_guest_path(path);
         let host = self.host_path_for_mount(mount, &spelling).ok_or(5u32)?;
         let root = mount.host_dir.canonicalize().map_err(|e| io_error(&e))?;
         let ancestor = host
@@ -709,7 +724,9 @@ impl Vfs {
                     options.create(true).truncate(true);
                 }
                 4 => {
-                    options.create(true);
+                    // Read-only OPEN_ALWAYS creates missing files separately.
+                    // An existing file needs a plain read-only host open.
+                    options.create(access & 2 != 0);
                 }
                 5 => {
                     options.truncate(true);
@@ -933,6 +950,39 @@ impl Vfs {
         };
         Ok((total, total.saturating_sub(occupied)))
     }
+    pub fn file_information(&self, path: &str) -> Result<FileInfo, u32> {
+        let attributes = self.attributes(path)?;
+        if self.is_ram_path(path) {
+            return Ok(FileInfo {
+                attributes,
+                times: [0; 3],
+                size: self.ram_file_size(path).unwrap_or(0),
+            });
+        }
+        let (exact, _) = self.exact_path(path, false)?;
+        let host = self.resolve(path).unwrap_or(exact);
+        let metadata = host.metadata().map_err(|e| io_error(&e))?;
+        let convert = |time: std::io::Result<std::time::SystemTime>| -> u64 {
+            let Ok(time) = time else {
+                return 0;
+            };
+            let epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(11_644_473_600);
+            time.duration_since(epoch)
+                .ok()
+                .and_then(|duration| u64::try_from(duration.as_nanos() / 100).ok())
+                .unwrap_or(0)
+        };
+        Ok(FileInfo {
+            attributes,
+            times: [
+                convert(metadata.created()),
+                convert(metadata.accessed()),
+                convert(metadata.modified()),
+            ],
+            size: if metadata.is_dir() { 0 } else { metadata.len() },
+        })
+    }
+
     pub fn attributes(&self, path: &str) -> Result<u32, u32> {
         if self.is_ram_path(path) {
             let key = self.file_key(path, false)?;
@@ -1025,17 +1075,93 @@ impl Vfs {
     }
     pub fn delete(&self, path: &str) -> Result<(), u32> {
         let attrs = self.attributes(path)?;
-        if attrs & 0x11 != 0 {
+        if attrs & 0x10 != 0 {
             return Err(5);
         }
-        let key = self.file_key(path, true)?;
+        let mut overlay = None;
+        if !self.is_ram_path(path) {
+            let normal = self.normalise_guest_path(path);
+            let (upper, mount) = self.exact_path(path, true)?;
+            let lower = self
+                .mounts
+                .iter()
+                .filter(|layer| layer.read_only && layer.prefix == mount.prefix)
+                .filter_map(|layer| self.host_path_for_mount(layer, &normal))
+                .find(|file| file.is_file());
+            if let Some(lower) = lower {
+                // Real read-only attributes remain effective. The install
+                // mount's read-only policy protects host data, not the guest name.
+                let installed_read_only = lower
+                    .metadata()
+                    .map_err(|error| io_error(&error))?
+                    .permissions()
+                    .readonly();
+                if attrs & 1 != 0 && (upper.exists() || installed_read_only) {
+                    return Err(5);
+                }
+                overlay = Some((
+                    upper.exists(),
+                    Self::overlay_marker(mount, &normal).ok_or(5u32)?,
+                    lower
+                        .canonicalize()
+                        .map_err(|error| io_error(&error))?
+                        .to_string_lossy()
+                        .to_ascii_lowercase(),
+                ));
+            }
+        }
+        if attrs & 1 != 0 && overlay.is_none() {
+            return Err(5);
+        }
+        let key = match &overlay {
+            Some((false, _, lower_key)) => lower_key.clone(),
+            _ => self.file_key(path, true)?,
+        };
         let shared = self.shared.clone();
         let mut s = shared.0.lock().unwrap();
-        if busy(&mut s, &key) {
+        if s.attributes.get(&key).is_some_and(|value| value & 1 != 0)
+            || self
+                .file_key(path, true)
+                .ok()
+                .and_then(|key| s.attributes.get(&key))
+                .is_some_and(|value| value & 1 != 0)
+        {
+            return Err(5);
+        }
+        if busy(&mut s, &key)
+            || overlay
+                .as_ref()
+                .is_some_and(|(_, _, lower)| lower != &key && busy(&mut s, lower))
+        {
             return Err(32);
         }
         s.volume_usage.clear();
-        if !self.delete_file_raw(path) {
+        if let Some((has_upper, marker, _)) = overlay {
+            let directory = marker.parent().ok_or(5u32)?;
+            match std::fs::create_dir(directory) {
+                Ok(()) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && directory.symlink_metadata().is_ok_and(|meta| meta.is_dir()) => {}
+                Err(error) => return Err(io_error(&error)),
+            }
+            let created = if Self::overlay_marker_exists(&marker) {
+                false
+            } else {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&marker)
+                    .map_err(|error| io_error(&error))?;
+                true
+            };
+            if has_upper && !self.delete_file_raw(path) {
+                if created {
+                    let _ = std::fs::remove_file(marker);
+                }
+                return Err(5);
+            }
+        } else if !self.delete_file_raw(path) {
             return Err(5);
         }
         s.attributes.remove(&key);
@@ -1092,6 +1218,72 @@ impl Vfs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn save_overlay_can_delete_and_replace_an_installed_file() {
+        let installed = tempfile::tempdir().unwrap();
+        let saved = tempfile::tempdir().unwrap();
+        std::fs::write(installed.path().join("Prefs.dat"), b"original").unwrap();
+        std::fs::write(saved.path().join("new.tmp"), b"updated").unwrap();
+        let open = || {
+            let mut v = Vfs::new();
+            v.mount_read_only("/App/", installed.path());
+            v.mount_save_dir("/App/", saved.path());
+            v
+        };
+        let v = open();
+        v.delete("/App/prefs.dat").unwrap();
+        assert_eq!(v.attributes("/App/PREFS.DAT"), Err(2));
+        assert_eq!(
+            v.list_dir("/App/").unwrap(),
+            vec![("new.tmp".into(), 7, false)]
+        );
+        drop(v);
+        let v = open();
+        assert_eq!(v.attributes("/App/Prefs.dat"), Err(2));
+        v.rename("/App/new.tmp", "/App/Prefs.dat").unwrap();
+        assert_eq!(
+            std::fs::read(v.resolve("/App/Prefs.dat").unwrap()).unwrap(),
+            b"updated"
+        );
+        assert_eq!(
+            std::fs::read(installed.path().join("Prefs.dat")).unwrap(),
+            b"original"
+        );
+        v.delete("/App/Prefs.dat").unwrap();
+        assert_eq!(open().attributes("/App/Prefs.dat"), Err(2));
+    }
+
+    #[test]
+    fn metadata_queries_cover_overlay_directories_ram_and_exclusive_handles() {
+        let installed = tempfile::tempdir().unwrap();
+        let saved = tempfile::tempdir().unwrap();
+        std::fs::write(installed.path().join("same.dat"), b"installed").unwrap();
+        std::fs::write(saved.path().join("same.dat"), b"save").unwrap();
+        let mut v = Vfs::new();
+        v.mount_read_only("/App/", installed.path());
+        v.mount_save_dir("/App/", saved.path());
+        let exclusive = v
+            .open_file("/App/same.dat", 3, 0, 3, false, 0)
+            .unwrap()
+            .handle;
+        let info = v.file_information("/App/same.dat").unwrap();
+        assert_eq!(info.size, 4);
+        assert_eq!(info.attributes, v.attributes("/App/same.dat").unwrap());
+        assert_ne!(info.times[2], 0);
+        assert_eq!(v.file_information("/App/").unwrap().attributes & 0x10, 0x10);
+        assert_eq!(v.file_information("/App/").unwrap().size, 0);
+        v.close(exclusive);
+        let ram = crate::memory_division::MemoryDivision::new(64 * 4096, 16).unwrap();
+        v.attach_ram(Some(ram));
+        let h = v.open("/ram.dat", Access::Write, true).unwrap();
+        assert_eq!(v.write(h, b"ram"), Some(3));
+        v.close(h);
+        let info = v.file_information("/ram.dat").unwrap();
+        assert_eq!(info.size, 3);
+        assert_eq!(info.times, [0; 3]);
+        assert_eq!(v.file_information("/absent.dat").unwrap_err(), 2);
+    }
+
     use super::*;
     #[test]
     fn new_files_keep_requested_case_and_old_overlays_recover_without_losing_bytes() {
@@ -1414,6 +1606,13 @@ mod tests {
             assert_eq!(v.write(h.handle, b"SAVE"), Some(4));
             v.close(h.handle);
             assert_eq!(v.open_file(path, 2, 3, 1, false, 0), Err(80));
+            let h = v.open_file(path, 1, 3, 4, false, 0).unwrap();
+            assert!(h.existed);
+            let mut bytes = [0; 4];
+            assert_eq!(v.read(h.handle, &mut bytes), Some(4));
+            assert_eq!(&bytes, b"SAVE");
+            assert!(v.write(h.handle, b"X").is_none());
+            v.close(h.handle);
             let h = v.open_file(path, 2, 3, 4, false, 0).unwrap();
             assert!(h.existed);
             assert_eq!(v.size(h.handle), Some(4));

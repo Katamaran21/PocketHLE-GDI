@@ -7,7 +7,6 @@ plugins {
 // a packaging label and must not advertise an older stable APK as an update.
 val pocketReleaseVersion = Regex("""(?m)^version\s*=\s*"([^"]+)"""")
     .find(rootProject.file("../../Cargo.toml").readText())!!.groupValues[1]
-val gtshellBuild = providers.gradleProperty("pockethleGtshell").orNull == "true"
 
 // Supply the same keystore for every signed build. Never generate a CI key.
 val signingStore = System.getenv("POCKETHLE_KEYSTORE")
@@ -26,12 +25,11 @@ android {
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
-        applicationId = if (gtshellBuild) "com.pockethle.app.gtshell" else "com.pockethle.app"
-        manifestPlaceholders["pockethleAppLabel"] = if (gtshellBuild) "PocketHLE GTShell" else "@string/app_name"
+        applicationId = "com.pockethle.gdi"
         minSdk = 24
         targetSdk = 34
-        versionCode = 15
-        versionName = pocketReleaseVersion + if (gtshellBuild) "-gtshell" else ""
+        versionCode = 20
+        versionName = pocketReleaseVersion
         buildConfigField("String", "UPDATE_VERSION", "\"$pocketReleaseVersion\"")
 
         ndk {
@@ -64,7 +62,9 @@ android {
         jvmTarget = "17"
     }
     buildFeatures { buildConfig = true }
+    sourceSets.getByName("main").assets.srcDir(rootProject.file("../pocket-desktop/assets/input"))
     sourceSets.getByName("test").resources.srcDir(rootProject.file("../../crates/pocket-library/tests/data"))
+    sourceSets.getByName("test").resources.srcDir(rootProject.file("../pocket-desktop/assets/input"))
 }
 
 dependencies {

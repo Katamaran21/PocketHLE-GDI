@@ -13,6 +13,8 @@
 //! provides a fully working ARM backend.
 
 mod cab_setup;
+pub mod ce_desktop;
+pub mod ce_image;
 mod colors_wallet;
 
 use std::path::Path;
@@ -38,6 +40,8 @@ pub struct Emulator {
     /// or after [`Emulator::load_pe`]. See that method for why.
     requested_screen: Option<(u32, u32)>,
     requested_frame_rate_limit: Option<u32>,
+    ce_image: Option<std::sync::Arc<ce_image::WindowsCeImage>>,
+    classic_windows: bool,
     pub instruction_budget_per_slice: u64,
     pub max_slices: u64,
 }
@@ -50,6 +54,8 @@ impl Emulator {
             dispatcher: WinCeDispatcher::new(),
             requested_screen: None,
             requested_frame_rate_limit: None,
+            ce_image: None,
+            classic_windows: false,
             instruction_budget_per_slice: 1_000_000,
             max_slices: 1024,
         }
@@ -64,18 +70,7 @@ impl Emulator {
 
     #[cfg(feature = "unicorn")]
     pub fn with_unicorn_cpu_for_arch(arch: pocket_cpu::Arch) -> Result<Self> {
-        Self::with_unicorn_cpu_for_arch_and_optimizations(
-            arch,
-            pocket_cpu::Optimizations::default(),
-        )
-    }
-
-    #[cfg(feature = "unicorn")]
-    pub fn with_unicorn_cpu_for_arch_and_optimizations(
-        arch: pocket_cpu::Arch,
-        options: pocket_cpu::Optimizations,
-    ) -> Result<Self> {
-        let cpu = pocket_cpu::unicorn::UnicornCpu::new_for_arch_with_optimizations(arch, options)
+        let cpu = pocket_cpu::unicorn::UnicornCpu::new_for_arch(arch)
             .context("creating unicorn-engine CPU instance")?;
         Ok(Self {
             cpu: Box::new(cpu),
@@ -83,19 +78,11 @@ impl Emulator {
             dispatcher: WinCeDispatcher::new(),
             requested_screen: None,
             requested_frame_rate_limit: None,
+            ce_image: None,
+            classic_windows: false,
             instruction_budget_per_slice: 1_000_000,
             max_slices: 1024,
         })
-    }
-
-    /// Launch-only policy: no mutable scheduling flag is checked during dispatch.
-    pub fn set_responsive_message_pump(&mut self, enabled: bool) -> Result<()> {
-        anyhow::ensure!(
-            self.process.is_none(),
-            "Message-pump optimization applies before loading a game"
-        );
-        self.dispatcher.set_responsive_message_pump(enabled);
-        Ok(())
     }
 
     /// Select the Pocket PC physical action key after loading a process.
@@ -107,6 +94,19 @@ impl Emulator {
             } else {
                 pocket_kernel::gapi::VK_A
             };
+        }
+    }
+
+    /// Advertise the selected console's readable platform identity. This is
+    /// process-local, like PocketPC OEM overrides; never persist it to the host
+    /// device registry. Games use SPI_GETPLATFORMTYPE to select hardware keys.
+    pub fn set_gizmondo_platform_identity(&mut self) {
+        if let Some(process) = self.process.as_mut() {
+            process.state.registry.set_volatile_value(
+                r"HKLM\System\Platform",
+                "PlatformType",
+                pocket_kernel::registry::RegistryValue::Sz("Gizmondo Terminal".into()),
+            );
         }
     }
 
@@ -122,9 +122,10 @@ impl Emulator {
 
     /// Add an optional presentation ceiling without changing the guest clock.
     /// May be called before or after loading. None retains existing display sync.
+    /// Some(0) disables implicit pacing; explicit guest vblank waits stay active.
     pub fn set_frame_rate_limit(&mut self, fps: Option<u32>) {
         self.requested_frame_rate_limit =
-            fps.filter(|fps| matches!(fps, 10 | 15 | 20 | 30 | 45 | 60));
+            fps.filter(|fps| matches!(fps, 0 | 10 | 15 | 20 | 30 | 45 | 60 | 120));
         if let Some(process) = self.process.as_mut() {
             let clock = &mut process.state.framebuffer.directdraw;
             clock.frame_rate_limit = self.requested_frame_rate_limit;
@@ -137,14 +138,58 @@ impl Emulator {
         pocket_winceapi::gles::set_gpu_renderer(enabled);
     }
 
-    pub fn set_anisotropic_filtering(&mut self, level: u8) {
-        pocket_winceapi::gles::set_anisotropic_filtering(level);
+    /// Select observed Gizmondo GoForce driver semantics for this session.
+    pub fn set_gizmondo_goforce_driver(&mut self, enabled: bool) {
+        pocket_winceapi::gles::set_gizmondo_goforce_driver(enabled);
+    }
+
+    /// Session gate for detected NVIDIA AR10/AR11 combiner clients.
+    pub fn set_nv_combiner_allowed(&mut self, allowed: bool) {
+        pocket_winceapi::gles::set_nv_combiner_allowed(allowed);
+    }
+
+    /// Opt-in Intel 2700G WinCE depth-bias semantics for the PocketPC profile.
+    pub fn set_intel2700g_depth_bias(&mut self, enabled: bool) {
+        pocket_winceapi::gles::set_intel2700g_depth_bias(enabled);
+    }
+
+    pub fn set_gles_internal_resolution(&mut self, scale: u8) {
+        pocket_winceapi::gles::set_internal_resolution(scale);
+    }
+
+    /// Per-session EGL format profile; configure after loading, before guest execution.
+    pub fn set_egl_rgba8888_only(&mut self, enabled: bool) {
+        pocket_winceapi::gles::set_egl_rgba8888_only(enabled);
     }
 
     /// Halt the emulator the first time an unimplemented API is hit.
     /// Useful for the tracing CLI mode.
     pub fn set_halt_on_unimplemented(&mut self, halt: bool) {
         self.dispatcher.halt_on_unimplemented = halt;
+    }
+
+    /// Configure image export metadata before mapping imports. System binaries
+    /// supply data only; CerfDemo and Explorer still use the HLE kernel/GDI.
+    pub fn set_windows_ce_image(
+        &mut self,
+        image: std::sync::Arc<ce_image::WindowsCeImage>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.process.is_none(),
+            "configure the CE image before load_pe"
+        );
+        self.dispatcher.set_system_ordinals(image.ordinals.clone());
+        self.ce_image = Some(image);
+        self.set_classic_windows(true);
+        Ok(())
+    }
+
+    pub fn set_classic_windows(&mut self, enabled: bool) {
+        self.classic_windows = enabled;
+        if let Some(process) = self.process.as_mut() {
+            process.state.ce.windows.enabled = enabled;
+            process.state.ce.windows.last_stamp = None;
+        }
     }
 
     /// Forward every dispatched API call as JSON-lines to `sink`.
@@ -163,6 +208,14 @@ impl Emulator {
     /// Load and map a PE file into the emulator. Existing process
     /// state is replaced.
     pub fn load_pe(&mut self, path: impl AsRef<Path>) -> Result<&Process> {
+        self.load_pe_with_executable_heap(path, true)
+    }
+
+    pub fn load_pe_with_executable_heap(
+        &mut self,
+        path: impl AsRef<Path>,
+        executable_heap: bool,
+    ) -> Result<&Process> {
         let path = path.as_ref();
         let raw = std::fs::read(path).context("reading PE")?;
         let mut image = pe::load_bytes(&raw).context("loading PE")?;
@@ -170,16 +223,29 @@ impl Emulator {
         colors_wallet::apply(&raw, &mut image).context("Colors wallet compatibility")?;
         pocket_winceapi::reset_media_backends();
         let arch = self.cpu.arch();
+        let system_ordinals = self.ce_image.as_ref().map(|image| &image.ordinals);
         let gles_tables = pocket_winceapi::gles_exports::local_tables(path, &image)
             .map_err(anyhow::Error::msg)?;
-        let mut process = Process::map_into(
+        let nv_combiner_client = pocket_winceapi::gles::uses_nv_combiner(&image);
+        let mut process = Process::map_into_with_executable_heap(
             image,
             self.cpu.as_mut(),
-            &|dll, ord| pocket_winceapi::gles_exports::resolve(&gles_tables, dll, ord, arch),
+            &|dll, ord| match system_ordinals
+                .and_then(|tables| tables.get(&dll.to_ascii_lowercase()))
+            {
+                Some(table) => table.get(&ord).cloned(),
+                None => pocket_winceapi::gles_exports::resolve(&gles_tables, dll, ord, arch),
+            },
             &self.dispatcher,
+            executable_heap,
         )
         .context("mapping image into CPU")?;
         process.state.gles_local_ordinals = gles_tables;
+        process.state.ce.windows.enabled = self.classic_windows;
+        if let Some(image) = &self.ce_image {
+            image.configure_process(&mut process.state);
+        }
+        pocket_winceapi::gles::set_nv_combiner_client(nv_combiner_client);
         self.process = Some(process);
         // A frontend that sized the screen before loading gets its
         // request honoured here rather than silently dropped.
@@ -383,6 +449,20 @@ impl Emulator {
             p.state.vfs.mount_save_dir(guest_prefix, host_dir);
         } else {
             log::warn!("mount_save_dir called before load_pe; ignored");
+        }
+    }
+
+    /// Mount save backing at one guest path without leaking its host location
+    /// through a parent save overlay.
+    pub fn mount_isolated_save_dir(
+        &mut self,
+        guest_prefix: &str,
+        host_dir: impl Into<std::path::PathBuf>,
+    ) {
+        if let Some(p) = self.process.as_mut() {
+            p.state.vfs.mount_isolated_save_dir(guest_prefix, host_dir);
+        } else {
+            log::warn!("mount_isolated_save_dir called before load_pe; ignored");
         }
     }
 
@@ -649,7 +729,13 @@ impl Emulator {
         let Some(p) = self.process.as_mut() else {
             return;
         };
-        p.state.framebuffer = pocket_kernel::Framebuffer::new(width, height);
+        let Ok(framebuffer) = pocket_kernel::framebuffer::deferred::DeferredFramebuffer::new(
+            pocket_kernel::Framebuffer::new(width, height),
+        ) else {
+            log::error!("invalid framebuffer dimensions {width}x{height}");
+            return;
+        };
+        p.state.framebuffer = framebuffer;
         p.state.framebuffer.directdraw.frame_rate_limit = self.requested_frame_rate_limit;
         // The GAPI mapping is sized from the framebuffer, so drop it;
         // the next GXOpenDisplay/GXBeginDraw re-maps at the new size.
@@ -676,8 +762,10 @@ mod tests {
         emu.set_screen_size(640, 480);
         assert_eq!(emu.requested_frame_rate_limit, Some(20));
         emu.set_frame_rate_limit(Some(0));
-        assert_eq!(emu.requested_frame_rate_limit, None);
+        assert_eq!(emu.requested_frame_rate_limit, Some(0));
         emu.set_frame_rate_limit(Some(60));
+        emu.set_frame_rate_limit(Some(120));
+        assert_eq!(emu.requested_frame_rate_limit, Some(120));
         emu.set_frame_rate_limit(None);
         assert_eq!(emu.requested_frame_rate_limit, None);
     }
@@ -724,3 +812,6 @@ pub fn suspend_host_session() -> pocket_winceapi::SuspendedSession {
 
 pub mod dependencies;
 mod pocketpc_storage;
+
+#[cfg(all(test, feature = "unicorn"))]
+mod deferred_gapi_tests;

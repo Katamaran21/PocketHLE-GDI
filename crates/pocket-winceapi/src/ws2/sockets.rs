@@ -24,7 +24,9 @@ pub(super) fn register(d: &mut WinCeDispatcher) {
         ("getsockname", local_address),
         ("getpeername", peer_address),
     ] {
-        d.register_handler("ws2.dll", name, handler);
+        for dll in ["ws2.dll", "winsock.dll"] {
+            d.register_handler(dll, name, handler);
+        }
     }
 }
 fn key(ctx: &mut CallCtx<'_>) -> Result<(usize, u32, u32), KernelError> {
@@ -199,10 +201,15 @@ fn connect(ctx: &mut CallCtx<'_>) -> Outcome {
     if !valid(ctx, h) {
         return error(ctx, 10038);
     }
-    let addr = match read_address(ctx, ptr, len) {
+    let mut addr = match read_address(ctx, ptr, len) {
         Ok(a) => a,
         Err(e) => return error(ctx, e),
     };
+    addr.address = ctx
+        .kernel
+        .vfs
+        .bluetooth
+        .resolve_discovery_alias(addr.address);
     let s = ctx.kernel.vfs.bluetooth.sockets.get_mut(&h).unwrap();
     let nonblocking = s.nonblocking;
     let timeout = 0;
@@ -396,16 +403,9 @@ fn shutdown(ctx: &mut CallCtx<'_>) -> Outcome {
     if !(0..=2).contains(&how) {
         return error(ctx, 10022);
     }
-    match ctx
-        .kernel
-        .vfs
-        .bluetooth
-        .sockets
-        .get_mut(&h)
-        .unwrap()
-        .native
-        .shutdown(how)
-    {
+    let s = ctx.kernel.vfs.bluetooth.sockets.get_mut(&h).unwrap();
+    let result = s.native.shutdown(how);
+    match result {
         Ok(()) => done(ctx, 0),
         Err(e) => error(ctx, e),
     }
@@ -708,6 +708,7 @@ mod tests {
         rx: VecDeque<u8>,
         accepts: u32,
         bound: SocketAddress,
+        connect_address: u64,
         ready: bool,
         closed: u32,
     }
@@ -725,7 +726,8 @@ mod tests {
         fn listen(&mut self, _: i32) -> BtResult<()> {
             Ok(())
         }
-        fn connect(&mut self, _: &SocketAddress) -> BtResult<()> {
+        fn connect(&mut self, address: &SocketAddress) -> BtResult<()> {
+            self.0.lock().unwrap().connect_address = address.address;
             Err(WOULD_BLOCK)
         }
         fn accept(&mut self) -> BtResult<(Box<dyn RfcommSocket>, SocketAddress)> {
@@ -801,11 +803,22 @@ mod tests {
         WinCeDispatcher,
         Arc<Mutex<Shared>>,
     ) {
+        started_with("ws2.dll")
+    }
+    fn started_with(
+        dll: &str,
+    ) -> (
+        pocket_cpu::stub::StubCpu,
+        pocket_kernel::KernelState,
+        WinCeDispatcher,
+        Arc<Mutex<Shared>>,
+    ) {
         let (mut cpu, mut k, mut d) = setup();
         let shared = Arc::new(Mutex::new(Shared {
             rx: VecDeque::new(),
             accepts: 0,
             bound: Default::default(),
+            connect_address: 0,
             ready: false,
             closed: 0,
         }));
@@ -818,7 +831,7 @@ mod tests {
                 &mut cpu,
                 &mut k,
                 &mut d,
-                "ws2.dll",
+                dll,
                 "WSAStartup",
                 &[0x202, 0x1800]
             ),
@@ -833,16 +846,59 @@ mod tests {
         }
     }
     #[test]
-    fn chicane_server_sequence_real_handles_options_nonblocking_and_cleanup() {
-        let (mut cpu, mut k, mut d, shared) = started();
-        let h = ret(call(
+    fn winsock_connect_resolves_gizmondo_discovery_alias() {
+        let (mut cpu, mut kernel, mut dispatcher, shared) = started_with("winsock.dll");
+        let handle = ret(call(
             &mut cpu,
-            &mut k,
-            &mut d,
-            "ws2.dll",
+            &mut kernel,
+            &mut dispatcher,
+            "winsock.dll",
             "socket",
             &[32, 1, 3],
         ));
+        kernel
+            .vfs
+            .bluetooth
+            .sockets
+            .get_mut(&handle)
+            .unwrap()
+            .nonblocking = true;
+        let real = 0x1234_5678_9abc;
+        let alias = kernel.vfs.bluetooth.gizmondo_discovery_alias(real).unwrap();
+        assert_eq!(
+            kernel.vfs.bluetooth.gizmondo_discovery_alias(real),
+            Ok(alias)
+        );
+        let address = SocketAddress {
+            address: alias,
+            port: 1,
+            uuid: [0; 16],
+        };
+        cpu.write_mem(0x1200, &encode(&address)).unwrap();
+        assert_eq!(
+            ret(call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "winsock.dll",
+                "connect",
+                &[handle, 0x1200, 40]
+            )),
+            u32::MAX
+        );
+        assert_eq!(shared.lock().unwrap().connect_address, real);
+    }
+
+    #[test]
+    fn chicane_server_sequence_real_handles_options_nonblocking_and_cleanup() {
+        for dll in ["ws2.dll", "winsock.dll"] {
+            assert_rfcomm_server_sequence(dll);
+        }
+    }
+
+    fn assert_rfcomm_server_sequence(dll: &str) {
+        let (mut cpu, mut k, mut d, shared) = started_with(dll);
+        let h = ret(call(&mut cpu, &mut k, &mut d, dll, "socket", &[32, 1, 3]));
         assert_ne!(h, 0);
         assert_ne!(h, u32::MAX);
         cpu.write_mem(0x1100, &4096u32.to_le_bytes()).unwrap();
@@ -852,7 +908,7 @@ mod tests {
                     &mut cpu,
                     &mut k,
                     &mut d,
-                    "ws2.dll",
+                    dll,
                     "setsockopt",
                     &[h, 0xffff, option, 0x1100, 4]
                 ),
@@ -864,7 +920,7 @@ mod tests {
                 &mut cpu,
                 &mut k,
                 &mut d,
-                "ws2.dll",
+                dll,
                 "setsockopt",
                 &[h, 6, 1, 0x1100, 4]
             ),
@@ -878,7 +934,7 @@ mod tests {
                 &mut cpu,
                 &mut k,
                 &mut d,
-                "ws2.dll",
+                dll,
                 "ioctlsocket",
                 &[h, 0x8004667e, 0x1100]
             ),
@@ -891,23 +947,16 @@ mod tests {
         };
         cpu.write_mem(0x1200, &encode(&addr)).unwrap();
         assert_eq!(
-            call(
-                &mut cpu,
-                &mut k,
-                &mut d,
-                "ws2.dll",
-                "bind",
-                &[h, 0x1200, 40]
-            ),
+            call(&mut cpu, &mut k, &mut d, dll, "bind", &[h, 0x1200, 40]),
             DispatchOutcome::ReturnedR0(0)
         );
         assert_eq!(shared.lock().unwrap().bound.port, 7);
         assert_eq!(
-            call(&mut cpu, &mut k, &mut d, "ws2.dll", "listen", &[h, 8]),
+            call(&mut cpu, &mut k, &mut d, dll, "listen", &[h, 8]),
             DispatchOutcome::ReturnedR0(0)
         );
         assert_eq!(
-            call(&mut cpu, &mut k, &mut d, "ws2.dll", "accept", &[h, 0, 0]),
+            call(&mut cpu, &mut k, &mut d, dll, "accept", &[h, 0, 0]),
             DispatchOutcome::ReturnedR0(u32::MAX)
         );
         assert_eq!(k.winsock_last_errors[&0], WOULD_BLOCK);
@@ -919,7 +968,7 @@ mod tests {
                 &mut cpu,
                 &mut k,
                 &mut d,
-                "ws2.dll",
+                dll,
                 "accept",
                 &[h, 0x1400, 0x1300]
             ),
@@ -931,14 +980,20 @@ mod tests {
             &mut cpu,
             &mut k,
             &mut d,
-            "ws2.dll",
+            dll,
             "accept",
             &[h, 0x1400, 0x1300],
         ));
         assert!(k.vfs.bluetooth.sockets[&peer].nonblocking);
         assert_eq!(decode(&cpu.read_mem(0x1400, 40).unwrap()).unwrap(), addr);
+        shared.lock().unwrap().rx.extend(b"hello");
         assert_eq!(
-            call(&mut cpu, &mut k, &mut d, "ws2.dll", "WSACleanup", &[]),
+            call(&mut cpu, &mut k, &mut d, dll, "recv", &[peer, 0x1500, 5, 0]),
+            DispatchOutcome::ReturnedR0(5)
+        );
+        assert_eq!(cpu.read_mem(0x1500, 5).unwrap(), b"hello");
+        assert_eq!(
+            call(&mut cpu, &mut k, &mut d, dll, "WSACleanup", &[]),
             DispatchOutcome::ReturnedR0(0)
         );
         assert!(k.vfs.bluetooth.sockets.is_empty());

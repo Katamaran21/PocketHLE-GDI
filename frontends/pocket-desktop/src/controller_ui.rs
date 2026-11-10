@@ -15,21 +15,30 @@ struct Widgets {
     committed: HashMap<Id, String>,
     popup: Option<Popup>,
     collecting: Option<Vec<(Id, bool)>>,
-    keep_popup: bool,
     page: Option<Id>,
     page_items: Vec<Id>,
     page_collecting: bool,
     page_seen: bool,
     toolbar_items: Vec<Id>,
+    toolbar_rects: HashMap<Id, egui::Rect>,
     toolbar_collecting: bool,
     toolbar_seen: bool,
     last_toolbar: Option<Id>,
     last_page: Option<Id>,
+    reveal_focus: Option<Id>,
+    modal_input: bool,
+    navigation_focus: bool,
 }
 #[derive(Clone)]
 struct Popup {
     owner: Id,
     items: Vec<Id>,
+}
+// Mouse focus is descriptive: it must not scroll a distant navigation owner
+// back into view. Only keyboard/controller navigation requests automatic reveal.
+fn reveal_gained_focus(ui: &Ui, response: &Response) -> bool {
+    response.gained_focus()
+        && (widgets(ui.ctx()).navigation_focus || widgets(ui.ctx()).collecting.is_some())
 }
 fn widgets(ctx: &egui::Context) -> Widgets {
     ctx.data_mut(|d| d.get_temp::<Widgets>(state_id()).unwrap_or_default())
@@ -40,6 +49,56 @@ fn edit_widgets(ctx: &egui::Context, edit: impl FnOnce(&mut Widgets)) {
         edit(&mut state);
         d.insert_temp(state_id(), state);
     });
+}
+
+/// Spatial navigation keeps two-row toolbar controls distinct from page order.
+fn toolbar_neighbor(focused: Option<Id>, control: &str, state: &Widgets) -> Option<Id> {
+    let (horizontal, sign) = match control {
+        "DPadLeft" | "LeftStickLeft" => (true, -1.0),
+        "DPadRight" | "LeftStickRight" => (true, 1.0),
+        "DPadUp" | "LeftStickUp" => (false, -1.0),
+        "DPadDown" | "LeftStickDown" => (false, 1.0),
+        _ => return None,
+    };
+    let Some(origin) = focused
+        .and_then(|id| state.toolbar_rects.get(&id))
+        .map(|rect| rect.center())
+    else {
+        return state.toolbar_items.first().copied();
+    };
+    let coordinates = |point: egui::Pos2| {
+        if horizontal {
+            (point.x, point.y)
+        } else {
+            (point.y, point.x)
+        }
+    };
+    let (along, across) = coordinates(origin);
+    let candidates: Vec<_> = state
+        .toolbar_items
+        .iter()
+        .filter(|id| Some(**id) != focused)
+        .filter_map(|id| {
+            state
+                .toolbar_rects
+                .get(id)
+                .map(|rect| (*id, coordinates(rect.center())))
+        })
+        .collect();
+    candidates
+        .iter()
+        .filter(|(_, (a, _))| (*a - along) * sign > 1.0)
+        .min_by(|(_, (a, b)), (_, (c, d))| {
+            ((a - along).abs() + (b - across).abs() * 3.0)
+                .total_cmp(&((c - along).abs() + (d - across).abs() * 3.0))
+        })
+        .or_else(|| {
+            candidates.iter().min_by(|(_, (a, b)), (_, (c, d))| {
+                ((b - across).abs() * 4.0 + a * sign)
+                    .total_cmp(&((d - across).abs() * 4.0 + c * sign))
+            })
+        })
+        .map(|(id, _)| *id)
 }
 
 #[derive(Default)]
@@ -119,26 +178,51 @@ impl Navigation {
         false
     }
     fn switch_section(&mut self, ctx: &egui::Context) -> bool {
-        if self.keyboard.is_some() { return false; }
+        if self.keyboard.is_some() {
+            return false;
+        }
         let state = widgets(ctx);
         let focused = ctx.memory(|m| m.focused());
         // A menu belongs to its owner in the toolbar/page behind it.
-        let owner = state.popup.as_ref().filter(|_| ctx.memory(|m| m.any_popup_open()))
-            .map(|p| p.owner).or(focused);
+        let owner = state
+            .popup
+            .as_ref()
+            .filter(|_| ctx.memory(|m| m.any_popup_open()))
+            .map(|p| p.owner)
+            .or(focused);
         let Some(target) = crate::deck_navigation::section_target(
-            owner, &state.toolbar_items, &state.page_items, state.last_toolbar, state.last_page,
-        ) else { return false; };
+            owner,
+            &state.toolbar_items,
+            &state.page_items,
+            state.last_toolbar,
+            state.last_page,
+        ) else {
+            return false;
+        };
         edit_widgets(ctx, |w| {
-            if owner.is_some_and(|id| w.toolbar_items.contains(&id)) { w.last_toolbar = owner; }
-            if owner.is_some_and(|id| w.page_items.contains(&id)) { w.last_page = owner; }
+            if owner.is_some_and(|id| w.toolbar_items.contains(&id)) {
+                w.last_toolbar = owner;
+            }
+            if owner.is_some_and(|id| w.page_items.contains(&id)) {
+                w.last_page = owner;
+            }
             w.popup = None;
         });
-        ctx.memory_mut(|m| { m.close_popup(); m.request_focus(target); });
+        ctx.memory_mut(|m| {
+            m.close_popup();
+            m.request_focus(target);
+        });
+        edit_widgets(ctx, |w| w.reveal_focus = Some(target));
         self.held = None;
         self.used = true;
         true
     }
     pub fn prepare_input(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, enabled: bool) {
+        if widgets(ctx).modal_input {
+            self.stop_repeat();
+            self.keyboard = None;
+            return;
+        }
         if !enabled || !raw.focused {
             self.pending.clear();
             self.held = None;
@@ -147,17 +231,15 @@ impl Navigation {
             }
             return;
         }
-        let f6 = raw.events.iter().any(|event| matches!(event,
-            Event::Key { key: Key::F6, pressed: true, repeat: false, .. }));
-        if f6 && self.switch_section(ctx) {
-            raw.events.retain(|event| !matches!(event, Event::Key { key: Key::F6, .. }));
-        }
         if let Some((control, next)) = &mut self.held {
             if Instant::now() >= *next {
                 self.pending.push(control.clone());
                 *next = Instant::now() + Duration::from_millis(120);
             }
             ctx.request_repaint_after(Duration::from_millis(30));
+        }
+        if !self.pending.is_empty() {
+            edit_widgets(ctx, |w| w.navigation_focus = true);
         }
         for control in std::mem::take(&mut self.pending) {
             if self.keyboard.is_some() {
@@ -170,7 +252,11 @@ impl Navigation {
             }
             let w = widgets(ctx);
             let focused = ctx.memory(|m| m.focused());
-            if let Some(popup) = w.popup.filter(|_| ctx.memory(|m| m.any_popup_open())) {
+            if let Some(popup) = w
+                .popup
+                .as_ref()
+                .filter(|_| ctx.memory(|m| m.any_popup_open()))
+            {
                 if let Some(next) = crate::deck_navigation::menu_index(
                     focused
                         .and_then(|id| popup.items.iter().position(|i| *i == id))
@@ -184,22 +270,30 @@ impl Navigation {
             }
             if !ctx.memory(|m| m.any_popup_open()) {
                 let in_toolbar = focused.is_some_and(|id| w.toolbar_items.contains(&id));
-                let items = if in_toolbar { &w.toolbar_items } else { &w.page_items };
-                let direction = if in_toolbar {
-                    match control.as_str() {
-                        "DPadLeft" | "LeftStickLeft" => "DPadUp",
-                        "DPadRight" | "LeftStickRight" => "DPadDown",
-                        other => other,
-                    }
-                } else { control.as_str() };
-                if let Some(next) = crate::deck_navigation::menu_index(
-                    focused.and_then(|id| items.iter().position(|item| *item == id)).unwrap_or(0),
-                    direction, items.len(),
-                ) {
-                    ctx.memory_mut(|m| m.request_focus(items[next]));
+                let items = if in_toolbar {
+                    &w.toolbar_items
+                } else {
+                    &w.page_items
+                };
+                let next = if in_toolbar {
+                    toolbar_neighbor(focused, &control, &w)
+                } else {
+                    crate::deck_navigation::menu_index(
+                        focused
+                            .and_then(|id| items.iter().position(|item| *item == id))
+                            .unwrap_or(0),
+                        &control,
+                        items.len(),
+                    )
+                    .map(|index| items[index])
+                };
+                if let Some(next) = next {
+                    ctx.memory_mut(|m| m.request_focus(next));
+                    edit_widgets(ctx, |w| w.reveal_focus = Some(next));
                     continue;
                 }
             }
+
             match control.as_str() {
                 "Escape" => key(raw, Key::Escape, false),
                 "South" => {
@@ -269,12 +363,21 @@ impl Navigation {
         }
     }
     pub fn show(&mut self, ctx: &egui::Context) {
+        if widgets(ctx).modal_input {
+            self.stop_repeat();
+            self.keyboard = None;
+            return;
+        }
         edit_widgets(ctx, |w| {
             if !w.page_seen {
                 w.page = None;
                 w.page_items.clear();
             }
-            if !w.toolbar_seen { w.toolbar_items.clear(); w.last_toolbar = None; }
+            if !w.toolbar_seen {
+                w.toolbar_items.clear();
+                w.toolbar_rects.clear();
+                w.last_toolbar = None;
+            }
         });
         if self.used {
             if let Some(response) = ctx
@@ -288,7 +391,7 @@ impl Navigation {
                 painter.rect_stroke(
                     response.rect.expand(2.0),
                     3.0,
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 190, 255)),
+                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 190, 255)),
                 );
             }
         }
@@ -309,7 +412,10 @@ impl Navigation {
             .open(&mut open)
             .show(ctx, |ui| {
                 let k = self.keyboard.as_ref().unwrap();
-                ui.label("A: select · B: cancel · Y: symbols");
+                ui.label(crate::controller_labels::text(
+                    ctx,
+                    "{South}: select · {East}: cancel · {North}: symbols",
+                ));
                 egui::ScrollArea::horizontal()
                     .id_source("controller_keyboard_value")
                     .stick_to_right(true)
@@ -425,7 +531,7 @@ pub fn text_edit(ui: &mut Ui, value: &mut String, hint: &str) -> Response {
         w.text.insert(response.id, value.clone());
     });
     register_page_widget(ui, &response);
-    if response.gained_focus() {
+    if reveal_gained_focus(ui, &response) {
         response.scroll_to_me(Some(egui::Align::Center));
     }
     response
@@ -449,14 +555,8 @@ impl ComboBox {
         let old = widgets(&ctx).popup;
         edit_widgets(&ctx, |w| {
             w.collecting = Some(Vec::new());
-            w.keep_popup = false;
         });
         let response = self.0.show_ui(ui, contents);
-        // egui 0.27 closes a popup for any mouse click away from its trigger,
-        // including a click on an expandable header inside that popup.
-        if widgets(&ctx).keep_popup {
-            ctx.memory_mut(|m| m.open_popup(response.response.id.with("popup")));
-        }
         let entries = widgets(&ctx).collecting.unwrap_or_default();
         edit_widgets(&ctx, |w| w.collecting = None);
         register_page_widget(ui, &response.response);
@@ -483,7 +583,7 @@ impl ComboBox {
         } else if old.is_some_and(|p| p.owner == response.response.id) {
             edit_widgets(&ctx, |w| w.popup = None);
         }
-        if response.response.gained_focus() {
+        if reveal_gained_focus(ui, &response.response) {
             response.response.scroll_to_me(Some(egui::Align::Center));
         }
         response
@@ -505,7 +605,7 @@ pub fn selectable_value<T: PartialEq>(
                 entries.push((response.id, selected));
             }
         });
-        if response.gained_focus() {
+        if reveal_gained_focus(ui, &response) {
             response.scroll_to_me(Some(egui::Align::Center));
         }
         if response.clicked() {
@@ -521,9 +621,54 @@ pub fn selectable_value<T: PartialEq>(
     response
 }
 
+/// The assistant owns navigation and its selected-row highlight while modal.
+/// Drop stale widget focus instead of drawing its old rectangle over the window title.
+pub fn claim_modal_input(ctx: &egui::Context) {
+    edit_widgets(ctx, |w| w.modal_input = true);
+    ctx.memory_mut(|memory| {
+        if let Some(id) = memory.focused() {
+            memory.surrender_focus(id);
+        }
+    });
+}
+
 pub fn begin_frame(ctx: &egui::Context) {
+    let pointer = ctx.input(|i| {
+        i.pointer.any_pressed()
+            || i.pointer.any_released()
+            || i.pointer.any_down()
+            || i.any_touches()
+            || i.events
+                .iter()
+                .any(|event| matches!(event, Event::Touch { .. }))
+            || i.raw_scroll_delta != egui::Vec2::ZERO
+    });
+    let keyboard = ctx.input(|i| {
+        i.events.iter().any(|e| {
+            matches!(
+                e,
+                Event::Key {
+                    key: Key::Tab
+                        | Key::ArrowUp
+                        | Key::ArrowDown
+                        | Key::ArrowLeft
+                        | Key::ArrowRight
+                        | Key::Enter,
+                    pressed: true,
+                    ..
+                }
+            )
+        })
+    });
     let open = ctx.memory(|m| m.any_popup_open());
     edit_widgets(ctx, |w| {
+        w.modal_input = false;
+        if pointer {
+            w.navigation_focus = false;
+            w.reveal_focus = None;
+        } else if keyboard {
+            w.navigation_focus = true;
+        }
         w.text.clear();
         w.page_seen = false;
         w.toolbar_seen = false;
@@ -536,19 +681,25 @@ pub fn begin_frame(ctx: &egui::Context) {
 /// A separate focus section for the existing launcher toolbar.
 pub fn toolbar_scope<R>(ui: &mut Ui, contents: impl FnOnce(&mut Ui) -> R) -> R {
     edit_widgets(ui.ctx(), |w| {
-        w.toolbar_seen = true; w.toolbar_collecting = true; w.toolbar_items.clear();
+        w.toolbar_seen = true;
+        w.toolbar_collecting = true;
+        w.toolbar_items.clear();
+        w.toolbar_rects.clear();
     });
     let result = contents(ui);
     let focused = ui.memory(|m| m.focused());
     edit_widgets(ui.ctx(), |w| {
         w.toolbar_collecting = false;
-        if focused.is_some_and(|id| w.toolbar_items.contains(&id)) { w.last_toolbar = focused; }
+        if focused.is_some_and(|id| w.toolbar_items.contains(&id)) {
+            w.last_toolbar = focused;
+        }
     });
     result
 }
 /// Used only by launcher event routing, never by emulated game input.
 pub fn toolbar_focused(ctx: &egui::Context) -> bool {
-    ctx.memory(|m| m.focused()).is_some_and(|id| widgets(ctx).toolbar_items.contains(&id))
+    ctx.memory(|m| m.focused())
+        .is_some_and(|id| widgets(ctx).toolbar_items.contains(&id))
 }
 
 /// Page navigation excludes the launcher toolbar while popup controls retain
@@ -574,8 +725,11 @@ pub fn page_scope<R>(ui: &mut Ui, id: impl Hash, contents: impl FnOnce(&mut Ui) 
     let state = widgets(ui.ctx());
     let focused = ui.memory(|m| m.focused());
     if !ui.memory(|m| m.any_popup_open())
-        && (entering || !focused.is_some_and(|id|
-            state.page_items.contains(&id) || state.toolbar_items.contains(&id)))
+        && (entering
+            || (state.navigation_focus
+                && !focused.is_some_and(|id| {
+                    state.page_items.contains(&id) || state.toolbar_items.contains(&id)
+                })))
     {
         if let Some(first) = state.page_items.first() {
             ui.memory_mut(|m| m.request_focus(*first));
@@ -583,16 +737,29 @@ pub fn page_scope<R>(ui: &mut Ui, id: impl Hash, contents: impl FnOnce(&mut Ui) 
     }
     let focused = ui.memory(|m| m.focused());
     edit_widgets(ui.ctx(), |w| {
-        if focused.is_some_and(|id| w.page_items.contains(&id)) { w.last_page = focused; }
+        if focused.is_some_and(|id| w.page_items.contains(&id)) {
+            w.last_page = focused;
+        }
     });
     result
 }
 
 fn register_page_widget(ui: &Ui, response: &Response) {
+    // Navigation requests focus before egui starts the next frame. Track that
+    // request explicitly: gained_focus/read_response can miss clipped widgets.
+    let reveal = widgets(ui.ctx()).reveal_focus == Some(response.id);
+    if reveal {
+        ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
+        edit_widgets(ui.ctx(), |w| w.reveal_focus = None);
+    }
     if response.enabled() {
         edit_widgets(ui.ctx(), |w| {
-            if w.toolbar_collecting && w.collecting.is_none() && !w.toolbar_items.contains(&response.id) {
+            if w.toolbar_collecting
+                && w.collecting.is_none()
+                && !w.toolbar_items.contains(&response.id)
+            {
                 w.toolbar_items.push(response.id);
+                w.toolbar_rects.insert(response.id, response.rect);
             }
             if w.page_collecting && w.collecting.is_none() && !w.page_items.contains(&response.id) {
                 w.page_items.push(response.id);
@@ -610,7 +777,7 @@ pub fn scroll_focus(ui: &Ui) {
         .memory(|m| m.focused())
         .and_then(|id| ui.ctx().read_response(id))
     {
-        if response.gained_focus() {
+        if reveal_gained_focus(ui, &response) {
             response.scroll_to_me(Some(egui::Align::Center));
         }
     }
@@ -633,48 +800,345 @@ mod tests {
             egui::CentralPanel::default().show(ctx, ui);
         });
     }
-    fn sections(ui: &mut Ui) -> ([Id;2],[Id;2]) {
-        let toolbar=toolbar_scope(ui, |ui| [button(ui,"Library").id,button(ui,"Settings").id]);
-        let page=page_scope(ui,"sections_test",|ui| [button(ui,"First").id,button(ui,"Save").id]);
-        (toolbar,page)
+    fn sections(ui: &mut Ui) -> ([Id; 2], [Id; 2]) {
+        let toolbar = toolbar_scope(ui, |ui| {
+            [button(ui, "Library").id, button(ui, "Settings").id]
+        });
+        let page = page_scope(ui, "sections_test", |ui| {
+            [button(ui, "First").id, button(ui, "Save").id]
+        });
+        (toolbar, page)
     }
     #[test]
+    fn modal_owner_drops_old_focus_overlay_and_pending_navigation() {
+        let ctx = egui::Context::default();
+        let mut nav = Navigation::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            begin_frame(ctx);
+            ctx.memory_mut(|m| m.request_focus(Id::new("old_assign_button")));
+            nav.press("DPadDown");
+            claim_modal_input(ctx);
+            nav.show(ctx);
+            assert!(ctx.memory(|m| m.focused()).is_none());
+            assert!(nav.pending.is_empty());
+            assert!(nav.held.is_none());
+        });
+    }
+    #[test]
+    fn clicking_unregistered_diagram_input_does_not_jump_to_page_start_after_scrolling() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let mut offset = 0.;
+        let mut target = egui::Rect::NOTHING;
+        let mut draw = |events: Vec<Event>, forced: Option<f32>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640., 480.),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    begin_frame(ctx);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        page_scope(ui, "diagram_scroll", |ui| {
+                            let mut scroll = egui::ScrollArea::vertical()
+                                .id_source("diagram_scroll_body")
+                                .max_height(140.);
+                            if let Some(value) = forced {
+                                scroll = scroll.vertical_scroll_offset(value);
+                            }
+                            let out = scroll.show(ui, |ui| {
+                                button(ui, "Assign an input");
+                                ui.add_space(440.);
+                                // Skin hotspots use real egui focus, outside the tab list.
+                                target = ui.button("Diagram input").rect;
+                                ui.add_space(440.);
+                            });
+                            offset = out.state.offset.y;
+                        })
+                    });
+                },
+            );
+            (offset, target.center())
+        };
+        draw(vec![], None);
+        draw(vec![], None);
+        let (before, point) = draw(vec![], Some(430.));
+        assert!(before > 400.);
+        for pressed in [true, false] {
+            draw(
+                vec![
+                    Event::PointerMoved(point),
+                    Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+                None,
+            );
+        }
+        let (after, _) = draw(vec![], None);
+        assert!(
+            (after - before).abs() < 1.,
+            "click changed scroll offset: {before} -> {after}"
+        );
+    }
+    #[test]
+    fn controller_reveals_offscreen_rows_in_nested_settings_scroll_area() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        let mut nav = Navigation::default();
+        let mut offset = 0.0;
+        let mut target_visible = false;
+        let mut draw = |ui: &mut Ui| {
+            page_scope(ui, "long_settings", |ui| {
+                let output = egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("settings_rows").show(ui, |ui| {
+                            for row in 0..40 {
+                                ui.label(format!("Setting {row}"));
+                                let response = button(ui, format!("Value {row}"));
+                                if row == 30 {
+                                    target_visible = ui.clip_rect().contains_rect(response.rect);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                offset = output.state.offset.y;
+            });
+        };
+        frame(&ctx, &mut nav, &mut draw);
+        for _ in 0..30 {
+            nav.press("DPadDown");
+            frame(&ctx, &mut nav, &mut draw);
+            nav.release("DPadDown");
+        }
+        frame(&ctx, &mut nav, &mut draw);
+        frame(&ctx, &mut nav, &mut draw);
+        assert!(
+            offset > 0.0,
+            "controller navigation must scroll the section"
+        );
+        assert!(target_visible, "the focused row must be fully visible");
+    }
+
+    #[test]
+    fn native_touch_suspends_controller_focus_repair_until_navigation_resumes() {
+        let ctx = egui::Context::default();
+        let mut nav = Navigation::default();
+        frame(&ctx, &mut nav, |ui| {
+            sections(ui);
+        });
+        edit_widgets(&ctx, |w| {
+            w.navigation_focus = true;
+            w.reveal_focus = Some(Id::new("old_navigation_target"));
+        });
+        for phase in [
+            egui::TouchPhase::Start,
+            egui::TouchPhase::Move,
+            egui::TouchPhase::End,
+            egui::TouchPhase::Cancel,
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![Event::Touch {
+                        device_id: egui::TouchDeviceId(0),
+                        id: egui::TouchId(1),
+                        phase,
+                        pos: egui::pos2(500.0, 200.0),
+                        force: None,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    begin_frame(ctx);
+                    assert!(!widgets(ctx).navigation_focus);
+                    assert!(widgets(ctx).reveal_focus.is_none());
+                },
+            );
+        }
+        nav.press("DPadDown");
+        frame(&ctx, &mut nav, |ui| {
+            sections(ui);
+        });
+        assert!(widgets(&ctx).navigation_focus);
+    }
+
+    #[test]
+    fn repeated_touch_scrolls_keep_their_offset_between_gestures() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let mut time = 0.0;
+        let mut draw = |events: Vec<Event>| {
+            time += 1.0 / 60.0;
+            let mut offset = 0.0;
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 480.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    begin_frame(ctx);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        page_scope(ui, "touch_scroll_settings", |ui| {
+                            let output =
+                                egui::ScrollArea::vertical()
+                                    .max_height(300.0)
+                                    .show(ui, |ui| {
+                                        for row in 0..60 {
+                                            button(ui, format!("Setting {row}"));
+                                        }
+                                        scroll_focus(ui);
+                                    });
+                            offset = output.state.offset.y;
+                        });
+                    });
+                },
+            );
+            offset
+        };
+        let pointer = |y, pressed| Event::PointerButton {
+            pos: egui::pos2(500.0, y),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        draw(vec![]);
+        draw(vec![]);
+        for _ in 0..3 {
+            let before = draw(vec![]);
+            let start = draw(vec![
+                Event::PointerMoved(egui::pos2(500.0, 260.0)),
+                pointer(260.0, true),
+            ]);
+            assert!(
+                start >= before - 1.0,
+                "new touch reset scroll: {before} -> {start}"
+            );
+            let after = draw(vec![Event::PointerMoved(egui::pos2(500.0, 100.0))]);
+            assert!(
+                after > start + 100.0,
+                "drag did not scroll: {start} -> {after}"
+            );
+            // Settle the finger before release to remove inertia from this check.
+            for _ in 0..10 {
+                draw(vec![]);
+            }
+            draw(vec![pointer(100.0, false), Event::PointerGone]);
+        }
+    }
+
+    #[test]
+    fn f6_does_not_switch_sections_or_get_consumed() {
+        let ctx = egui::Context::default();
+        let mut nav = Navigation::default();
+        let mut target = Id::NULL;
+        frame(&ctx, &mut nav, |ui| {
+            let (_, page) = sections(ui);
+            target = page[0];
+        });
+        ctx.memory_mut(|m| m.request_focus(target));
+        let mut raw = egui::RawInput::default();
+        raw.events.push(Event::Key {
+            key: Key::F6,
+            physical_key: Some(Key::F6),
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        });
+        nav.prepare_input(&ctx, &mut raw, true);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(target));
+        assert_eq!(raw.events.len(), 1);
+    }
+
+    #[test]
     fn l3_switches_sections_restores_focus_and_keeps_toolbar_navigation_separate() {
-        let ctx=egui::Context::default();let mut nav=Navigation::default();
-        let mut ids=([Id::NULL;2],[Id::NULL;2]);
-        frame(&ctx,&mut nav,|ui|{ids=sections(ui);});
-        ctx.memory_mut(|m|m.request_focus(ids.1[1]));
-        frame(&ctx,&mut nav,|ui|{sections(ui);});
-        nav.press("LeftThumb");frame(&ctx,&mut nav,|ui|{sections(ui);});
-        assert_eq!(ctx.memory(|m|m.focused()),Some(ids.0[0]));
-        nav.press("DPadRight");frame(&ctx,&mut nav,|ui|{sections(ui);});
-        assert_eq!(ctx.memory(|m|m.focused()),Some(ids.0[1]));
+        let ctx = egui::Context::default();
+        let mut nav = Navigation::default();
+        let mut ids = ([Id::NULL; 2], [Id::NULL; 2]);
+        frame(&ctx, &mut nav, |ui| {
+            ids = sections(ui);
+        });
+        ctx.memory_mut(|m| m.request_focus(ids.1[1]));
+        frame(&ctx, &mut nav, |ui| {
+            sections(ui);
+        });
+        nav.press("LeftThumb");
+        frame(&ctx, &mut nav, |ui| {
+            sections(ui);
+        });
+        assert_eq!(ctx.memory(|m| m.focused()), Some(ids.0[0]));
+        nav.press("DPadRight");
+        frame(&ctx, &mut nav, |ui| {
+            sections(ui);
+        });
+        assert_eq!(ctx.memory(|m| m.focused()), Some(ids.0[1]));
         nav.release("DPadRight");
-        nav.press("LeftThumb");frame(&ctx,&mut nav,|ui|{sections(ui);});
-        assert_eq!(ctx.memory(|m|m.focused()),Some(ids.1[1]));
-        nav.press("LeftThumb");frame(&ctx,&mut nav,|ui|{sections(ui);});
-        assert_eq!(ctx.memory(|m|m.focused()),Some(ids.0[1]));
+        nav.press("LeftThumb");
+        frame(&ctx, &mut nav, |ui| {
+            sections(ui);
+        });
+        assert_eq!(ctx.memory(|m| m.focused()), Some(ids.1[1]));
+        nav.press("LeftThumb");
+        frame(&ctx, &mut nav, |ui| {
+            sections(ui);
+        });
+        assert_eq!(ctx.memory(|m| m.focused()), Some(ids.0[1]));
     }
     #[test]
     fn section_switch_closes_popup_and_uses_its_owner_section() {
-        let ctx=egui::Context::default();let mut nav=Navigation::default();
-        let mut ids=([Id::NULL;2],[Id::NULL;2]);
-        frame(&ctx,&mut nav,|ui|{ids=sections(ui);});
-        let popup=Id::new("section_popup");let item=Id::new("popup_item");
-        ctx.memory_mut(|m|{m.open_popup(popup);m.request_focus(item);});
-        edit_widgets(&ctx,|w| w.popup=Some(Popup{owner:ids.0[1],items:vec![item]}));
+        let ctx = egui::Context::default();
+        let mut nav = Navigation::default();
+        let mut ids = ([Id::NULL; 2], [Id::NULL; 2]);
+        frame(&ctx, &mut nav, |ui| {
+            ids = sections(ui);
+        });
+        let popup = Id::new("section_popup");
+        let item = Id::new("popup_item");
+        ctx.memory_mut(|m| {
+            m.open_popup(popup);
+            m.request_focus(item);
+        });
+        edit_widgets(&ctx, |w| {
+            w.popup = Some(Popup {
+                owner: ids.0[1],
+                items: vec![item],
+            })
+        });
         assert!(nav.switch_section(&ctx));
-        assert!(!ctx.memory(|m|m.any_popup_open()));
-        assert_eq!(ctx.memory(|m|m.focused()),Some(ids.1[0]));
+        assert!(!ctx.memory(|m| m.any_popup_open()));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(ids.1[0]));
     }
     #[test]
     fn virtual_keyboard_blocks_section_switch() {
-        let ctx=egui::Context::default();let mut nav=Navigation::default();
-        frame(&ctx,&mut nav,|ui|{sections(ui);});
-        let focused=ctx.memory(|m|m.focused()).unwrap();
-        nav.keyboard=Some(Keyboard{field:focused,value:String::new(),index:0,upper:false,symbols:false});
+        let ctx = egui::Context::default();
+        let mut nav = Navigation::default();
+        frame(&ctx, &mut nav, |ui| {
+            sections(ui);
+        });
+        let focused = ctx.memory(|m| m.focused()).unwrap();
+        nav.keyboard = Some(Keyboard {
+            field: focused,
+            value: String::new(),
+            index: 0,
+            upper: false,
+            symbols: false,
+        });
         assert!(!nav.switch_section(&ctx));
-        assert!(nav.keyboard_open());assert_eq!(ctx.memory(|m|m.focused()),Some(focused));
+        assert!(nav.keyboard_open());
+        assert_eq!(ctx.memory(|m| m.focused()), Some(focused));
     }
 
     #[test]
@@ -835,35 +1299,6 @@ mod tests {
         assert!(!nav.back(&ctx));
     }
     #[test]
-    fn b_closes_a_native_toolbar_menu_before_leaving_the_page() {
-        let ctx = egui::Context::default();
-        let mut nav = Navigation::default();
-        let mut owner = Id::NULL;
-        frame(&ctx, &mut nav, |ui| {
-            owner = menu_button(ui, "Settings", |ui| {
-                let _ = ui.button("General");
-            })
-            .response
-            .id
-        });
-        ctx.memory_mut(|m| m.request_focus(owner));
-        nav.press("South");
-        frame(&ctx, &mut nav, |ui| {
-            menu_button(ui, "Settings", |ui| {
-                let _ = ui.button("General");
-            });
-        });
-        assert!(menu_open(&ctx));
-        assert!(nav.back(&ctx));
-        frame(&ctx, &mut nav, |ui| {
-            menu_button(ui, "Settings", |ui| {
-                let _ = ui.button("General");
-            });
-        });
-        assert!(!menu_open(&ctx));
-        assert!(!nav.back(&ctx));
-    }
-    #[test]
     fn keyboard_is_one_third_larger_and_adapts_to_small_viewports() {
         let deck = KeyboardLayout::for_viewport(egui::vec2(1280.0, 800.0));
         assert_eq!(deck.key, egui::vec2(64.0, 40.0));
@@ -959,37 +1394,6 @@ pub fn menu_open(ctx: &egui::Context) -> bool {
     ctx.memory(|m| m.any_popup_open())
 }
 
-/// Top-level launcher menus share the same controller focus scope as combo boxes.
-/// Nested menu groups expand in place so focus never escapes into the page behind them.
-pub fn menu_button<R>(
-    ui: &mut Ui,
-    title: impl Into<WidgetText>,
-    contents: impl FnOnce(&mut Ui) -> R,
-) -> egui::InnerResponse<Option<R>> {
-    let title = title.into();
-    if widgets(ui.ctx()).collecting.is_some() {
-        let index = widgets(ui.ctx()).collecting.as_ref().map_or(0, Vec::len);
-        let response = egui::CollapsingHeader::new(title).show(ui, contents);
-        if response.header_response.clicked() {
-            edit_widgets(ui.ctx(), |w| w.keep_popup = true);
-        }
-        if response.header_response.enabled() {
-            edit_widgets(ui.ctx(), |w| {
-                if let Some(entries) = &mut w.collecting {
-                    entries.insert(
-                        index.min(entries.len()),
-                        (response.header_response.id, false),
-                    );
-                }
-            });
-        }
-        egui::InnerResponse::new(response.body_returned, response.header_response)
-    } else {
-        ComboBox::from_id_source(("launcher_menu", title.text()))
-            .selected_text(title.clone())
-            .show_ui(ui, contents)
-    }
-}
 fn register(ui: &Ui, response: &Response, close: bool) {
     register_page_widget(ui, response);
     if response.enabled() {
@@ -999,7 +1403,7 @@ fn register(ui: &Ui, response: &Response, close: bool) {
             }
         });
     }
-    if response.gained_focus() {
+    if reveal_gained_focus(ui, &response) {
         response.scroll_to_me(Some(egui::Align::Center));
     }
     if close && response.clicked() && widgets(ui.ctx()).collecting.is_some() {
@@ -1020,17 +1424,26 @@ pub fn button(ui: &mut Ui, text: impl Into<WidgetText>) -> Response {
 /// Register custom focusable widgets without changing their appearance/behavior.
 pub fn track_focus(ui: &Ui, response: &Response) {
     register_page_widget(ui, response);
-    if response.gained_focus() { response.scroll_to_me(Some(egui::Align::Center)); }
-}
-pub fn small_button(ui: &mut Ui, text: impl Into<WidgetText>) -> Response {
-    let response = ui.small_button(text);
-    register(ui, &response, true);
-    response
+    if reveal_gained_focus(ui, &response) {
+        response.scroll_to_me(Some(egui::Align::Center));
+    }
 }
 pub fn sized_button(ui: &mut Ui, size: egui::Vec2, text: impl Into<WidgetText>) -> Response {
     let r = ui.add_sized(size, egui::Button::new(text).wrap(true));
     register(ui, &r, true);
     r
+}
+pub fn add_sized_enabled(
+    ui: &mut Ui,
+    enabled: bool,
+    size: egui::Vec2,
+    widget: impl egui::Widget,
+) -> Response {
+    let response = ui
+        .add_enabled_ui(enabled, |ui| ui.add_sized(size, widget))
+        .inner;
+    register(ui, &response, true);
+    response
 }
 pub fn checkbox(ui: &mut Ui, value: &mut bool, text: impl Into<WidgetText>) -> Response {
     let r = ui.checkbox(value, text);
@@ -1046,76 +1459,4 @@ pub fn hyperlink_to(ui: &mut Ui, text: impl Into<WidgetText>, url: impl ToString
     let r = ui.hyperlink_to(text, url);
     register(ui, &r, true);
     r
-}
-
-#[cfg(test)]
-mod mouse_menu_regression {
-    use super::*;
-    #[test]
-    fn clicking_a_nested_header_keeps_its_parent_open() {
-        let ctx = egui::Context::default();
-        let mut nav = Navigation::default();
-        let mut owner = Id::NULL;
-        let mut draw = |raw: egui::RawInput| {
-            let mut expanded = false;
-            let _ = ctx.run(raw, |ctx| {
-                begin_frame(ctx);
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    owner = menu_button(ui, "Settings", |ui| {
-                        menu_button(ui, "Filters", |ui| {
-                            expanded = true;
-                            ui.label("Nearest");
-                        });
-                    })
-                    .response
-                    .id;
-                });
-            });
-            expanded
-        };
-        let raw = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(900.0, 700.0),
-            )),
-            ..Default::default()
-        };
-        draw(raw());
-        ctx.memory_mut(|m| m.request_focus(owner));
-        let mut input = raw();
-        nav.press("South");
-        nav.prepare_input(&ctx, &mut input, true);
-        let render = |input| {
-            let mut expanded = false;
-            let _ = ctx.run(input, |ctx| {
-                begin_frame(ctx);
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    menu_button(ui, "Settings", |ui| {
-                        menu_button(ui, "Filters", |ui| {
-                            expanded = true;
-                            ui.label("Nearest");
-                        });
-                    });
-                });
-            });
-            expanded
-        };
-        render(input);
-        render(raw());
-        let header = widgets(&ctx).popup.unwrap().items[0];
-        let point = ctx.read_response(header).unwrap().rect.center();
-        for pressed in [true, false] {
-            let mut input = raw();
-            input.events.push(Event::PointerMoved(point));
-            input.events.push(Event::PointerButton {
-                pos: point,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: Modifiers::NONE,
-            });
-            render(input);
-        }
-        assert!(ctx.memory(|m| m.any_popup_open()));
-        assert!(render(raw()));
-    }
 }

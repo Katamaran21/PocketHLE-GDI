@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 mod contracts;
 #[path = "vfs_mapping.rs"]
 mod mapping;
-pub use contracts::{OpenResult, VfsShared};
+pub use contracts::{FileInfo, OpenResult, VfsShared};
 pub use mapping::MappedFile;
 
 /// `INVALID_HANDLE_VALUE` from `<windows.h>`.
@@ -241,6 +241,8 @@ impl OpenVolume {
 #[derive(Debug, Clone)]
 struct Mount {
     storage_card: bool,
+    /// Host backing belongs only to this guest mount, even inside another overlay.
+    isolated: bool,
     prefix: String,
     /// `prefix` with its original capitalisation. Enumerating a parent
     /// directory reports a nested mount point by name, and a guest that
@@ -255,6 +257,13 @@ struct Mount {
     /// Read-only mounts are a session snapshot for recursive fallback.
     /// Exact lookups remain live; writable mounts never use this index.
     fallback_files: RefCell<Option<Vec<PathBuf>>>,
+}
+
+/// A child inherits the exact namespace, including read-only and private
+/// overlays. Open descriptions and quotas travel separately through VfsShared.
+#[derive(Debug, Clone)]
+pub struct VfsNamespace {
+    mounts: Vec<Mount>,
 }
 
 /// The Gizmondo registration service device exposed as `REG1:`.
@@ -427,6 +436,7 @@ pub struct Vfs {
     vibration_handles: HashMap<u32, Arc<VibrationOpen>>,
     pub camera_deadlines: HashMap<(usize, u32, u32), std::time::Instant>,
     mounts: Vec<Mount>,
+    section_files: HashMap<u32, u32>,
     shared: VfsShared,
     ram: Option<crate::memory_division::MemoryDivision>,
     ram_handles: HashMap<u32, Arc<Mutex<OpenRamFile>>>,
@@ -471,6 +481,7 @@ impl Vfs {
             vibration_handles: HashMap::new(),
             camera_deadlines: HashMap::new(),
             mounts: Vec::new(),
+            section_files: HashMap::new(),
             shared: VfsShared::default(),
             ram: None,
             ram_handles: HashMap::new(),
@@ -705,6 +716,13 @@ impl Vfs {
         self.mount_with_options(guest_prefix, host_dir, true);
     }
 
+    /// A CE system image has exact device paths, rather than archive resource
+    /// aliases. Explorer must not find a missing file elsewhere by basename.
+    pub fn mount_read_only_filesystem(&mut self, guest_prefix: &str, host_dir: impl Into<PathBuf>) {
+        self.mount_read_only(guest_prefix, host_dir);
+        self.mounts.last_mut().unwrap().resource_fallback = false;
+    }
+
     pub fn mount_save_dir(&mut self, guest_prefix: &str, host_dir: impl Into<PathBuf>) {
         let host_dir = host_dir.into();
         if let Err(error) = std::fs::create_dir_all(&host_dir) {
@@ -712,6 +730,30 @@ impl Vfs {
         }
         self.mount_with_options(guest_prefix, host_dir.clone(), false);
         self.restore_overlay_spelling(guest_prefix, &host_dir);
+    }
+
+    /// Mount private backing storage without exposing its host location through
+    /// another mount. Existing save bytes stay in place; only the guest namespace
+    /// changes. Use this for per-game documents stored inside the save directory.
+    pub fn mount_isolated_save_dir(&mut self, guest_prefix: &str, host_dir: impl Into<PathBuf>) {
+        self.mount_save_dir(guest_prefix, host_dir);
+        self.mounts.last_mut().unwrap().isolated = true;
+    }
+
+    /// Whether a host path belongs to another mount's private backing subtree.
+    fn hidden_backing(&self, mount: &Mount, path: &Path) -> bool {
+        self.mounts.iter().any(|other| {
+            if !other.read_only
+                && path
+                    .strip_prefix(&other.host_dir)
+                    .ok()
+                    .and_then(|path| path.components().next())
+                    .is_some_and(|component| component.as_os_str() == Self::OVERLAY_DELETIONS)
+            {
+                return true;
+            }
+            other.isolated && !std::ptr::eq(mount, other) && path.starts_with(&other.host_dir)
+        })
     }
 
     /// Recover names case-folded by older writable overlays. Only an unambiguous
@@ -828,6 +870,7 @@ impl Vfs {
         let storage_card = matches!(p.as_str(), "/sd card/" | "/storage card/");
         self.mounts.push(Mount {
             storage_card,
+            isolated: false,
             prefix: p,
             display_prefix: display,
             host_dir: host_dir.into(),
@@ -881,6 +924,16 @@ impl Vfs {
             .collect()
     }
 
+    pub fn namespace_snapshot(&self) -> VfsNamespace {
+        VfsNamespace {
+            mounts: self.mounts.clone(),
+        }
+    }
+
+    pub fn inherit_namespace(&mut self, namespace: &VfsNamespace) {
+        self.mounts.clone_from(&namespace.mounts);
+    }
+
     fn normalise_guest_path(&self, guest_path: &str) -> String {
         self.spelled_guest_path(guest_path).to_ascii_lowercase()
     }
@@ -914,10 +967,71 @@ impl Vfs {
         mounts
     }
 
+    // Store overlay deletions in a private host directory, outside the guest
+    // namespace. An upper file always wins, even if a lower file is masked.
+    const OVERLAY_DELETIONS: &'static str = ".pockethle-whiteouts";
+
+    fn overlay_marker(mount: &Mount, normal: &str) -> Option<PathBuf> {
+        use sha1::{Digest, Sha1};
+        use std::fmt::Write as _;
+
+        let prefix = normal.get(..mount.prefix.len())?;
+        if !prefix.eq_ignore_ascii_case(&mount.prefix) {
+            return None;
+        }
+        let relative = &normal[mount.prefix.len()..];
+        let mut parts = Vec::new();
+        for component in Path::new(relative).components() {
+            match component {
+                Component::Normal(part) => parts.push(part.to_str()?),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    parts.pop()?;
+                }
+                _ => return None,
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let hash = Sha1::digest(parts.join("/").to_ascii_lowercase().as_bytes());
+        let mut filename = String::with_capacity(hash.len() * 2);
+        for byte in hash {
+            write!(&mut filename, "{byte:02x}").unwrap();
+        }
+        Some(mount.host_dir.join(Self::OVERLAY_DELETIONS).join(filename))
+    }
+
+    fn overlay_marker_exists(marker: &Path) -> bool {
+        marker
+            .parent()
+            .is_some_and(|parent| parent.symlink_metadata().is_ok_and(|meta| meta.is_dir()))
+            && marker.symlink_metadata().is_ok_and(|meta| meta.is_file())
+    }
+
+    fn masked_lower_path(&self, mount: &Mount, normal: &str) -> bool {
+        mount.read_only
+            && self.mounts.iter().any(|upper| {
+                !upper.read_only
+                    && upper.prefix == mount.prefix
+                    && upper
+                        .host_dir
+                        .join(Self::OVERLAY_DELETIONS)
+                        .symlink_metadata()
+                        .is_ok_and(|meta| meta.is_dir())
+                    && Self::overlay_marker(upper, normal).is_some_and(|marker| {
+                        marker.symlink_metadata().is_ok_and(|meta| meta.is_file())
+                    })
+            })
+    }
+
     fn host_path_for_mount(&self, mount: &Mount, normalised: &str) -> Option<PathBuf> {
         let root = mount.prefix.trim_end_matches('/');
+        if self.masked_lower_path(mount, normalised) {
+            return None;
+        }
         if normalised.eq_ignore_ascii_case(root) {
-            return Some(mount.host_dir.clone());
+            return (!self.hidden_backing(mount, &mount.host_dir)).then(|| mount.host_dir.clone());
         }
         let rel = &normalised[mount.prefix.len()..];
         let mut p = mount.host_dir.clone();
@@ -925,6 +1039,9 @@ impl Vfs {
             match comp {
                 Component::Normal(n) => {
                     let wanted = n.to_string_lossy();
+                    if wanted.eq_ignore_ascii_case(Self::OVERLAY_DELETIONS) {
+                        return None;
+                    }
                     let exact = p.join(n);
                     // exists() cannot tell us the stored spelling: on Windows
                     // it succeeds for "vehicle.dat" when the real name is
@@ -966,7 +1083,7 @@ impl Vfs {
                 }
             }
         }
-        Some(p)
+        (!self.hidden_backing(mount, &p)).then_some(p)
     }
 
     /// Rank fallback files by matching trailing path components. A basename
@@ -993,14 +1110,18 @@ impl Vfs {
     }
 
     fn rank_fallback_files(
-        root: &Path,
+        &self,
+        mount: &Mount,
         wanted: &[&str],
         files: &[PathBuf],
     ) -> (usize, Vec<PathBuf>) {
         let mut best = 0;
         let mut found = Vec::new();
         for path in files {
-            let Ok(relative) = path.strip_prefix(root) else {
+            if self.hidden_backing(mount, path) {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(&mount.host_dir) else {
                 continue;
             };
             let score = relative
@@ -1025,14 +1146,14 @@ impl Vfs {
         (best, found)
     }
 
-    fn find_path_recursive(mount: &Mount, wanted: &[&str]) -> (usize, Vec<PathBuf>) {
+    fn find_path_recursive(&self, mount: &Mount, wanted: &[&str]) -> (usize, Vec<PathBuf>) {
         if mount.read_only {
             let mut files = mount.fallback_files.borrow_mut();
             let files = files.get_or_insert_with(|| Self::collect_fallback_files(&mount.host_dir));
-            Self::rank_fallback_files(&mount.host_dir, wanted, files)
+            self.rank_fallback_files(mount, wanted, files)
         } else {
             let files = Self::collect_fallback_files(&mount.host_dir);
-            Self::rank_fallback_files(&mount.host_dir, wanted, &files)
+            self.rank_fallback_files(mount, wanted, &files)
         }
     }
 
@@ -1128,6 +1249,12 @@ impl Vfs {
                     .any(|parent| parent.is_dir());
             }
         }
+        if mounts
+            .iter()
+            .any(|mount| self.masked_lower_path(mount, &normalised))
+        {
+            return fallback;
+        }
         let wanted: Vec<_> = normalised
             .split('/')
             .filter(|part| !part.is_empty())
@@ -1135,7 +1262,7 @@ impl Vfs {
         let mut best = 0;
         let mut candidates = Vec::new();
         for mount in mounts.into_iter().filter(|mount| mount.resource_fallback) {
-            let (score, found) = Self::find_path_recursive(mount, &wanted);
+            let (score, found) = self.find_path_recursive(mount, &wanted);
             if score > best {
                 best = score;
                 candidates.clear();
@@ -1215,8 +1342,19 @@ impl Vfs {
                 continue;
             };
             for entry in entries.flatten() {
+                if self.hidden_backing(mount, &entry.path()) {
+                    continue;
+                }
                 let Ok(meta) = entry.metadata() else { continue };
                 let name = entry.file_name().to_string_lossy().to_string();
+                if name.eq_ignore_ascii_case(Self::OVERLAY_DELETIONS)
+                    || self.masked_lower_path(
+                        mount,
+                        &format!("{}/{}", normalised.trim_end_matches('/'), name),
+                    )
+                {
+                    continue;
+                }
                 merged.entry(name.to_ascii_lowercase()).or_insert((
                     name,
                     meta.len(),
@@ -1859,6 +1997,7 @@ impl Vfs {
         self.vibration_handles.clear();
         self.camera_deadlines.clear();
         self.bluetooth.lookups.clear();
+        self.bluetooth.clear_discovery_aliases();
         self.bluetooth.writes.clear();
         self.bluetooth.sockets.clear();
         self.bluetooth.socket_deadlines.clear();
@@ -2794,6 +2933,102 @@ mod tests {
     }
 
     #[test]
+    fn isolated_documents_do_not_leak_through_parent_overlay() {
+        let installed = tempfile::tempdir().unwrap();
+        let saves = tempfile::tempdir().unwrap();
+        let documents = saves.path().join("my-documents");
+        std::fs::create_dir_all(documents.join("nested")).unwrap();
+        std::fs::write(documents.join("nested/private.sav"), b"old documents").unwrap();
+        std::fs::write(saves.path().join("progress.sav"), b"old save").unwrap();
+        // Installed assets with the same directory name must remain visible.
+        std::fs::create_dir(installed.path().join("my-documents")).unwrap();
+        std::fs::write(installed.path().join("my-documents/asset.dat"), b"asset").unwrap();
+        let mut v = Vfs::new();
+        v.mount_read_only("/Program Files/Example/", installed.path());
+        v.mount_save_dir("/Program Files/Example/", saves.path());
+        v.mount_isolated_save_dir("/My Documents/", &documents);
+        assert_eq!(
+            v.resolve("/My Documents/nested/private.sav"),
+            Some(documents.join("nested/private.sav"))
+        );
+        assert!(v
+            .open("/My Documents/nested/private.sav", Access::Read, false)
+            .is_some());
+        assert!(v
+            .open_file(
+                "/Program Files/Example/my-documents/nested/private.sav",
+                1,
+                3,
+                3,
+                false,
+                0
+            )
+            .is_err());
+        assert!(v
+            .open_file(
+                "/Program Files/Example/my-documents/new.sav",
+                2,
+                3,
+                2,
+                false,
+                0
+            )
+            .is_err());
+        assert!(v
+            .open(
+                "/Program Files/Example/my-documents/asset.dat",
+                Access::Read,
+                false
+            )
+            .is_some());
+        let listing = v.list_dir("/Program Files/Example/my-documents").unwrap();
+        assert_eq!(
+            listing.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(),
+            ["asset.dat"]
+        );
+        let handle = v
+            .open("/My Documents/new.sav", Access::Write, true)
+            .unwrap();
+        assert_eq!(v.write(handle, b"new documents"), Some(13));
+        v.close(handle);
+        assert_eq!(
+            std::fs::read(documents.join("new.sav")).unwrap(),
+            b"new documents"
+        );
+        assert_eq!(
+            std::fs::read(documents.join("nested/private.sav")).unwrap(),
+            b"old documents"
+        );
+        assert_eq!(
+            std::fs::read(saves.path().join("progress.sav")).unwrap(),
+            b"old save"
+        );
+    }
+
+    #[test]
+    fn isolated_empty_backing_is_not_a_game_subdirectory() {
+        let saves = tempfile::tempdir().unwrap();
+        let mut v = Vfs::new();
+        v.mount_save_dir("/Game/", saves.path());
+        v.mount_isolated_save_dir("/My Documents/", saves.path().join("my-documents"));
+        std::fs::write(saves.path().join("data.dat"), b"data").unwrap();
+        let listing = v.list_dir("/Game/").unwrap();
+        assert_eq!(
+            listing.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(),
+            ["data.dat"]
+        );
+        assert!(v.list_dir("/Game/my-documents").is_none());
+        assert!(v.attributes("/Game/my-documents").is_err());
+        assert!(v.open("/Game/private.sav", Access::Read, false).is_none());
+        std::fs::write(saves.path().join("my-documents/private.sav"), b"private").unwrap();
+        // Recursive basename fallback must not bypass the isolation either.
+        assert!(v.open("/Game/private.sav", Access::Read, false).is_none());
+        assert!(v
+            .open("/My Documents/private.sav", Access::Read, false)
+            .is_some());
+    }
+
+    #[test]
     fn mount_resolves_guest_paths() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("hello.txt"), b"hi").unwrap();
@@ -2927,6 +3162,9 @@ mod tests {
     #[test]
     fn device_paths_do_not_fall_back_to_basename_files() {
         let dir = tempfile::tempdir().unwrap();
+        // ':' cannot occur in a Windows host filename; the guest device
+        // refusal still applies there without a colon-named fallback fixture.
+        #[cfg(not(windows))]
         std::fs::write(dir.path().join("ACS1:"), b"not a device").unwrap();
         let mut v = Vfs::new();
         v.mount("\\Application\\", dir.path());

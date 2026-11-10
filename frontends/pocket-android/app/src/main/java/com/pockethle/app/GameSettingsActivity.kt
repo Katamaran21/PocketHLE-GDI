@@ -1,14 +1,14 @@
 package com.pockethle.app
 
 import android.os.Bundle
-import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
 import androidx.preference.ListPreference
-import androidx.preference.PreferenceFragmentCompat
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.fragment.app.viewModels
 import org.json.JSONObject
 
 /** Per-game settings sheet. */
-class GameSettingsActivity : AppCompatActivity() {
+class GameSettingsActivity : HostKeyActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
@@ -38,16 +38,21 @@ class GameSettingsActivity : AppCompatActivity() {
         return true
     }
 
-    class GamePreferencesFragment : PreferenceFragmentCompat() {
+    class GamePreferencesFragment : ScrollingTitlePreferenceFragment() {
         private lateinit var rootDir: String
         private lateinit var gameId: String
         private var current: GameSettings = GameSettings.default()
+        private val ceImageModel: WindowsCeImageModel by viewModels()
+        private val selectCeImage = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri != null) ceImageModel.importImage(uri)
+        }
 
         override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
             rootDir = LibraryPaths.root(requireContext())
             gameId = arguments?.getString(EXTRA_GAME_ID).orEmpty()
             current = readGameSettings() ?: GameSettings.default()
             setPreferencesFromResource(R.xml.preferences_game, rootKey)
+            if (!NativeBridge.isGizmondoGame(rootDir, gameId)) addWindowsCePreferences()
             findPreference<ListPreference>("screen")?.isVisible =
                 !NativeBridge.isGizmondoGame(rootDir, gameId)
             findPreference<androidx.preference.PreferenceCategory>("device_identity_category")?.isVisible =
@@ -115,6 +120,16 @@ class GameSettingsActivity : AppCompatActivity() {
                 identityField("pocketpc_oem_info", "OEM model (readable text)", current.pocketpcOemInfo) {current=current.copy(pocketpcOemInfo=it)}
                 identityField("pocketpc_platform_type", "Platform type (readable text)", current.pocketpcPlatformType) {current=current.copy(pocketpcPlatformType=it)}
                 findPreference<androidx.preference.PreferenceCategory>("graphics_category")!!.addPreference(ListPreference(requireContext()).apply {
+                    key="pocketpc_egl_rgba8888_only";title="OpenGL ES surface format";isPersistent=false
+                    entries=arrayOf("Default (RGB565 + RGBA8888)","RGBA8888 only")
+                    entryValues=arrayOf("false","true");value=current.pocketpcEglRgba8888Only.toString()
+                    summaryProvider=androidx.preference.Preference.SummaryProvider<ListPreference> { "${it.entry}\nDefault lets the game choose 16-bit or 32-bit surfaces. Try RGBA8888 only if water or other effects show incorrect textures. Games that require 16-bit surfaces may not start. Applies to software and GPU rendering. Restart the game to apply." }
+                    dialogTitle="OpenGL ES surface format"
+                    setOnPreferenceChangeListener { _, value ->
+                        current=current.copy(pocketpcEglRgba8888Only=value.toString()=="true");writeGameSettings();true
+                    }
+                })
+                findPreference<androidx.preference.PreferenceCategory>("graphics_category")!!.addPreference(ListPreference(requireContext()).apply {
                     key="pocketpc_gapi_columns";title="GAPI display compatibility";isPersistent=false
                     entries=arrayOf("Linear scanlines (default)","Columns (early portrait LCD)")
                     entryValues=arrayOf("false","true");value=current.pocketpcGapiColumns.toString()
@@ -133,6 +148,9 @@ class GameSettingsActivity : AppCompatActivity() {
                 identityField("pocketpc_device_id", "PocketPC ID (Platform ID — hexadecimal)", current.pocketpcDeviceId) {current=current.copy(pocketpcDeviceId=it)}
             }
             findPreference<ListPreference>("screen")?.apply {
+                summaryProvider = androidx.preference.Preference.SummaryProvider<ListPreference> { pref ->
+                    "${pref.entry}\n${getString(R.string.pref_screen_summary)}"
+                }
                 value = current.screen
                 setOnPreferenceChangeListener { _, newValue ->
                     current = current.copy(screen = newValue.toString())
@@ -140,16 +158,18 @@ class GameSettingsActivity : AppCompatActivity() {
                     true
                 }
             }
+            val globalFrameLimit = runCatching { JSONObject(NativeBridge.readConfig(rootDir)).optString("frame_rate_limit", "60") }.getOrDefault("60").takeIf { it in listOf("10","15","20","30","45","60","120","unlimited") } ?: "60"
+            val inheritedLimitLabel = "Emulator default (${if (globalFrameLimit == "unlimited") "Unlimited" else "$globalFrameLimit fps"})"
             findPreference<ListPreference>("frame_rate_limit")?.apply {
                 isPersistent = false
-                entries = arrayOf("Unlimited", "10 fps", "15 fps", "20 fps", "30 fps", "45 fps", "60 fps")
-                entryValues = arrayOf("unlimited", "10", "15", "20", "30", "45", "60")
-                value = current.frameRateLimit
+                entries = arrayOf(inheritedLimitLabel, "10 fps", "15 fps", "20 fps", "30 fps", "45 fps", "60 fps", "120 fps", "Unlimited")
+                entryValues = arrayOf("inherit", "10", "15", "20", "30", "45", "60", "120", "unlimited")
+                value = current.frameRateLimit ?: "inherit"
                 summaryProvider = androidx.preference.Preference.SummaryProvider<ListPreference> { pref ->
-                    "${pref.entry ?: "Unlimited"}. Maximum game FPS; may help frame-dependent animations. Unlimited adds no cap; display sync still applies. GAPI / DirectDraw / OpenGL ES; GDI-only drawing is not capped. Restart the game to apply."
+                    "${pref.entry ?: inheritedLimitLabel}. Maximum game FPS, or Unlimited. Emulator default inherits the global limit. GAPI / DirectDraw / OpenGL ES; GDI-only drawing is not capped. Restart the game to apply."
                 }
                 setOnPreferenceChangeListener { _, newValue ->
-                    current = current.copy(frameRateLimit = newValue.toString())
+                    current = current.copy(frameRateLimit = newValue.toString().takeUnless { it == "inherit" })
                     writeGameSettings()
                     true
                 }
@@ -163,6 +183,9 @@ class GameSettingsActivity : AppCompatActivity() {
                 }
             }
             findPreference<ListPreference>("rotation")?.apply {
+                summaryProvider = androidx.preference.Preference.SummaryProvider<ListPreference> { pref ->
+                    "${pref.entry}\n${getString(R.string.pref_rotation_summary)}"
+                }
                 value = current.rotation
                 setOnPreferenceChangeListener { _, newValue ->
                     current = current.copy(rotation = newValue.toString())
@@ -170,17 +193,26 @@ class GameSettingsActivity : AppCompatActivity() {
                     true
                 }
             }
-            val globalGpu = runCatching { JSONObject(NativeBridge.readConfig(rootDir)).optBoolean("gpu_renderer", true) }.getOrDefault(true)
-            findPreference<ListPreference>("anisotropic_filtering")?.apply {
-                isPersistent=false
-                entries=arrayOf("Emulator default", "Off", "2×", "4×", "8×")
-                entryValues=arrayOf("inherit", "0", "2", "4", "8")
-                value=current.anisotropicFiltering?.toString() ?: "inherit"
-                isEnabled=current.gpuRenderer ?: globalGpu
-                summaryProvider=ListPreference.SimpleSummaryProvider.getInstance()
-                setOnPreferenceChangeListener { _, v ->
-                    current=current.copy(anisotropicFiltering=v.toString().toIntOrNull())
-                    writeGameSettings(); true
+            findPreference<ListPreference>("executable_heap")?.apply {
+                isVisible = !NativeBridge.isGizmondoGame(rootDir, gameId)
+                entries = arrayOf("Use emulator setting", "Enabled", "Disabled")
+                entryValues = arrayOf("inherit", "enabled", "disabled")
+                value = when (current.executableHeap) {
+                    null -> "inherit"
+                    true -> "enabled"
+                    false -> "disabled"
+                }
+                summaryProvider = androidx.preference.Preference.SummaryProvider<ListPreference> { pref ->
+                    "${pref.entry ?: "Use emulator setting"}. ${getString(R.string.executable_heap_help)}"
+                }
+                setOnPreferenceChangeListener { _, newValue ->
+                    current = current.copy(executableHeap = when (newValue) {
+                        "enabled" -> true
+                        "disabled" -> false
+                        else -> null
+                    })
+                    writeGameSettings()
+                    true
                 }
             }
             findPreference<ListPreference>("gpu_renderer_mode")?.apply {
@@ -192,12 +224,86 @@ class GameSettingsActivity : AppCompatActivity() {
                 summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
                 setOnPreferenceChangeListener { _, newValue ->
                     current = current.copy(gpuRenderer = when (newValue.toString()) { "gpu" -> true; "software" -> false; else -> null })
-                    findPreference<ListPreference>("anisotropic_filtering")?.isEnabled=current.gpuRenderer ?: globalGpu
                     writeGameSettings()
                     true
                 }
             }
 
+        }
+
+        private fun addWindowsCePreferences() {
+            val category = androidx.preference.PreferenceCategory(requireContext()).apply {
+                key = "windows_ce_category"; title = "Windows CE desktop"; isPersistent = false
+            }
+            preferenceScreen.addPreference(category)
+            val enabled = androidx.preference.SwitchPreferenceCompat(requireContext()).apply {
+                title = "Use Windows CE profile"; isPersistent = false
+                isChecked = current.windowsCe != null
+                summary = "Classic windows and a shared desktop for Explorer and its applications."
+            }
+            val image = androidx.preference.Preference(requireContext()).apply {
+                title = "Choose extracted CE image…"; isPersistent = false
+                setOnPreferenceClickListener { selectCeImage.launch(null); true }
+            }
+            val frames = androidx.preference.SwitchPreferenceCompat(requireContext()).apply {
+                title = "Classic window frames"; isPersistent = false
+                isChecked = current.windowsCe?.classicWindows ?: true
+                setOnPreferenceChangeListener { _, value ->
+                    current = current.copy(windowsCe = (current.windowsCe ?: WindowsCeSettings()).copy(classicWindows = value as Boolean))
+                    writeGameSettings(); true
+                }
+            }
+            val arguments = androidx.preference.EditTextPreference(requireContext()).apply {
+                title = "Command line"; isPersistent = false
+                text = current.windowsCe?.commandLine.orEmpty()
+                dialogMessage = "Arguments passed to the CE application. Use \\Application\\ for Portable Explorer's folder layout."
+                summaryProvider = androidx.preference.EditTextPreference.SimpleSummaryProvider.getInstance()
+                setOnPreferenceChangeListener { _, value ->
+                    val text = value.toString()
+                    if (text.contains('\u0000')) false else {
+                        current = current.copy(windowsCe = (current.windowsCe ?: WindowsCeSettings()).copy(commandLine = text))
+                        writeGameSettings(); true
+                    }
+                }
+            }
+            fun refresh() {
+                val busy = ceImageModel.step.value == WindowsCeImageModel.Step.Copying
+                enabled.isEnabled = !busy
+                image.isEnabled = current.windowsCe != null && !busy
+                image.summary = if (busy) "Copying the selected image…" else
+                    current.windowsCe?.imageRoot?.let { "$it\nFilesystem, fonts and initial registry; changes are saved separately." }
+                        ?: "Optional. Select a folder containing Windows/coredll.dll, or a parent containing fs/Windows."
+                frames.isVisible = current.windowsCe != null
+                arguments.isVisible = current.windowsCe != null
+            }
+            enabled.setOnPreferenceChangeListener { _, value ->
+                current = if (value as Boolean) current.copy(
+                    windowsCe = current.windowsCe ?: WindowsCeSettings(), screen = "vga_landscape", rotation = "none", maxSlices = 0,
+                ) else current.copy(windowsCe = null)
+                findPreference<ListPreference>("screen")?.value = current.screen
+                findPreference<ListPreference>("rotation")?.value = current.rotation
+                writeGameSettings(); refresh(); true
+            }
+            category.addPreference(enabled); category.addPreference(image)
+            category.addPreference(frames); category.addPreference(arguments)
+            ceImageModel.step.observe(this) { step ->
+                when (step) {
+                    is WindowsCeImageModel.Step.Imported -> {
+                        current = current.copy(windowsCe = (current.windowsCe ?: WindowsCeSettings()).copy(
+                            imageRoot = step.imageRoot, dataDir = step.dataDir,
+                        ))
+                        enabled.isChecked = true
+                        writeGameSettings(); ceImageModel.consumed()
+                    }
+                    is WindowsCeImageModel.Step.Failed -> {
+                        android.widget.Toast.makeText(context, step.message, android.widget.Toast.LENGTH_LONG).show()
+                        ceImageModel.consumed()
+                    }
+                    else -> {}
+                }
+                refresh()
+            }
+            refresh()
         }
 
         private fun readGameSettings(): GameSettings? {
@@ -215,10 +321,14 @@ class GameSettingsActivity : AppCompatActivity() {
             val result = runCatching { org.json.JSONObject(NativeBridge.writeGameSettings(rootDir, gameId, current.toJson().toString())) }.getOrNull()
             val saved = runCatching { org.json.JSONObject(NativeBridge.readGameSettings(rootDir, gameId)) }.getOrNull()
             val gpuSaved = saved != null && saved.has("gpu_renderer") &&
-                (if (saved.isNull("gpu_renderer")) null else saved.optBoolean("gpu_renderer")) == current.gpuRenderer && saved.has("anisotropic_filtering") &&
-                (if (saved.isNull("anisotropic_filtering")) null else saved.optInt("anisotropic_filtering")) == current.anisotropicFiltering
-            val frameLimitSaved = saved?.optString("frame_rate_limit", "") == current.frameRateLimit
-            if (result?.optBoolean("ok", false) != true || !gpuSaved || !frameLimitSaved) {
+                (if (saved.isNull("gpu_renderer")) null else saved.optBoolean("gpu_renderer")) == current.gpuRenderer
+            val frameLimitSaved = saved != null && saved.has("frame_rate_limit") && (if (saved.isNull("frame_rate_limit")) null else saved.optString("frame_rate_limit")) == current.frameRateLimit
+            val heapSaved = saved != null &&
+                (if (saved.isNull("executable_heap")) null else saved.optBoolean("executable_heap")) == current.executableHeap
+            val eglFormatSaved = saved != null && saved.has("pocketpc_egl_rgba8888_only") &&
+                saved.optBoolean("pocketpc_egl_rgba8888_only") == current.pocketpcEglRgba8888Only
+            val ceSaved = saved != null && GameSettings.fromJson(saved).windowsCe?.copy(originalJson = "{}") == current.windowsCe?.copy(originalJson = "{}")
+            if (result?.optBoolean("ok", false) != true || !gpuSaved || !frameLimitSaved || !heapSaved || !eglFormatSaved || !ceSaved) {
                 android.widget.Toast.makeText(context, "Could not save settings. Rebuild and install the updated native libraries and APK.", android.widget.Toast.LENGTH_LONG).show()
             }
         }

@@ -1340,6 +1340,14 @@ impl AudioEngine {
     }
 }
 
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        // Explicit runner shutdown is normal; destruction/unwinding must also
+        // signal and join the owned CPAL worker rather than detach its handle.
+        self.stop();
+    }
+}
+
 /// Host-side pull handle produced by [`AudioEngine::tap`].
 ///
 /// Draining moves the playback cursor forward, so `waveOutGetPosition`
@@ -1642,6 +1650,62 @@ fn fill_output_u16(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "audio-cpal")]
+    #[test]
+    fn voice_groups_pause_resume_and_stop_independently_without_a_host_device() {
+        let engine = AudioEngine::new();
+        let format = GuestFormat {
+            sample_rate: 22050,
+            channels: 1,
+            bits_per_sample: 16,
+        };
+        for (group, samples) in [(11, [1000i16; 4]), (22, [2000i16; 4])] {
+            engine.play_voice_with(
+                &samples,
+                format,
+                VoiceParams {
+                    group,
+                    looped: true,
+                    volume: 1.0,
+                },
+            );
+        }
+        // Use the same mixer as CPAL, without starting a hardware output worker
+        // or racing a second consumer against a host callback.
+        let render = || {
+            let mut output = [0f32; 32];
+            engine
+                .shared
+                .lock()
+                .unwrap()
+                .render_frames(&mut output, 22050, 1);
+            output
+        };
+        engine.pause_voice_group(11, true);
+        assert!(
+            render().iter().all(|s| *s > 0.0),
+            "the other group remains audible"
+        );
+        engine.pause_voice_group(22, true);
+        assert!(render().iter().all(|s| *s == 0.0), "both groups are paused");
+        engine.pause_voice_group(11, false);
+        assert!(
+            render().iter().all(|s| *s > 0.0),
+            "one group resumes independently"
+        );
+        engine.stop_voice_group(22);
+        assert!(
+            render().iter().all(|s| *s > 0.0),
+            "stopping a different group preserves output"
+        );
+        engine.stop_voice_group(11);
+        assert!(
+            render().iter().all(|s| *s == 0.0),
+            "stopping the final group silences output"
+        );
+        assert!(engine.worker.is_none());
+    }
 
     #[test]
     fn wave_volume_updates_queued_loop_and_future_streams_without_stopping_cursors() {
@@ -2064,5 +2128,39 @@ mod output_recording_tests {
         tap.drain_into(&mut out[..2]);
         assert!(sink.drain().is_empty());
         assert_eq!(&out[..2], &[3000, -3000]);
+    }
+}
+
+#[cfg(test)]
+mod session_drop_tests {
+    use super::*;
+    #[cfg(feature = "audio-cpal")]
+    #[test]
+    fn dropping_engine_signals_and_joins_output_worker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut engine = AudioEngine::new();
+        let shutdown = engine.shutdown.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        engine.worker = Some(std::thread::spawn(move || {
+            while !shutdown.load(Ordering::SeqCst) {
+                std::thread::park_timeout(std::time::Duration::from_millis(1));
+            }
+            flag.store(true, Ordering::Release);
+        }));
+        drop(engine);
+        assert!(finished.load(Ordering::Acquire));
+    }
+    #[test]
+    fn dropping_engine_without_explicit_stop_flushes_a_retained_tap() {
+        let engine = AudioEngine::new();
+        engine.set_guest_format(GuestFormat::default());
+        engine.push_samples(&[1000; 128]);
+        let tap = engine.tap();
+        assert!(tap.format_ready());
+        drop(engine);
+        assert!(!tap.format_ready());
+        let mut output = [0; 128];
+        assert_eq!(tap.drain_into(&mut output), 0);
     }
 }

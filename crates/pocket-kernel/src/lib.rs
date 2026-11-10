@@ -37,9 +37,13 @@ pub mod async_keys;
 pub mod audio;
 pub mod bluetooth;
 pub mod camera;
+pub mod ce;
+pub mod ce_hive;
+pub mod cedb;
 pub mod classic_sip;
 pub mod colors;
 pub mod controls;
+pub mod crypto;
 pub mod desktop_services;
 pub mod device_identity;
 pub mod device_status;
@@ -58,6 +62,7 @@ pub mod image_memory;
 pub mod imaging;
 pub mod internet;
 pub mod memory_division;
+mod mips_native_thunks;
 pub mod msgbox;
 pub mod msxml;
 pub mod native_thunks;
@@ -77,6 +82,9 @@ pub mod touch_steering;
 pub mod tracker;
 pub mod vfs;
 pub mod vibration;
+mod window_cleanup;
+mod window_compositor;
+pub mod windowing;
 pub mod zlib;
 
 pub use audio::{AudioEngine, AudioTap, GuestFormat, VoiceParams};
@@ -480,6 +488,9 @@ pub struct WaveOutDevice {
 /// State shared by all open `waveOut` handles.
 #[derive(Debug, Default)]
 pub struct WaveOutState {
+    /// WinMM mixer opens have their own lifetime; never alias wave/file handles.
+    pub mixer_handles: std::collections::HashSet<u32>,
+    pub next_mixer_handle: u32,
     /// Optional compatibility budget for simultaneously open output handles.
     /// None preserves the unbounded software mixer. This is not a measured
     /// hardware voice count; device launchers may explicitly opt into a budget.
@@ -520,7 +531,7 @@ pub struct WaveOutState {
     /// Set while the guest is executing `waveOutProc`, so the pump
     /// knows to restore the interrupted call's registers when the
     /// callback returns.
-    pub function_frame: Option<GuestCallFrame>,
+    pub function_frame: Option<(usize, u32, GuestCallFrame)>,
 }
 
 /// One `hssSound` or `hssMusic` object the guest constructed.
@@ -565,6 +576,7 @@ pub struct HssChannel {
     pub offset: u64,
     pub stopped: bool,
     pub paused: bool,
+    pub suspended: bool,
     pub looped: bool,
     pub music: bool,
 }
@@ -583,16 +595,19 @@ impl HssChannel {
             offset: 0,
             stopped: true,
             paused: false,
+            suspended: false,
             looped: false,
             music: false,
         }
     }
     pub fn position(&self) -> u64 {
-        let position = self.offset.saturating_add(if self.paused || self.stopped {
-            0
-        } else {
-            (self.started.elapsed().as_secs_f64() * self.rate as f64) as u64
-        });
+        let position =
+            self.offset
+                .saturating_add(if self.paused || self.suspended || self.stopped {
+                    0
+                } else {
+                    (self.started.elapsed().as_secs_f64() * self.rate as f64) as u64
+                });
         if self.looped && self.frames != 0 {
             position % self.frames
         } else {
@@ -602,7 +617,7 @@ impl HssChannel {
     pub fn active(&self) -> bool {
         !self.stopped
             && self.frames > 0
-            && (self.looped || self.paused || self.position() < self.frames)
+            && (self.looped || self.paused || self.suspended || self.position() < self.frames)
     }
 }
 
@@ -611,6 +626,7 @@ impl HssChannel {
 pub struct HssState {
     pub channels: HashMap<(u32, u32), HssChannel>,
     pub speakers: HashMap<u32, (u32, u32)>,
+    pub suspended_speakers: std::collections::HashSet<u32>,
     /// Loaded clips, keyed by the `this` pointer of the `hssSound` /
     /// `hssMusic` object that owns them.
     pub clips: HashMap<u32, HssClip>,
@@ -637,6 +653,7 @@ impl Default for HssState {
         Self {
             channels: HashMap::new(),
             speakers: HashMap::new(),
+            suspended_speakers: std::collections::HashSet::new(),
             clips: HashMap::new(),
             decoded: HashMap::new(),
             format: GuestFormat::default(),
@@ -706,6 +723,7 @@ pub struct ModalDialog {
 /// the HLE has to both remember the parts and draw them.
 #[derive(Debug, Clone, Default)]
 pub struct StatusBar {
+    pub simple: bool,
     /// Parent window the bar is docked to the bottom of.
     pub parent: u32,
     /// Height in pixels, from the `CreateStatusWindow` call.
@@ -768,6 +786,50 @@ impl StatusBar {
             self.height
         } else {
             Self::DEFAULT_HEIGHT
+        }
+    }
+
+    /// A classic CE status control belongs to its parent client, not the
+    /// display's bottom edge. Portable Explorer keeps its taskbar below it.
+    pub fn render_at(
+        &self,
+        surface: &mut gdi::Surface<'_>,
+        rect: (i32, i32, i32, i32),
+        face: Option<&gdi::Font>,
+        background: Option<u16>,
+    ) {
+        let (x, y, width, height) = rect;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        surface.fill_rect(x, y, width, height, background.unwrap_or(Self::BG));
+        surface.fill_rect(x, y, width, 1, Self::EDGE);
+        for (i, text) in self.part_text.iter().enumerate() {
+            if self.simple && i != 255 {
+                continue;
+            }
+            if !self.simple && i == 255 {
+                continue;
+            }
+            let (left, right) = if self.simple {
+                (0, width)
+            } else {
+                self.part_span(i, width)
+            };
+            if left >= right {
+                continue;
+            }
+            if left > 0 {
+                surface.fill_rect(x + left, y + 3, 1, (height - 6).max(0), 0x8410);
+            }
+            let layout = text::layout(face, &text.encode_utf16().collect::<Vec<_>>());
+            layout.draw(
+                surface,
+                x + left + 3,
+                y + (height - layout.height) / 2,
+                Self::FG,
+                [x + left + 2, y + 1, x + right - 2, y + height],
+            );
         }
     }
 
@@ -837,6 +899,14 @@ pub struct GuestCallFrame {
     pub sp: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct NotifyMessageFrame {
+    pub thread: usize,
+    pub thunk: u32,
+    pub frame: GuestCallFrame,
+    pub recipients: Vec<u32>,
+}
+
 /// A synchronous window callback belongs to the guest thread that entered it.
 #[derive(Debug, Clone, Copy)]
 pub struct WindowCallbackFrame {
@@ -894,7 +964,7 @@ pub struct ControlNotifyFrame {
 /// in the `WM_SIZE` arm, so a title that draws immediately after
 /// `CreateWindowExW` — before it ever reaches its message pump — sees a
 /// zeroed layout and refuses to paint.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MenuItem {
     pub id: u32,
     pub kind: u32,
@@ -1029,6 +1099,8 @@ impl Dispatcher for NullDispatcher {
 /// code, patched imports, and exports registered in `dynamic_exports`.
 #[derive(Debug, Clone)]
 pub struct LoadedModule {
+    /// LOAD_LIBRARY_AS_DATAFILE: resources only, never exports or callbacks.
+    pub data_file: bool,
     /// Native import edges; lifetime follows reachability from explicit loads.
     pub dependencies: Vec<u32>,
     pub attached: bool,
@@ -1079,7 +1151,7 @@ pub struct ProcessLaunch {
     pub concurrent: bool,
     pub command_line: String,
     pub creation_flags: u32,
-    pub call_key: (usize, u32, u32),
+    pub call_key: Option<(usize, u32, u32)>,
     pub executable: PathBuf,
     pub guest_path: String,
     pub process_handle: u32,
@@ -1099,6 +1171,7 @@ pub struct ChildProcess {
 pub struct ProcessHandleContext {
     pub table: handles::HandleTable,
     vfs_shared: vfs::VfsShared,
+    registry_store: std::sync::Arc<std::sync::Mutex<registry::RegistryStore>>,
     events: shared_objects::SharedObjects<EventObject>,
     semaphores: shared_objects::SharedObjects<SemaphoreObject>,
     mutexes: shared_objects::SharedObjects<MutexObject>,
@@ -1129,6 +1202,7 @@ pub struct KernelState {
     /// Only frontends with foreground handoff support may expose SD launch.
     pub process_launch_enabled: bool,
     pub pending_process_launch: Option<ProcessLaunch>,
+    pub scheduled_process_launches: HashMap<String, (std::time::SystemTime, String)>,
     pub command_line_cache: Option<u32>,
     pub command_line: Option<String>,
     pub process_launch_results: HashMap<(usize, u32, u32), Result<u32, u32>>,
@@ -1138,13 +1212,16 @@ pub struct KernelState {
     pub main_thread: MainThreadState,
     /// Closed aliases remain as tombstones to reject stale handles.
     pub object_handles: handles::HandleTable,
+    pub crypto: crypto::CryptoState,
+    pub cedb: cedb::ContactStore,
     pub mapped_views: file_mapping::MappedViews,
     pub msxml: msxml::MsxmlState,
     pub random_seed: u32,
     /// Software-rendered display the GDI/GAPI handlers paint into.
-    pub framebuffer: Framebuffer,
+    pub framebuffer: framebuffer::deferred::DeferredFramebuffer,
     /// Tracked GDI objects (DCs, bitmaps, brushes, pens, fonts).
     pub gdi: GdiState,
+    pub ce: ce::State,
     /// Flat resource table for `FindResourceW` / `LoadResource`.
     pub resources: Vec<ResourceEntry>,
     /// Image base for resource RVA → VA conversion.
@@ -1233,6 +1310,9 @@ pub struct KernelState {
     /// GXBeginDraw owns guest pixels until GXEndDraw publishes the frame.
     /// Raw framebuffer polling must not expose an unfinished GAPI draw.
     pub gx_draw_active: bool,
+    /// Thread that acquired the active GAPI display pointer. Another thread
+    /// yielding cannot declare its unfinished draw complete.
+    pub gx_draw_thread: usize,
     /// This display session has declared explicit GXEndDraw frame boundaries.
     pub gx_explicit_present: bool,
     /// Signature of sampled guest framebuffer rows from the last sync.
@@ -1370,6 +1450,7 @@ pub struct KernelState {
     /// another thread is inside WndProc; its callback return must restore
     /// only its own arguments/stack, never another thread's continuation.
     pub message_frames: HashMap<usize, Vec<GuestCallFrame>>,
+    pub notify_message_frames: Vec<NotifyMessageFrame>,
     /// Bottom status bar created via commctrl's `CreateStatusWindowW`.
     ///
     /// Pocket PC apps get a real shell-drawn bar here; PocketHLE has no
@@ -1448,6 +1529,8 @@ pub struct KernelState {
     pub current_thread: usize,
     /// Last-error values are isolated by guest thread, including main (0).
     pub thread_last_errors: HashMap<usize, u32>,
+    /// WinCE access keys set by individual guest threads.
+    pub thread_proc_permissions: HashMap<usize, u32>,
     /// Winsock errors belong to the calling thread and survive status reads.
     pub legacy_winsock: desktop_services::LegacyWinsock,
     pub notification_icons: HashMap<(u32, u32), desktop_services::NotificationIcon>,
@@ -1612,6 +1695,19 @@ pub struct MainThreadState {
 }
 
 impl KernelState {
+    /// Discard input and repeats when this process loses or regains focus.
+    pub fn reset_foreground_input(&mut self) {
+        self.pending_input.clear();
+        if let Some(up) = self.stylus_stick.cancel() {
+            self.pending_input.push_back(up);
+        }
+        self.pressed_keys.fill(false);
+        self.async_keys = Default::default();
+        self.held_keys.clear();
+        self.key_repeat_next_ms = None;
+        self.key_repeat_cursor = 0;
+    }
+
     /// Observe each host input once, whether queried asynchronously or removed by a pump.
     pub fn pop_pending_input(&mut self) -> Option<InputEvent> {
         self.async_keys
@@ -1712,18 +1808,127 @@ impl KernelState {
         }
     }
 
+    /// Explorer and Control Panel use one device registry across processes.
+    /// Apply changed settings at input polling boundaries, without repeatedly
+    /// overwriting volume or SIP changes made through an application's APIs.
+    pub fn sync_ce_settings(&mut self) {
+        if self.ce.version.is_none() {
+            return;
+        }
+        let number = |key: &str, name: &str, fallback: u32| match self.registry.value(key, name) {
+            Some(crate::registry::RegistryValue::Dword(value)) => value,
+            _ => fallback,
+        };
+        self.controls.double_click_time_ms =
+            u64::from(number(r"HKCU\ControlPanel\Pen", "DoubleTapTimeout", 500).clamp(1, 5000));
+        self.ce.settings.key_repeat_delay_ms =
+            u64::from(number(r"HKCU\ControlPanel\Keyboard", "InitialDelay", 400).clamp(100, 2000));
+        self.ce.settings.key_repeat_interval_ms =
+            u64::from(number(r"HKCU\ControlPanel\Keyboard", "RepeatRate", 33).clamp(10, 1000));
+        let audio = (
+            number(r"HKCU\ControlPanel\Volume", "Volume", u32::MAX),
+            number(r"HKCU\ControlPanel\Volume", "Mute", 2) & 2 != 0,
+        );
+        if self.ce.settings.audio != Some(audio) {
+            self.audio
+                .set_wave_volume(0, if audio.1 { audio.0 } else { 0 });
+            self.ce.settings.audio = Some(audio);
+        }
+        if let Some(crate::registry::RegistryValue::Dword(visible)) =
+            self.registry.value(r"HKCU\ControlPanel\SIP", "Visible")
+        {
+            let visible = visible != 0;
+            if self.ce.settings.sip_visible != Some(visible) {
+                self.ce.settings.sip_visible = Some(visible);
+                self.shell_keyboard.sip = true;
+                self.shell_keyboard.requested = visible;
+                if !visible && self.shell_keyboard.visible {
+                    self.shell_keyboard.visible = false;
+                    self.invalidate_presentation();
+                }
+            }
+        }
+    }
+
+    pub fn take_process_launch(&mut self) -> Option<ProcessLaunch> {
+        if self.pending_process_launch.is_some() {
+            return self.pending_process_launch.take();
+        }
+        if self.scheduled_process_launches.is_empty() {
+            return None;
+        }
+        self.take_scheduled_process_launch(std::time::SystemTime::now())
+    }
+
+    /// Drain one expired notification through the same guest process runner.
+    pub fn take_scheduled_process_launch(
+        &mut self,
+        now: std::time::SystemTime,
+    ) -> Option<ProcessLaunch> {
+        let (key, _) = self
+            .scheduled_process_launches
+            .iter()
+            .filter(|(_, (deadline, _))| *deadline <= now)
+            .min_by_key(|(key, (deadline, _))| (*deadline, *key))?;
+        let key = key.clone();
+        let (_, guest_path) = self.scheduled_process_launches.remove(&key)?;
+        let Some(executable) = self.vfs.resolve(&guest_path).filter(|path| path.is_file()) else {
+            log::debug!("CeRunAppAtTime: scheduled executable unavailable: {guest_path:?}");
+            return None;
+        };
+        let Some((process_handle, table)) = self.object_handles.new_child() else {
+            log::warn!("CeRunAppAtTime: could not allocate a guest process for {guest_path:?}");
+            return None;
+        };
+        table.hold_start();
+        Some(ProcessLaunch {
+            concurrent: true,
+            command_line: "AppRunAtTime".into(),
+            creation_flags: 0,
+            call_key: None,
+            executable,
+            guest_path,
+            process_handle,
+            thread_handle: process_handle + 1,
+        })
+    }
+
     pub fn child_handle_context(&mut self, handle: u32) -> Option<ProcessHandleContext> {
         self.publish_handles();
         Some(ProcessHandleContext {
             table: self.object_handles.child(handle)?,
             vfs_shared: self.vfs.shared_context(),
+            registry_store: self.registry.store.clone(),
             events: self.events.clone(),
             semaphores: self.semaphores.clone(),
             mutexes: self.mutexes.clone(),
         })
     }
     pub fn reclaim_finished_stacks(&mut self, cpu: &mut dyn Cpu) -> Result<(), KernelError> {
+        self.reclaim_finished_windows();
         self.reclaim_finished_tls();
+        // An interrupted guest enumeration owns its scratch buffer. Retire it
+        // with its thread even if other threads keep the process alive.
+        let main_finished = self.main_thread.exit_code.is_some();
+        let threads = &self.threads;
+        let finished = |thread: usize| {
+            if thread == 0 {
+                main_finished
+            } else {
+                threads.get(thread - 1).is_some_and(|t| t.finished)
+            }
+        };
+        self.notify_message_frames
+            .retain(|frame| !finished(frame.thread));
+        let heap = &mut self.heap;
+        self.gdi.font_enum_frames.retain(|frame| {
+            if finished(frame.thread) {
+                heap.free(frame.scratch);
+                false
+            } else {
+                true
+            }
+        });
         let dead_host_buffers: Vec<_> = self
             .legacy_winsock
             .hostent_buffers
@@ -1810,6 +2015,8 @@ impl KernelState {
     }
     pub fn attach_handle_context(&mut self, context: ProcessHandleContext) {
         self.vfs.attach_shared_context(context.vfs_shared);
+        // Registry values belong to the device; handles and overrides stay local.
+        self.registry.store = context.registry_store;
         self.object_handles = context.table;
         self.events = context.events;
         self.semaphores = context.semaphores;
@@ -1921,7 +2128,9 @@ impl KernelState {
         if !self.heap.attach_ram(division.clone()) {
             return false;
         }
-        if !self.registry.attach_ram(division.as_ref()) {
+        if (division.is_some() || previous.is_some())
+            && !self.registry.attach_ram(division.as_ref())
+        {
             self.heap.attach_ram(previous);
             return false;
         }
@@ -1951,6 +2160,11 @@ impl KernelState {
             }
         }
         self.message_frames.clear();
+        self.notify_message_frames.clear();
+        for frame in self.gdi.font_enum_frames.drain(..) {
+            self.heap.free(frame.scratch);
+        }
+        self.gdi.clear_guest_fonts();
         self.gdi.owner_draw_frames.clear();
         self.gdi.list_paint_frames.clear();
         self.gdi.control_color_frames.clear();
@@ -1994,16 +2208,27 @@ impl KernelState {
     /// forever.
     /// Host-owned SIP overlay. Never write its pixels into the guest's GDI/GAPI
     /// framebuffer: hiding or rotating the keyboard must not leave stale pixels.
-    pub fn presentation_framebuffer(&self) -> std::borrow::Cow<'_, Framebuffer> {
+    pub fn presentation_framebuffer(
+        &mut self,
+    ) -> Result<std::borrow::Cow<'_, Framebuffer>, String> {
         if (!self.shell_keyboard.sip || !self.shell_keyboard.visible)
-            && self.gdi.shell_menus.tracking.is_none()
+            && self.gdi.shell_menus.active_handle().is_none()
+            && !self
+                .gdi
+                .image_drag
+                .as_ref()
+                .is_some_and(|drag| drag.visible)
         {
-            return std::borrow::Cow::Borrowed(&self.framebuffer);
+            return Ok(std::borrow::Cow::Borrowed(
+                self.framebuffer.presentation_cpu()?,
+            ));
         }
-        let mut frame = self.framebuffer.clone();
-        if self.gdi.shell_menus.tracking.is_some() {
+        let mut frame = self.framebuffer.presentation_cpu()?.clone();
+        // Native GDI/SIP overlays use guest coordinates and take precedence.
+        frame.clear_render_presentation();
+        if let Some(menu_bar) = self.gdi.shell_menus.active_handle() {
             self.gdi.shell_menus.render(
-                shell_menu::TRACKING_HANDLE,
+                menu_bar,
                 &mut gdi::Surface::Screen(&mut frame),
                 &self.gdi,
                 &self.menu_items,
@@ -2012,7 +2237,34 @@ impl KernelState {
         }
         self.shell_keyboard
             .render(&mut gdi::Surface::Screen(&mut frame));
-        std::borrow::Cow::Owned(frame)
+        if let Some(drag) = self.gdi.image_drag.as_ref().filter(|drag| drag.visible) {
+            let origin = if drag.window == 0 {
+                (0, 0)
+            } else {
+                self.native_window_screen_rect(drag.window)
+                    .map(|r| (r.0, r.1))
+                    .or_else(|| self.controls.screen_rect(drag.window).map(|r| (r.0, r.1)))
+                    .unwrap_or_default()
+            };
+            let x = origin
+                .0
+                .saturating_add(drag.position.0)
+                .saturating_sub(drag.hotspot.0);
+            let y = origin
+                .1
+                .saturating_add(drag.position.1)
+                .saturating_sub(drag.hotspot.1);
+            let clip = [0, 0, frame.width as i32, frame.height as i32];
+            drag.image.draw(
+                &mut gdi::Surface::Screen(&mut frame),
+                x,
+                y,
+                drag.image.width,
+                drag.image.height,
+                clip,
+            );
+        }
+        Ok(std::borrow::Cow::Owned(frame))
     }
 
     /// Walk child parents, never popup owners. The fallback preserves the
@@ -2106,6 +2358,9 @@ impl KernelState {
             let r = self.window_rects.get(&hwnd)?;
             x = x.saturating_add(r.0);
             y = y.saturating_add(r.1);
+            let inset = self.window_metrics(hwnd).insets();
+            x = x.saturating_add(inset[0]);
+            y = y.saturating_add(inset[1]);
             if !self
                 .window_styles
                 .get(&hwnd)
@@ -2128,6 +2383,21 @@ impl KernelState {
             .filter_map(|&h| self.window_client_origin(h).map(|p| (h, p)))
             .collect();
         self.controls.set_native_origins(origins);
+        let bar_bounds: Vec<_> = self
+            .gdi
+            .shell_menus
+            .bars
+            .iter()
+            .filter(|(_, bar)| bar.bounds.is_some())
+            .filter_map(|(&h, _)| {
+                self.controls
+                    .screen_rect(h)
+                    .map(|(x, y, w, t)| (h, [x, y, x + w, y + t]))
+            })
+            .collect();
+        for (h, bounds) in bar_bounds {
+            self.gdi.shell_menus.bars.get_mut(&h).unwrap().bounds = Some(bounds);
+        }
         let hidden = self
             .controls
             .window_handles()
@@ -2149,7 +2419,8 @@ impl KernelState {
 
     fn composite_window_layers(&mut self, present_windows: bool) {
         self.refresh_control_visibility();
-        if !present_windows
+        if !self.ce.windows.enabled
+            && !present_windows
             && self.controls.is_empty()
             && self.modal.is_none()
             && self.active_shell_bar().is_none()
@@ -2214,6 +2485,7 @@ impl KernelState {
                 .hash(&mut hash);
             c.list_items.hash(&mut hash);
             c.list_images.hash(&mut hash);
+            c.list_states.hash(&mut hash);
             c.list_image_lists.hash(&mut hash);
             c.list_positions.hash(&mut hash);
             let stamp = hash.finish();
@@ -2323,6 +2595,10 @@ impl KernelState {
         }
         self.controls
             .layout_choice_popups(self.framebuffer.height as i32);
+        if self.ce.windows.enabled {
+            self.composite_classic_windows();
+            return;
+        }
         let frame_counter = self.framebuffer.frame_counter;
         let controls = self.controls.clone();
         let modal = self.modal.clone();
@@ -2338,7 +2614,9 @@ impl KernelState {
             .get(&title_owner)
             .map(String::as_str)
             .unwrap_or("");
-        let mut surf = gdi::Surface::Screen(&mut self.framebuffer);
+        let navigation_dialog = controls
+            .panel(self.active_window)
+            .filter(|panel| panel.visible && panel.uses_navigation_bar());
         let mut layers = Vec::new();
         let mut native_paint_changed = false;
         for (&hwnd, &dc) in &self.window_dcs {
@@ -2436,6 +2714,27 @@ impl KernelState {
         if present_windows && !native_paint_changed {
             return;
         }
+        if !present_windows
+            && layers.is_empty()
+            && !controls.has_visible_content()
+            && modal.is_none()
+            && shell_bar.is_none()
+            && !taskbar
+            && !(self.shell_keyboard.visible && !self.shell_keyboard.sip)
+        {
+            return;
+        }
+        // A completed but unchanged paint is not a framebuffer write. Acquire
+        // CPU pixels only after that decision, or merely polling EndPaint
+        // would materialize and invalidate an otherwise valid shared GPU image.
+        let frame = match self.framebuffer.cpu_mut() {
+            Ok(frame) => frame,
+            Err(error) => {
+                log::error!("CPU compositor could not access GPU pixels: {error}");
+                return;
+            }
+        };
+        let mut surf = gdi::Surface::Screen(frame);
         layers.sort_by_key(|layer| layer.0);
         controls.render_composited_with_images(&mut surf, &self.gdi, |owner, surface| {
             for (hwnd, parent, x, y, bm, clip) in &layers {
@@ -2461,7 +2760,7 @@ impl KernelState {
         if taskbar {
             self.gdi
                 .shell_menus
-                .render_taskbar(&mut surf, taskbar_title);
+                .render_taskbar(&mut surf, taskbar_title, navigation_dialog);
         }
         if !self.shell_keyboard.sip {
             self.shell_keyboard.render(&mut surf);
@@ -2500,7 +2799,12 @@ impl KernelState {
     /// is compared, case-insensitively.
     pub fn module_by_name(&self, name: &str) -> Option<&LoadedModule> {
         let key = module_file_name(name);
-        self.modules.iter().find(|m| m.name == key)
+        self.modules.iter().find(|m| !m.data_file && m.name == key)
+    }
+
+    pub fn data_file_module_by_name(&self, name: &str) -> Option<&LoadedModule> {
+        let key = module_file_name(name);
+        self.modules.iter().find(|m| m.data_file && m.name == key)
     }
 
     /// Resources and image base to search for a given `hModule`.
@@ -3181,6 +3485,19 @@ impl Heap {
         self.image_memory.clone()
     }
 
+    /// Try the existing CE process slot before using a separate VA arena.
+    /// ARM code in slot zero can branch directly to any other code there.
+    pub fn virtual_alloc_in_private_slot(&mut self, size: u32, commit: bool) -> Option<u32> {
+        const SLOT_END: u32 = 0x0200_0000;
+        let span = size.checked_add(0xffff)? & !0xffff;
+        let base = self.free.iter().find_map(|&(start, len)| {
+            let base = start.checked_add(0xffff)? & !0xffff;
+            let end = base.checked_add(span)?;
+            (base != 0 && end <= SLOT_END && end <= start.checked_add(len)?).then_some(base)
+        })?;
+        self.virtual_alloc(base, size, true, commit)
+    }
+
     /// Page-aligned reservations share the same virtual arenas as the heap,
     /// but consume physical pages only when committed.
     pub fn virtual_alloc(
@@ -3430,10 +3747,27 @@ impl Heap {
     }
     /// MEMORY_BASIC_INFORMATION, ending at the next state/protection transition.
     pub fn query_virtual(&self, address: u32) -> Option<[u32; 7]> {
-        let (&base, block) = self
+        let Some((&base, block)) = self
             .virtual_blocks
             .iter()
-            .find(|&(base, block)| address >= *base && address < *base + block.size)?;
+            .find(|&(base, block)| address >= *base && address < *base + block.size)
+        else {
+            // Independent host-backed VA is owned by this allocator even in
+            // its free gaps. A free query starts at the queried page, never at
+            // an earlier coarse boundary that may contain a live reservation.
+            if self.ram.is_none() && (HOST_VIRTUAL_BASE..HOST_VIRTUAL_END).contains(&address) {
+                let page = address & !0xfff;
+                let end = self
+                    .virtual_blocks
+                    .keys()
+                    .copied()
+                    .filter(|&base| base > page && base < HOST_VIRTUAL_END)
+                    .min()
+                    .unwrap_or(HOST_VIRTUAL_END);
+                return Some([page, 0, 0, end - page, 0x10000, 0, 0]);
+            }
+            return None;
+        };
         let first = address / 4096;
         let committed = block.committed.contains(&first);
         let protect = if committed {
@@ -3662,6 +3996,14 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
                 .entry(NOTE_PRJ_MODULE_HANDLE)
                 .or_insert_with(HashMap::new)
                 .insert(name, thunk.thunk_va);
+        } else if let Some((_, handle)) = ce::CPL_MODULES
+            .iter()
+            .find(|(dll, _)| thunk.dll.eq_ignore_ascii_case(dll))
+        {
+            exports
+                .entry(*handle)
+                .or_insert_with(HashMap::new)
+                .insert(name, thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("ole32.dll") {
             ole32.insert(name.clone(), thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("libegl.dll") {
@@ -3732,10 +4074,20 @@ impl Process {
     /// import will then take the regular hooked dispatcher path at
     /// runtime.
     pub fn map_into(
+        image: LoadedImage,
+        cpu: &mut dyn Cpu,
+        ordinal_resolver: &dyn Fn(&str, u16) -> Option<String>,
+        dispatcher: &dyn Dispatcher,
+    ) -> Result<Self, KernelError> {
+        Self::map_into_with_executable_heap(image, cpu, ordinal_resolver, dispatcher, true)
+    }
+
+    pub fn map_into_with_executable_heap(
         mut image: LoadedImage,
         cpu: &mut dyn Cpu,
         ordinal_resolver: &dyn Fn(&str, u16) -> Option<String>,
         dispatcher: &dyn Dispatcher,
+        executable_heap: bool,
     ) -> Result<Self, KernelError> {
         if let Some(runtime) = image.managed_runtime.as_deref() {
             return Err(KernelError::Loader(format!(
@@ -3878,7 +4230,7 @@ impl Process {
             };
             let native =
                 if image.machine == machine::MIPS_R3000 || image.machine == machine::MIPS_R4000 {
-                    None
+                    native_name.and_then(|name| native_thunks::mips_thunk_for(&imp.dll, name))
                 } else {
                     native_name.and_then(|n| native_thunks::native_thunk_at(&imp.dll, n, thunk_va))
                 };
@@ -3961,6 +4313,7 @@ impl Process {
             "ws2.dll",
             "wininet.dll",
             "note_prj.dll",
+            "cplmain.cpl",
         ] {
             dynamic_exports_to_add.extend(
                 dispatcher
@@ -3982,7 +4335,9 @@ impl Process {
                 // GetProcAddress must expose the same small-copy fast path
                 // as a static import; unrelated dynamic exports keep their
                 // existing dispatch behaviour.
-                let hybrid = if cpu.arch() == Arch::Arm
+                let hybrid = if cpu.arch() == Arch::Mips {
+                    native_thunks::mips_thunk_for(&dll, &name).map(|words| (None, words))
+                } else if cpu.arch() == Arch::Arm
                     && (native_thunks::hybrid_fallback_offset(&dll, &name).is_some()
                         || (dll.eq_ignore_ascii_case("coredll.dll")
                             && matches!(name.as_str(), "__i64tod" | "__u64tod")))
@@ -4051,11 +4406,17 @@ impl Process {
             log::debug!("starting Thumb-mode entry with CPSR.T set");
         }
 
-        // 4. Map a heap.
-        cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE)?;
+        // 4. Map the ordinary process heap. Legacy ARM CE software can
+        // load code into malloc storage. Virtual allocations retain the
+        // protections requested by the guest.
+        let mut heap_prot = Prot::READ | Prot::WRITE;
+        if executable_heap && image_memory::legacy_arm_ce(image.machine, image.subsystem) {
+            heap_prot |= Prot::EXEC;
+        }
+        cpu.map_region(HEAP_BASE, HEAP_SIZE, heap_prot)?;
         let mut heap = if let Some((_, _, heap_base)) = private_layout {
             let heap_size = 0x0200_0000 - heap_base;
-            cpu.map_region(heap_base, heap_size, Prot::READ | Prot::WRITE)?;
+            cpu.map_region(heap_base, heap_size, heap_prot)?;
             let mut heap = Heap::new(heap_base, heap_size);
             heap.add_region(HEAP_BASE, HEAP_SIZE);
             heap
@@ -4190,6 +4551,7 @@ impl Process {
                 module_path: DEFAULT_MODULE_PATH.to_string(),
                 process_launch_enabled: false,
                 pending_process_launch: None,
+                scheduled_process_launches: Default::default(),
                 command_line_cache: None,
                 command_line: None,
                 process_launch_results: HashMap::new(),
@@ -4202,11 +4564,14 @@ impl Process {
                     ..MainThreadState::default()
                 },
                 object_handles: handles::HandleTable::default(),
+                crypto: Default::default(),
+                cedb: Default::default(),
                 mapped_views: Default::default(),
                 msxml: Default::default(),
                 random_seed: 0x1234_abcd,
-                framebuffer: Framebuffer::default(),
+                framebuffer: framebuffer::deferred::DeferredFramebuffer::default(),
                 gdi: GdiState::new(),
+                ce: ce::State::default(),
                 resources,
                 image_base: img_base,
                 image_size: img_size,
@@ -4235,6 +4600,7 @@ impl Process {
                 dib_decode_scratch: Vec::new(),
                 gx_last_pushed_counter: 0,
                 gx_draw_active: false,
+                gx_draw_thread: 0,
                 gx_explicit_present: false,
                 gx_guest_signature: None,
                 gles_strings: HashMap::new(),
@@ -4289,6 +4655,7 @@ impl Process {
                 accelerator_frames: Vec::new(),
                 shell_status: None,
                 message_frames: Default::default(),
+                notify_message_frames: Default::default(),
                 status_bar: None,
                 controls: Default::default(),
                 modal: None,
@@ -4308,6 +4675,7 @@ impl Process {
                 mutexes: Default::default(),
                 current_thread: 0,
                 thread_last_errors: HashMap::new(),
+                thread_proc_permissions: HashMap::new(),
                 legacy_winsock: Default::default(),
                 notification_icons: HashMap::new(),
                 winsock_last_errors: HashMap::new(),
@@ -4393,6 +4761,8 @@ impl Process {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameAction {
     Continue,
+    /// Keep running a background process while giving foreground work a turn.
+    ContinueInBackground,
     Stop,
 }
 
@@ -4439,6 +4809,10 @@ pub fn gapi_copy_columns(width: usize, height: usize, src: &[u8], dst: &mut [u8]
 }
 
 fn sync_guest_framebuffer(cpu: &mut dyn Cpu, state: &mut KernelState) {
+    // Internal polling is not a guest read. Leave untouched GPU pixels deferred.
+    if cpu.deferred_memory_pending(SYNTHETIC_FRAMEBUFFER_BASE) {
+        return;
+    }
     if !state.fb_mapped
         || state.gx_draw_active
         || !state.framebuffer.directdraw.primary_locks.is_empty()
@@ -4448,7 +4822,7 @@ fn sync_guest_framebuffer(cpu: &mut dyn Cpu, state: &mut KernelState) {
     }
     let pitch = state.guest_fb_pitch.max(state.framebuffer.stride_bytes()) as usize;
     let row_bytes = state.framebuffer.stride_bytes() as usize;
-    let len = state.framebuffer.pixels.len();
+    let len = state.framebuffer.byte_size() as usize;
     if state.gx_readback_scratch.len() != len {
         state.gx_readback_scratch.resize(len, 0);
     }
@@ -4486,13 +4860,20 @@ fn sync_guest_framebuffer(cpu: &mut dyn Cpu, state: &mut KernelState) {
             }
         }
     }
-    if state.gx_readback_scratch != state.framebuffer.pixels {
-        state
-            .framebuffer
-            .pixels
-            .copy_from_slice(&state.gx_readback_scratch);
-        state.framebuffer.mark_dirty();
-        state.gx_last_pushed_counter = state.framebuffer.frame_counter;
+    let frame = match state.framebuffer.cpu() {
+        Ok(frame) => frame,
+        Err(error) => {
+            log::error!("GAPI synchronization could not access GPU pixels: {error}");
+            return;
+        }
+    };
+    if state.gx_readback_scratch != frame.pixels {
+        // The image is resident, so this second access cannot invoke a reader.
+        if let Ok(frame) = state.framebuffer.cpu_mut() {
+            frame.pixels.copy_from_slice(&state.gx_readback_scratch);
+            frame.mark_dirty();
+            state.gx_last_pushed_counter = frame.frame_counter;
+        }
     }
 }
 
@@ -4532,6 +4913,12 @@ pub fn image_uses_thumb_entry(cpu: &mut dyn Cpu, image: &LoadedImage) -> Result<
         || (word & 0x0fff_0000) == 0x092d_0000
         || (word & 0x0fff_0000) == 0x08bd_0000
         || (word & 0x0e00_0000) == 0x0a00_0000
+        // Thumb-tagged CE DLLs can expose an ARM DllMain attach stub:
+        // str lr,[sp,#-4]!; cmp r1,#DLL_PROCESS_ATTACH. Require both
+        // instructions so an ordinary Thumb entry is not reclassified.
+        || (image.machine == machine::THUMB
+            && word == 0xe52d_e004
+            && cpu.read_u32_le(entry + 4)? == 0xe351_0001)
         // GTShell's supplied PMS DLLs declare IMAGE_FILE_MACHINE_THUMB,
         // but DllMain is an ARM `mov r0, #constant; bx lr` leaf. Check
         // both instructions: treating an arbitrary Thumb pair as ARM
@@ -4638,6 +5025,7 @@ pub fn run_main_loop_with_hook(
         // continuation address is kept separately in `pc`, so restore it
         // explicitly before each new slice; otherwise a return from one
         // API thunk re-enters that same thunk forever.
+        framebuffer::gapi_memory::before_resume(cpu, &mut process.state)?;
         cpu.write_reg(ArmReg::Pc, pc)?;
         // Refresh the host-managed tick page so the native
         // `GetTickCount` thunk's plain `LDR` returns a fresh
@@ -4725,6 +5113,11 @@ pub fn run_main_loop_with_hook(
             match stop {
                 StopReason::InstructionLimit => {
                     pc = cpu.read_reg(ArmReg::Pc)?;
+                    // Unicorn reports an aligned PC when preempted. Its next
+                    // emu_start needs the Thumb tag to resume in that state.
+                    if cpu.arch() == pocket_cpu::Arch::Arm {
+                        pc = (pc & !1) | ((cpu.read_reg(ArmReg::Cpsr)? >> 5) & 1);
+                    }
                     if let Some(worker_pc) =
                         dispatcher.schedule_cpu_slice(cpu, &mut process.state)?
                     {
@@ -5159,12 +5552,21 @@ pub fn run_main_loop_with_hook(
             if due || input_due {
                 last_frontend_poll = Some(now);
                 process.state.sync_backlight();
+                process.state.sync_ce_settings();
                 process.state.sync_power_notifications();
                 let action = hook.on_frame(&mut process.state);
                 last_presented_frame = process.state.framebuffer.frame_counter;
-                if action == FrameAction::Stop {
-                    log::info!("frame hook requested stop");
-                    return Ok(());
+                match action {
+                    FrameAction::Stop => {
+                        log::info!("frame hook requested stop");
+                        return Ok(());
+                    }
+                    FrameAction::ContinueInBackground if !process.state.should_stop => {
+                        // The execution gate is released here. A busy background
+                        // message pump must give other guests a chance to run.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    FrameAction::Continue | FrameAction::ContinueInBackground => {}
                 }
             }
         }
@@ -5189,6 +5591,98 @@ mod tests {
     use pocket_cpu::stub::StubCpu;
     use pocket_pe::{LoadedImage, LoadedSection};
 
+    #[derive(Debug)]
+    struct RetainedTestImage {
+        reads: std::sync::atomic::AtomicUsize,
+        fail: std::sync::atomic::AtomicBool,
+    }
+    impl framebuffer::deferred::CpuPixelSource for RetainedTestImage {
+        fn logical_size(&self) -> (u32, u32) {
+            (3, 2)
+        }
+        fn native_size(&self) -> (u32, u32) {
+            (3, 2)
+        }
+        fn materialize(&self) -> Result<framebuffer::deferred::MaterializedPixels, String> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("lost test context".into());
+            }
+            Ok(framebuffer::deferred::MaterializedPixels {
+                logical_size: (3, 2),
+                native_size: (3, 2),
+                rgb565: vec![0, 0xf8, 0, 0xf8, 0, 0xf8, 0, 0xf8, 0, 0xf8, 0, 0xf8],
+                native_rgba: None,
+            })
+        }
+    }
+    #[test]
+    fn active_kernel_materializes_only_at_cpu_boundaries_and_keeps_gapi_coherent() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let mut cpu = StubCpu::new();
+        let mut process = Process::map_into(
+            image_based_at(0x10000, 0x1000),
+            &mut cpu,
+            &|_, _| None,
+            &NullDispatcher,
+        )
+        .unwrap();
+        let k = &mut process.state;
+        k.framebuffer.resize(3, 2);
+        let source = std::sync::Arc::new(RetainedTestImage {
+            reads: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
+        k.framebuffer.publish_gpu(source.clone()).unwrap();
+        let revision = k.framebuffer.frame_counter;
+        assert_eq!(
+            (
+                k.framebuffer.width,
+                k.framebuffer.height,
+                k.framebuffer.stride_bytes()
+            ),
+            (3, 2, 6)
+        );
+        assert_eq!(source.reads.load(Ordering::Relaxed), 0);
+        assert!(k.framebuffer.resident_cpu().is_none());
+        let frame = k.presentation_framebuffer().unwrap();
+        assert_eq!(&frame.pixels[..2], &[0, 0xf8]);
+        drop(frame);
+        assert_eq!(k.framebuffer.frame_counter, revision);
+        assert!(k.framebuffer.gpu_source().is_some());
+        assert_eq!(source.reads.load(Ordering::Relaxed), 1);
+        k.fb_mapped = true;
+        k.gx_last_pushed_counter = revision;
+        cpu.map_region(SYNTHETIC_FRAMEBUFFER_BASE, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_mem(
+            SYNTHETIC_FRAMEBUFFER_BASE,
+            &[0x1f, 0, 0x1f, 0, 0x1f, 0, 0x1f, 0, 0x1f, 0, 0x1f, 0],
+        )
+        .unwrap();
+        sync_guest_framebuffer(&mut cpu, k);
+        assert_eq!(
+            &k.framebuffer.resident_cpu().unwrap().pixels[..2],
+            &[0x1f, 0]
+        );
+        assert!(k.framebuffer.gpu_source().is_none());
+        assert_ne!(k.framebuffer.frame_counter, revision);
+        assert_eq!(source.reads.load(Ordering::Relaxed), 1);
+        k.framebuffer.publish_gpu(source.clone()).unwrap();
+        source.fail.store(true, Ordering::Relaxed);
+        let revision = k.framebuffer.frame_counter;
+        assert!(k.presentation_framebuffer().is_err());
+        assert!(k.framebuffer.resident_cpu().is_none());
+        assert!(k.framebuffer.gpu_source().is_some());
+        assert_eq!(k.framebuffer.frame_counter, revision);
+        source.fail.store(false, Ordering::Relaxed);
+        assert_eq!(
+            &k.presentation_framebuffer().unwrap().pixels[..2],
+            &[0, 0xf8]
+        );
+    }
+
     #[test]
     fn physical_columns_are_decoded_when_a_guest_retains_its_framebuffer_pointer() {
         let mut cpu = StubCpu::new();
@@ -5212,7 +5706,10 @@ mod tests {
         )
         .unwrap();
         sync_guest_framebuffer(&mut cpu, k);
-        assert_eq!(k.framebuffer.pixels, [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
+        assert_eq!(
+            k.framebuffer.resident_cpu().unwrap().pixels,
+            [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]
+        );
     }
 
     #[test]
@@ -5238,7 +5735,10 @@ mod tests {
         cpu.write_mem(SYNTHETIC_FRAMEBUFFER_BASE, &0xf800u16.to_le_bytes())
             .unwrap();
         sync_guest_framebuffer(&mut cpu, k);
-        assert_eq!(&k.framebuffer.pixels[..2], &0xf800u16.to_le_bytes());
+        assert_eq!(
+            &k.framebuffer.resident_cpu().unwrap().pixels[..2],
+            &0xf800u16.to_le_bytes()
+        );
         k.registry.set_value(
             r"HKCU\ControlPanel\Backlight",
             "OnLevel",
@@ -5248,7 +5748,10 @@ mod tests {
         cpu.write_mem(SYNTHETIC_FRAMEBUFFER_BASE, &0x001fu16.to_le_bytes())
             .unwrap();
         sync_guest_framebuffer(&mut cpu, k);
-        assert_eq!(&k.framebuffer.pixels[..2], &0x001fu16.to_le_bytes());
+        assert_eq!(
+            &k.framebuffer.resident_cpu().unwrap().pixels[..2],
+            &0x001fu16.to_le_bytes()
+        );
         // A real host/GDI draw still owns unsynchronized pixels. A rotation
         // must not allow stale guest memory to overwrite that drawing.
         let last_guest = k.gx_last_pushed_counter;
@@ -5256,7 +5759,10 @@ mod tests {
         k.invalidate_presentation();
         assert_eq!(k.gx_last_pushed_counter, last_guest);
         sync_guest_framebuffer(&mut cpu, k);
-        assert_eq!(&k.framebuffer.pixels[..2], &0x07e0u16.to_le_bytes());
+        assert_eq!(
+            &k.framebuffer.resident_cpu().unwrap().pixels[..2],
+            &0x07e0u16.to_le_bytes()
+        );
     }
 
     #[test]
@@ -5283,6 +5789,7 @@ mod tests {
                 menu: 0,
                 sip: true,
                 background: 0xf800,
+                bounds: None,
             },
         );
         assert!(k.controls.is_empty());
@@ -5291,16 +5798,19 @@ mod tests {
         k.composite_controls();
         let offset = ((k.framebuffer.height - 3) * k.framebuffer.width * 2) as usize;
         assert_eq!(
-            &k.framebuffer.pixels[offset..offset + 2],
+            &k.framebuffer.resident_cpu().unwrap().pixels[offset..offset + 2],
             &0xf800u16.to_le_bytes()
         );
-        assert_eq!(&k.framebuffer.pixels[..2], &0x07e0u16.to_le_bytes());
+        assert_eq!(
+            &k.framebuffer.resident_cpu().unwrap().pixels[..2],
+            &0x07e0u16.to_le_bytes()
+        );
         assert_eq!(k.framebuffer.frame_counter, counter);
         k.window_visibility.insert(bar, false);
         k.framebuffer.fill(0x001f);
         k.composite_controls();
         assert_eq!(
-            &k.framebuffer.pixels[offset..offset + 2],
+            &k.framebuffer.resident_cpu().unwrap().pixels[offset..offset + 2],
             &0x001fu16.to_le_bytes()
         );
     }
@@ -5325,18 +5835,21 @@ mod tests {
         k.fb_mapped = true;
         k.guest_fb_pitch = k.framebuffer.stride_bytes();
         k.gx_last_pushed_counter = k.framebuffer.frame_counter;
-        let before = k.framebuffer.pixels.clone();
+        let before = k.framebuffer.resident_cpu().unwrap().pixels.clone();
         let counter = k.framebuffer.frame_counter;
         k.gx_draw_active = true;
         cpu.write_mem(SYNTHETIC_FRAMEBUFFER_BASE, &0xf800u16.to_le_bytes())
             .unwrap();
         sync_guest_framebuffer(&mut cpu, k);
-        assert_eq!(k.framebuffer.pixels, before);
+        assert_eq!(k.framebuffer.resident_cpu().unwrap().pixels, before);
         assert_eq!(k.framebuffer.frame_counter, counter);
         // Direct framebuffer users outside a GX draw retain polling support.
         k.gx_draw_active = false;
         sync_guest_framebuffer(&mut cpu, k);
-        assert_eq!(&k.framebuffer.pixels[..2], &0xf800u16.to_le_bytes());
+        assert_eq!(
+            &k.framebuffer.resident_cpu().unwrap().pixels[..2],
+            &0xf800u16.to_le_bytes()
+        );
     }
 
     /// `SB_SETPARTS` hands us right-hand edges, with a trailing -1
@@ -5398,6 +5911,89 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_native_window_paint_preserves_gpu_authority_without_readback() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let mut cpu = StubCpu::new();
+        let mut process = Process::map_into(
+            image_based_at(0x10000, 0x1000),
+            &mut cpu,
+            &|_, _| None,
+            &NullDispatcher,
+        )
+        .unwrap();
+        let state = &mut process.state;
+        state.framebuffer.resize(3, 2);
+        let source = std::sync::Arc::new(RetainedTestImage {
+            reads: AtomicUsize::new(0),
+            fail: AtomicBool::new(true),
+        });
+        state.framebuffer.publish_gpu(source.clone()).unwrap();
+        // Hidden startup controls must not invalidate a subsequent GL frame.
+        state.controls.add_panel(controls::DialogPanel {
+            hwnd: 0xdead4100,
+            x: 0,
+            y: 0,
+            w: 3,
+            h: 2,
+            visible: false,
+            border: false,
+            caption: None,
+            ok_pressed: false,
+            caption_height: None,
+            caption_command: Some(1),
+            caption_help: false,
+        });
+        state.composite_controls();
+        assert_eq!(source.reads.load(Ordering::Relaxed), 0);
+        assert!(!state.framebuffer.cpu_resident());
+        assert!(state.framebuffer.gpu_source().is_some());
+        // Even an absent backing layer must not enter the CPU boundary.
+        state.present_window_surfaces();
+        let hwnd = 0xdead4000;
+        let dc = state.gdi.create_memory_dc();
+        let bm = state.gdi.create_compatible_bitmap(3, 2);
+        state.gdi.select_into(dc, bm);
+        state.window_dcs.insert(hwnd, dc);
+        state.window_rects.insert(hwnd, (0, 0, 3, 2));
+        state.window_visibility.insert(hwnd, true);
+        let revision = state.framebuffer.revision();
+        let epoch = state.framebuffer.authority_epoch();
+        let identity = state.framebuffer.gpu_source().unwrap().clone();
+        for _ in 0..1000 {
+            state.present_window_surfaces();
+        }
+        assert_eq!(source.reads.load(Ordering::Relaxed), 0);
+        assert!(!state.framebuffer.cpu_resident());
+        assert!(std::sync::Arc::ptr_eq(
+            state.framebuffer.gpu_source().unwrap(),
+            &identity
+        ));
+        assert_eq!(state.framebuffer.revision(), revision);
+        assert_eq!(state.framebuffer.authority_epoch(), epoch);
+        // Real changed GDI pixels must still be composited and published.
+        source.fail.store(false, Ordering::Relaxed);
+        gdi::Surface::Bitmap(state.gdi.bitmap_mut(bm).unwrap()).fill_rect(0, 0, 3, 2, 0x07e0);
+        state.present_window_surfaces();
+        assert_eq!(source.reads.load(Ordering::Relaxed), 1);
+        assert!(state.framebuffer.gpu_source().is_none());
+        assert_eq!(
+            &state.framebuffer.resident_cpu().unwrap().pixels[..2],
+            &[0xe0, 7]
+        );
+        assert_eq!(state.framebuffer.revision(), revision.wrapping_add(1));
+        // A hidden window with changed backing pixels is also a no-op.
+        state.framebuffer.publish_gpu(source.clone()).unwrap();
+        source.fail.store(true, Ordering::Relaxed);
+        state.window_visibility.insert(hwnd, false);
+        gdi::Surface::Bitmap(state.gdi.bitmap_mut(bm).unwrap()).fill_rect(0, 0, 3, 2, 0x001f);
+        let epoch = state.framebuffer.authority_epoch();
+        state.present_window_surfaces();
+        assert_eq!(source.reads.load(Ordering::Relaxed), 1);
+        assert_eq!(state.framebuffer.authority_epoch(), epoch);
+        assert!(!state.framebuffer.cpu_resident());
+    }
+
+    #[test]
     fn completed_native_window_paint_notifies_presentation_but_polling_does_not() {
         let mut cpu = StubCpu::new();
         let mut process = Process::map_into(
@@ -5421,7 +6017,7 @@ mod tests {
         assert_eq!(state.framebuffer.frame_counter, initial.wrapping_add(1));
         let offset = ((55 * state.framebuffer.width + 45) * 2) as usize;
         assert_eq!(
-            &state.framebuffer.pixels[offset..offset + 2],
+            &state.framebuffer.resident_cpu().unwrap().pixels[offset..offset + 2],
             &0xf800u16.to_le_bytes()
         );
         let presented = state.framebuffer.frame_counter;
@@ -5433,7 +6029,7 @@ mod tests {
         state.present_window_surfaces(); // BeginPaint/EndPaint with no drawing
         assert_eq!(state.framebuffer.frame_counter, direct_frame);
         assert_eq!(
-            &state.framebuffer.pixels[offset..offset + 2],
+            &state.framebuffer.resident_cpu().unwrap().pixels[offset..offset + 2],
             &0x001fu16.to_le_bytes()
         );
         let presented = direct_frame;
@@ -5441,7 +6037,7 @@ mod tests {
         state.present_window_surfaces();
         assert_eq!(state.framebuffer.frame_counter, presented.wrapping_add(1));
         assert_eq!(
-            &state.framebuffer.pixels[offset..offset + 2],
+            &state.framebuffer.resident_cpu().unwrap().pixels[offset..offset + 2],
             &0x07e0u16.to_le_bytes()
         );
         state.window_visibility.insert(hwnd, false);
@@ -5474,6 +6070,8 @@ mod tests {
             caption: Some("Test".into()),
             ok_pressed: false,
             caption_height: None,
+            caption_command: Some(1),
+            caption_help: false,
         });
         let list = state.controls.create(
             parent,
@@ -5505,8 +6103,8 @@ mod tests {
         let pixel = |x: usize, y: usize| {
             let offset = (y * state.framebuffer.width as usize + x) * 2;
             u16::from_le_bytes([
-                state.framebuffer.pixels[offset],
-                state.framebuffer.pixels[offset + 1],
+                state.framebuffer.resident_cpu().unwrap().pixels[offset],
+                state.framebuffer.resident_cpu().unwrap().pixels[offset + 1],
             ])
         };
         // Client origin is (21,45), not the screen origin or window origin.
@@ -6113,6 +6711,28 @@ mod tests {
         assert!(image_uses_thumb_entry(&mut cpu, &process.image).unwrap());
     }
 
+    #[test]
+    fn thumb_tagged_arm_dll_attach_stub_keeps_arm_mode() {
+        for (words, thumb) in [
+            ([0xe52d_e004u32, 0xe351_0001], false),
+            ([0xe52d_e004, 0x4770_2001], true),
+            ([0x2901_b500, 0xbd00_2001], true),
+        ] {
+            let mut image = image_based_at(0x10000, 0x1000);
+            image.machine = machine::THUMB;
+            for (slot, word) in image.sections[0].data[..8].chunks_exact_mut(4).zip(words) {
+                slot.copy_from_slice(&word.to_le_bytes());
+            }
+            let mut cpu = StubCpu::new();
+            let process =
+                Process::map_into(image, &mut cpu, &|_, _| None, &NullDispatcher).unwrap();
+            assert_eq!(
+                image_uses_thumb_entry(&mut cpu, &process.image).unwrap(),
+                thumb
+            );
+        }
+    }
+
     /// An image based *above* slot 0 still gets the alias window, since
     /// its CRT startup addresses itself through slot-relative pointers
     /// and nothing is mapped at `0x10000` to collide with.
@@ -6226,5 +6846,47 @@ mod standalone_egl_tests {
         assert_eq!(exports[&EGL_MODULE_HANDLE]["eglGetDisplay"], 0x70000080);
         assert!(!exports.contains_key(&GLES_CM_MODULE_HANDLE));
         assert!(!exports.contains_key(&GLES_CL_MODULE_HANDLE));
+    }
+}
+
+#[cfg(test)]
+mod virtual_query_free_gap_tests {
+    use super::*;
+
+    #[test]
+    fn free_query_after_full_reservation_can_reserve_the_next_block() {
+        let mut heap = Heap::new(0x0100_0000, 0x0020_0000);
+        let first = heap.virtual_alloc(0, 0x10000, true, true).unwrap();
+        assert_eq!(first, HOST_VIRTUAL_BASE);
+        let query = heap.query_virtual(first + 0x10000).unwrap();
+        assert_eq!(query[0], first + 0x10000);
+        assert_eq!(query[1], 0);
+        assert_eq!(query[4], 0x10000);
+        assert_eq!(query[3], HOST_VIRTUAL_END - query[0]);
+        // The guest CRT uses BaseAddress returned by VirtualQuery as the next
+        // preferred VirtualAlloc address. It must not point back into `first`.
+        assert_eq!(
+            heap.virtual_alloc(query[0], 0x10000, true, true),
+            Some(first + 0x10000)
+        );
+        assert_eq!(heap.query_virtual(first).unwrap()[4], 0x1000);
+    }
+
+    #[test]
+    fn free_query_rounds_to_page_and_stops_before_next_live_reservation() {
+        let mut heap = Heap::new(0x0100_0000, 0x0020_0000);
+        let first = heap.virtual_alloc(0, 0x10000, true, false).unwrap();
+        let next = heap
+            .virtual_alloc(first + 0x30000, 0x10000, true, false)
+            .unwrap();
+        let query = heap.query_virtual(first + 0x1107b).unwrap();
+        assert_eq!(query, [first + 0x11000, 0, 0, 0x1f000, 0x10000, 0, 0]);
+        assert_eq!(query[0] + query[3], next);
+        assert!(heap.virtual_free(first, 0, true));
+        assert_eq!(
+            heap.query_virtual(first).unwrap(),
+            [first, 0, 0, 0x30000, 0x10000, 0, 0]
+        );
+        assert!(heap.query_virtual(HOST_VIRTUAL_END).is_none());
     }
 }

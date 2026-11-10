@@ -17,12 +17,19 @@
 //! * Vertices arrive in clip space; this module does the perspective
 //!   divide, the viewport transform, and near/far clipping.
 
+mod combine;
+pub use combine::Combine;
+
 /// How many texture stages a draw can cascade through.
-pub const MAX_TEXTURE_STAGES: usize = 4;
+pub const MAX_TEXTURE_STAGES: usize = 6;
 
 /// A vertex after the modelview-projection transform, in clip space.
 #[derive(Debug, Clone, Copy)]
 pub struct Vertex {
+    /// Eye-space position retained for user clipping, including singular projections.
+    pub eye: [f32; 4],
+    /// Derived point width; negative means use pipeline point size.
+    pub point_width: f32,
     /// Clip-space position, `w` not yet divided out.
     pub pos: [f32; 4],
     /// Object-space normal consumed by the native lighting shader.
@@ -31,7 +38,7 @@ pub struct Vertex {
     pub color: [f32; 4],
     pub back_color: [f32; 4],
     /// Texture coordinates, one set per texture unit.
-    pub texcoord: [[f32; 2]; MAX_TEXTURE_STAGES],
+    pub texcoord: [[f32; 4]; MAX_TEXTURE_STAGES],
     /// Eye-space Z used for fog. OpenGL defines fog distance from the
     /// eye-space depth, not clip-space or NDC Z.
     pub fog_depth: f32,
@@ -40,11 +47,13 @@ pub struct Vertex {
 impl Default for Vertex {
     fn default() -> Self {
         Self {
+            eye: [0., 0., 0., 1.],
+            point_width: -1.,
             pos: [0.0, 0.0, 0.0, 1.0],
             normal: [0.0, 0.0, 1.0],
             color: [1.0, 1.0, 1.0, 1.0],
             back_color: [1.0; 4],
-            texcoord: [[0.0, 0.0]; MAX_TEXTURE_STAGES],
+            texcoord: [[0.0, 0.0, 0.0, 1.0]; MAX_TEXTURE_STAGES],
             fog_depth: 0.0,
         }
     }
@@ -172,6 +181,7 @@ pub enum FrontFace {
 /// How the texture colour combines with the incoming fragment colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TexEnvMode {
+    Combine(Combine),
     Modulate,
     Replace,
     Decal,
@@ -200,6 +210,8 @@ pub struct PipelineState {
     pub alpha_test: bool,
     pub alpha_func: CompareFunc,
     pub alpha_ref: f32,
+    pub logic_op: bool,
+    pub logic_mode: u32,
     pub blend: bool,
     pub blend_src: BlendFactor,
     pub blend_dst: BlendFactor,
@@ -217,10 +229,16 @@ pub struct PipelineState {
     pub smooth_shading: bool,
     pub two_sided_lighting: bool,
     pub point_size: f32,
+    pub point_size_array: bool,
+    pub point_sprite: bool,
+    pub point_coord_replace: [bool; MAX_TEXTURE_STAGES],
     pub line_width: f32,
     pub polygon_offset: bool,
     pub polygon_factor: f32,
     pub polygon_units: f32,
+    /// Original Intel 2700G WinCE driver: integer constant bias, no slope term.
+    /// Opt-in driver compatibility; standard ES behavior is the default.
+    pub intel2700g_depth_bias: bool,
 }
 
 impl Default for PipelineState {
@@ -235,6 +253,8 @@ impl Default for PipelineState {
             alpha_test: false,
             alpha_func: CompareFunc::Always,
             alpha_ref: 0.0,
+            logic_op: false,
+            logic_mode: crate::GL_COPY,
             blend: false,
             blend_src: BlendFactor::One,
             blend_dst: BlendFactor::Zero,
@@ -250,16 +270,42 @@ impl Default for PipelineState {
             smooth_shading: true,
             two_sided_lighting: false,
             point_size: 1.0,
+            point_size_array: false,
+            point_sprite: false,
+            point_coord_replace: [false; MAX_TEXTURE_STAGES],
             line_width: 1.0,
             polygon_offset: false,
             polygon_factor: 0.,
             polygon_units: 0.,
+            intel2700g_depth_bias: false,
+        }
+    }
+}
+
+impl PipelineState {
+    /// The reference WinCE CL driver ignores factor and arithmetic-shifts its
+    /// signed 16.16 units before encoding a sign + 16-bit magnitude register.
+    pub fn polygon_offset_parameters(&self) -> (f32, f32) {
+        if self.intel2700g_depth_bias {
+            (0., self.polygon_units.floor().clamp(-65535., 65535.))
+        } else {
+            (self.polygon_factor, self.polygon_units)
+        }
+    }
+
+    pub fn depth_bits(&self) -> u32 {
+        if self.intel2700g_depth_bias {
+            24
+        } else {
+            16
         }
     }
 }
 
 /// Colour and depth attachments.
 pub struct RenderTarget {
+    /// RGB565 virtual surface; RGBA bytes are only its expanded CPU cache.
+    pub rgb565: bool,
     pub width: u32,
     pub height: u32,
     /// RGBA8888, row-major, top row first.
@@ -274,20 +320,37 @@ impl RenderTarget {
         Self {
             width,
             height,
+            rgb565: false,
             color: vec![0u8; px * 4],
             depth: vec![1.0f32; px],
         }
+    }
+
+    pub fn with_format(width: u32, height: u32, rgb565: bool) -> Self {
+        let mut target = Self::new(width, height);
+        target.rgb565 = rgb565;
+        if rgb565 {
+            for p in target.color.chunks_exact_mut(4) {
+                p[3] = 255;
+            }
+        }
+        target
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == self.width && height == self.height {
             return;
         }
-        *self = Self::new(width, height);
+        *self = Self::with_format(width, height, self.rgb565);
     }
 
     /// `glClear(GL_COLOR_BUFFER_BIT)` honouring the scissor box.
     pub fn clear_color(&mut self, rgba: [u8; 4], scissor: Option<(i32, i32, i32, i32)>) {
+        let rgba = if self.rgb565 {
+            rgb565_pixel(rgba)
+        } else {
+            rgba
+        };
         match self.scissor_bounds(scissor) {
             None => {}
             Some((x0, y0, x1, y1)) if self.covers_all(x0, y0, x1, y1) => {
@@ -301,6 +364,40 @@ impl RenderTarget {
                     for x in x0..x1 {
                         let i = (row + x as usize) * 4;
                         self.color[i..i + 4].copy_from_slice(&rgba);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clear only enabled color components; keep the full-write fast path.
+    pub fn clear_color_masked(
+        &mut self,
+        rgba: [u8; 4],
+        scissor: Option<(i32, i32, i32, i32)>,
+        mask: [bool; 4],
+    ) {
+        let rgba = if self.rgb565 {
+            rgb565_pixel(rgba)
+        } else {
+            rgba
+        };
+        let mask = [mask[0], mask[1], mask[2], mask[3] && !self.rgb565];
+        if mask == [true; 4] || self.rgb565 && mask[..3] == [true; 3] {
+            self.clear_color(rgba, scissor);
+            return;
+        }
+        if mask == [false; 4] {
+            return;
+        }
+        if let Some((x0, y0, x1, y1)) = self.scissor_bounds(scissor) {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = (y as usize * self.width as usize + x as usize) * 4;
+                    for c in 0..4 {
+                        if mask[c] {
+                            self.color[i + c] = rgba[c];
+                        }
                     }
                 }
             }
@@ -336,13 +433,14 @@ impl RenderTarget {
         &self,
         scissor: Option<(i32, i32, i32, i32)>,
     ) -> Option<(i32, i32, i32, i32)> {
-        let (w, h) = (self.width as i32, self.height as i32);
+        let (w, h) = (i64::from(self.width), i64::from(self.height));
         let Some((sx, sy, sw, sh)) = scissor else {
-            return Some((0, 0, w, h));
+            return Some((0, 0, w as i32, h as i32));
         };
         if sw <= 0 || sh <= 0 {
             return None;
         }
+        let (sx, sy, sw, sh) = (i64::from(sx), i64::from(sy), i64::from(sw), i64::from(sh));
         let x0 = sx.max(0);
         let x1 = (sx + sw).min(w);
         // GL's scissor Y is measured from the bottom; flip to rows.
@@ -352,7 +450,7 @@ impl RenderTarget {
         if x0 >= x1 || y0 >= y1 {
             return None;
         }
-        Some((x0, y0, x1, y1))
+        Some((x0 as i32, y0 as i32, x1 as i32, y1 as i32))
     }
 
     /// Convert the colour buffer to RGB565 little-endian, the format the
@@ -377,6 +475,13 @@ impl RenderTarget {
 /// draws from. Returning `None` means that unit has no usable texture,
 /// in which case the stage leaves the fragment colour alone.
 pub trait TextureSampler {
+    fn combiner_program(&self) -> Option<&crate::combiner_program::BasicProgram> {
+        None
+    }
+
+    fn combiner_constants(&self) -> [[f32; 4]; 4] {
+        [[0.0; 4]; 4]
+    }
     fn sample(&self, unit: usize, s: f32, t: f32) -> Option<[u8; 4]>;
     fn needs_gradients(&self) -> bool {
         false
@@ -398,6 +503,69 @@ impl<F: Fn(usize, f32, f32) -> Option<[u8; 4]>> TextureSampler for F {
     }
 }
 pub type SampleFn<'a> = &'a dyn TextureSampler;
+
+fn coordinate_units(sample: SampleFn<'_>, stages: &[TextureStage]) -> u8 {
+    sample.combiner_program().map_or_else(
+        || {
+            stages
+                .iter()
+                .fold(0, |mask, stage| mask | (1 << stage.unit))
+        },
+        |program| program.coordinate_units(),
+    )
+}
+
+fn framebuffer_color(target: &RenderTarget, idx: usize) -> [f32; 4] {
+    let offset = idx * 4;
+    [
+        to_unit(target.color[offset]),
+        to_unit(target.color[offset + 1]),
+        to_unit(target.color[offset + 2]),
+        if target.rgb565 {
+            1.
+        } else {
+            to_unit(target.color[offset + 3])
+        },
+    ]
+}
+
+fn evaluate_combiner(
+    program: &crate::combiner_program::BasicProgram,
+    sample: SampleFn<'_>,
+    stages: &[TextureStage],
+    primary: [f32; 4],
+    constants: [[f32; 4]; 4],
+    framebuffer: [f32; 4],
+    coordinate: impl Fn(usize) -> (f32, f32, [f32; 4]),
+) -> Option<[f32; 4]> {
+    program.evaluate_fragment(primary, constants, framebuffer, |route| {
+        let Some(stage) = stages.iter().find(|stage| stage.unit == route.texture) else {
+            return [0., 0., 0., 1.];
+        };
+        let (s, t, grad) = if route.s == route.t && route.s_component == 0 && route.t_component == 1
+        {
+            coordinate(route.s)
+        } else {
+            let (sx, sy, sg) = coordinate(route.s);
+            let (tx, ty, tg) = coordinate(route.t);
+            let s = [sx, sy][route.s_component];
+            let t = [tx, ty][route.t_component];
+            (
+                s,
+                t,
+                [
+                    sg[route.s_component],
+                    tg[route.t_component],
+                    sg[route.s_component + 2],
+                    tg[route.t_component + 2],
+                ],
+            )
+        };
+        sample
+            .sample_grad(route.texture, s, t, grad, stage.lod_bias)
+            .map_or([0., 0., 0., 1.], |texel| texel.map(to_unit))
+    })
+}
 
 /// One enabled texture unit, as the rasterizer sees it.
 ///
@@ -439,7 +607,7 @@ struct ScreenVertex {
     /// Reciprocal of clip `w`, for perspective-correct interpolation.
     inv_w: f32,
     color: [f32; 4],
-    texcoord: [[f32; 2]; MAX_TEXTURE_STAGES],
+    texcoord: [[f32; 4]; MAX_TEXTURE_STAGES],
     fog_depth: f32,
 }
 
@@ -545,6 +713,8 @@ fn clip_plane(input: &[Vertex], out: &mut Vec<Vertex>, plane: usize) {
 fn lerp_vertex(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
     let mix = |x: f32, y: f32| x + (y - x) * t;
     Vertex {
+        eye: std::array::from_fn(|i| mix(a.eye[i], b.eye[i])),
+        point_width: mix(a.point_width, b.point_width),
         pos: [
             mix(a.pos[0], b.pos[0]),
             mix(a.pos[1], b.pos[1]),
@@ -558,10 +728,7 @@ fn lerp_vertex(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
             mix(a.color[3], b.color[3]),
         ],
         texcoord: std::array::from_fn(|u| {
-            [
-                mix(a.texcoord[u][0], b.texcoord[u][0]),
-                mix(a.texcoord[u][1], b.texcoord[u][1]),
-            ]
+            std::array::from_fn(|c| mix(a.texcoord[u][c], b.texcoord[u][c]))
         }),
         back_color: std::array::from_fn(|i| mix(a.back_color[i], b.back_color[i])),
         normal: std::array::from_fn(|i| mix(a.normal[i], b.normal[i])),
@@ -591,7 +758,7 @@ fn raster_clipped(
         z: 0.0,
         inv_w: 1.0,
         color: [0.0; 4],
-        texcoord: [[0.0; 2]; MAX_TEXTURE_STAGES],
+        texcoord: [[0.0, 0.0, 0.0, 1.0]; MAX_TEXTURE_STAGES],
         fog_depth: 0.0,
     }; 3];
     for (i, v) in tri.iter().enumerate() {
@@ -666,13 +833,27 @@ fn raster_clipped(
         let dy = ((sv[1].x - sv[0].x) * (sv[2].z - sv[0].z)
             - (sv[2].x - sv[0].x) * (sv[1].z - sv[0].z))
             / area;
-        state.polygon_factor * dx.abs().max(dy.abs()) + state.polygon_units / 65535.
+        let (factor, units) = state.polygon_offset_parameters();
+        let resolution = if state.intel2700g_depth_bias {
+            16777215.
+        } else {
+            65535.
+        };
+        factor * dx.abs().max(dy.abs()) + units / resolution
     } else {
         0.
     };
     let inv_area = 1.0 / area;
     let gradients = sample.needs_gradients();
-    let (qx, qy, uv_grad) = if gradients {
+    let coordinates = coordinate_units(sample, stages);
+    let projective_units = (0..MAX_TEXTURE_STAGES).fold(0u8, |mask, unit| {
+        if coordinates & (1 << unit) != 0 && sv.iter().any(|v| v.texcoord[unit][3] != 1.) {
+            mask | (1 << unit)
+        } else {
+            mask
+        }
+    });
+    let (q_grad, uv_grad) = if gradients {
         let dx = [
             -(sv[2].y - sv[1].y) * inv_area,
             -(sv[0].y - sv[2].y) * inv_area,
@@ -683,25 +864,32 @@ fn raster_clipped(
             (sv[0].x - sv[2].x) * inv_area,
             (sv[1].x - sv[0].x) * inv_area,
         ];
-        let qx = (0..3).map(|i| dx[i] * sv[i].inv_w).sum::<f32>();
-        let qy = (0..3).map(|i| dy[i] * sv[i].inv_w).sum::<f32>();
+        let mut q_grad = [[0.; 2]; MAX_TEXTURE_STAGES];
         let mut uv_grad = [[0.; 4]; MAX_TEXTURE_STAGES];
-        for stage in stages {
+        for unit in 0..MAX_TEXTURE_STAGES {
+            if coordinates & (1 << unit) == 0 {
+                continue;
+            }
             for (axis, weights) in [dx, dy].iter().enumerate() {
+                q_grad[unit][axis] = (0..3)
+                    .map(|i| weights[i] * sv[i].inv_w * sv[i].texcoord[unit][3])
+                    .sum();
                 for c in 0..2 {
-                    uv_grad[stage.unit][axis * 2 + c] = (0..3)
-                        .map(|i| weights[i] * sv[i].inv_w * sv[i].texcoord[stage.unit][c])
+                    uv_grad[unit][axis * 2 + c] = (0..3)
+                        .map(|i| weights[i] * sv[i].inv_w * sv[i].texcoord[unit][c])
                         .sum();
                 }
             }
         }
-        (qx, qy, uv_grad)
+        (q_grad, uv_grad)
     } else {
-        (0., 0., [[0.; 4]; MAX_TEXTURE_STAGES])
+        ([[0.; 2]; MAX_TEXTURE_STAGES], [[0.; 4]; MAX_TEXTURE_STAGES])
     };
     // Flat shading takes the provoking vertex, which for a triangle is
     // the last one.
     let flat_color = sv[2].color;
+    let combiner = sample.combiner_program();
+    let constants = combiner.map(|_| sample.combiner_constants());
     let mut written = 0usize;
     let stride = target.width as usize;
 
@@ -765,38 +953,62 @@ fn raster_clipped(
             // the stage order. Coordinates are interpolated per stage
             // rather than up front, because an unused unit's coordinate
             // set must not cost anything per fragment.
-            for stage in stages {
+            let primary = frag;
+            let coordinate = |unit: usize| {
                 let uv = |c: usize| {
-                    p0 * sv[0].texcoord[stage.unit][c]
-                        + p1 * sv[1].texcoord[stage.unit][c]
-                        + p2 * sv[2].texcoord[stage.unit][c]
+                    p0 * sv[0].texcoord[unit][c]
+                        + p1 * sv[1].texcoord[unit][c]
+                        + p2 * sv[2].texcoord[unit][c]
                 };
-                let (u, v) = (uv(0), uv(1));
-                let texel = if gradients {
-                    let g = uv_grad[stage.unit];
-                    sample.sample_grad(
-                        stage.unit,
-                        u,
-                        v,
-                        [
-                            (g[0] - u * qx) * rec,
-                            (g[1] - v * qx) * rec,
-                            (g[2] - u * qy) * rec,
-                            (g[3] - v * qy) * rec,
-                        ],
-                        stage.lod_bias,
-                    )
+                let inv_q = if projective_units & (1 << unit) == 0 {
+                    1.
                 } else {
-                    sample.sample(stage.unit, u, v)
+                    let q = uv(3);
+                    if q != 0. && q.is_finite() {
+                        1. / q
+                    } else {
+                        0.
+                    }
                 };
-                if let Some(texel) = texel {
-                    let tc = [
-                        to_unit(texel[0]),
-                        to_unit(texel[1]),
-                        to_unit(texel[2]),
-                        to_unit(texel[3]),
-                    ];
-                    frag = apply_tex_env(stage, frag, tc);
+                let (u, v) = (uv(0) * inv_q, uv(1) * inv_q);
+                let grad = if gradients {
+                    let g = uv_grad[unit];
+                    let [qx, qy] = q_grad[unit];
+                    let rec = rec * inv_q;
+                    [
+                        (g[0] - u * qx) * rec,
+                        (g[1] - v * qx) * rec,
+                        (g[2] - u * qy) * rec,
+                        (g[3] - v * qy) * rec,
+                    ]
+                } else {
+                    [0.; 4]
+                };
+                (u, v, grad)
+            };
+            if let (Some(program), Some(constants)) = (combiner, constants) {
+                let dst = if program.reads_framebuffer() {
+                    framebuffer_color(target, idx)
+                } else {
+                    [0.; 4]
+                };
+                let Some(color) =
+                    evaluate_combiner(program, sample, stages, primary, constants, dst, coordinate)
+                else {
+                    continue;
+                };
+                frag = color;
+            } else {
+                for stage in stages {
+                    let (u, v, grad) = coordinate(stage.unit);
+                    let texel = if gradients {
+                        sample.sample_grad(stage.unit, u, v, grad, stage.lod_bias)
+                    } else {
+                        sample.sample(stage.unit, u, v)
+                    };
+                    if let Some(texel) = texel {
+                        frag = apply_tex_env(stage, frag, texel.map(to_unit), primary);
+                    }
                 }
             }
 
@@ -843,13 +1055,8 @@ fn write_fragment(
     }
 
     let ci = idx * 4;
-    let dst = [
-        to_unit(target.color[ci]),
-        to_unit(target.color[ci + 1]),
-        to_unit(target.color[ci + 2]),
-        to_unit(target.color[ci + 3]),
-    ];
-    let out = if state.blend {
+    let dst = framebuffer_color(target, idx);
+    let out = if state.blend && !state.logic_op {
         let sf = state.blend_src.resolve(frag, dst);
         let df = state.blend_dst.resolve(frag, dst);
         [
@@ -863,14 +1070,64 @@ fn write_fragment(
     };
 
     for (c, (&value, &masked)) in out.iter().zip(&state.color_mask).enumerate() {
-        if masked {
-            target.color[ci + c] = to_byte(value);
+        if masked && !(target.rgb565 && c == 3) {
+            target.color[ci + c] = if target.rgb565 {
+                let max = if c == 1 { 63 } else { 31 };
+                let source = (value.clamp(0., 1.) * max as f32 + 0.5) as u8;
+                let bits = if state.logic_op {
+                    let dest = ((u32::from(target.color[ci + c]) * max + 127) / 255) as u8;
+                    logic_byte(state.logic_mode, source, dest) & max as u8
+                } else {
+                    source
+                };
+                ((u32::from(bits) * 255 + max / 2) / max) as u8
+            } else if state.logic_op {
+                logic_byte(state.logic_mode, to_byte(value), target.color[ci + c])
+            } else {
+                to_byte(value)
+            };
         }
+    }
+    if target.rgb565 {
+        target.color[ci + 3] = 255;
     }
     if state.depth_test && state.depth_write {
         target.depth[idx] = z;
     }
     true
+}
+
+/// Expand a virtual RGB565 pixel to the shared RGBA byte cache.
+pub fn rgb565_pixel(mut p: [u8; 4]) -> [u8; 4] {
+    for (i, max) in [31u32, 63, 31].into_iter().enumerate() {
+        let bits = (u32::from(p[i]) * max + 127) / 255;
+        p[i] = ((bits * 255 + max / 2) / max) as u8;
+    }
+    p[3] = 255;
+    p
+}
+
+/// ES 1.1 table 4.2. Operates on framebuffer component bits, before write masks.
+pub(crate) fn logic_byte(op: u32, s: u8, d: u8) -> u8 {
+    match op {
+        0x1500 => 0,
+        0x1501 => s & d,
+        0x1502 => s & !d,
+        0x1503 => s,
+        0x1504 => !s & d,
+        0x1505 => d,
+        0x1506 => s ^ d,
+        0x1507 => s | d,
+        0x1508 => !(s | d),
+        0x1509 => !(s ^ d),
+        0x150a => !d,
+        0x150b => s | !d,
+        0x150c => !s,
+        0x150d => !s | d,
+        0x150e => !(s & d),
+        0x150f => 255,
+        _ => unreachable!(),
+    }
 }
 
 fn primitive_fragment(
@@ -883,24 +1140,55 @@ fn primitive_fragment(
     z: f32,
     v: &Vertex,
     gradients: &[[f32; 4]; MAX_TEXTURE_STAGES],
+    sprite: Option<([f32; 2], f32)>,
 ) -> bool {
     let idx = y as usize * target.width as usize + x as usize;
     if state.depth_test && !state.depth_func.test(z, target.depth[idx]) {
         return false;
     }
-    let mut color = v.color;
-    for stage in stages {
-        let uv = v.texcoord[stage.unit];
-        if let Some(texel) = sample.sample_grad(
-            stage.unit,
-            uv[0],
-            uv[1],
-            gradients[stage.unit],
-            stage.lod_bias,
-        ) {
-            color = apply_tex_env(stage, color, texel.map(to_unit));
+    let coordinate = |unit: usize| {
+        let uv = v.texcoord[unit];
+        if state.point_coord_replace[unit] {
+            if let Some((uv, inv_size)) = sprite {
+                return (uv[0], uv[1], [inv_size, 0., 0., inv_size]);
+            }
         }
-    }
+        let q = uv[3];
+        if q != 0. {
+            (uv[0] / q, uv[1] / q, gradients[unit])
+        } else {
+            (0., 0., gradients[unit])
+        }
+    };
+    let color = if let Some(program) = sample.combiner_program() {
+        let Some(color) = evaluate_combiner(
+            program,
+            sample,
+            stages,
+            v.color,
+            sample.combiner_constants(),
+            if program.reads_framebuffer() {
+                framebuffer_color(target, idx)
+            } else {
+                [0.; 4]
+            },
+            coordinate,
+        ) else {
+            return false;
+        };
+        color
+    } else {
+        let mut color = v.color;
+        for stage in stages {
+            let (u, v_coord, gradient) = coordinate(stage.unit);
+            if let Some(texel) =
+                sample.sample_grad(stage.unit, u, v_coord, gradient, stage.lod_bias)
+            {
+                color = apply_tex_env(stage, color, texel.map(to_unit), v.color);
+            }
+        }
+        color
+    };
     write_fragment(target, state, idx, z, color, v.fog_depth)
 }
 
@@ -938,7 +1226,12 @@ pub fn draw_point(
     let Some((x0, y0, x1, y1)) = target.scissor_bounds(state.scissor) else {
         return 0;
     };
-    let size = state.point_size.clamp(1., 64.).round() as i32;
+    let width = if v.point_width >= 0. {
+        v.point_width
+    } else {
+        state.point_size
+    };
+    let size = width.clamp(1., 64.).round() as i32;
     let center = |p: f64| {
         if size % 2 == 0 {
             (p + 0.5).floor()
@@ -946,10 +1239,18 @@ pub fn draw_point(
             p.floor() + 0.5
         }
     };
-    let left = (center(pos[0]) - f64::from(size) / 2.) as i32;
-    let top = (f64::from(target.height)
-        - center(f64::from(target.height) - pos[1])
-        - f64::from(size) / 2.) as i32;
+    let left = if state.point_sprite {
+        (pos[0] - f64::from(size) / 2. - 0.5).ceil() as i32
+    } else {
+        (center(pos[0]) - f64::from(size) / 2.) as i32
+    };
+    let top = if state.point_sprite {
+        (pos[1] - f64::from(size) / 2. - 0.5).ceil() as i32
+    } else {
+        (f64::from(target.height)
+            - center(f64::from(target.height) - pos[1])
+            - f64::from(size) / 2.) as i32
+    };
     let mut written = 0;
     for y in top.max(y0)..top.saturating_add(size).min(y1) {
         for x in left.max(x0)..left.saturating_add(size).min(x1) {
@@ -963,6 +1264,17 @@ pub fn draw_point(
                 pos[2] as f32,
                 &v,
                 &[[0.; 4]; MAX_TEXTURE_STAGES],
+                if state.point_sprite {
+                    Some((
+                        [
+                            (0.5 + (f64::from(x) + 0.5 - pos[0]) / f64::from(size)) as f32,
+                            (0.5 + (f64::from(y) + 0.5 - pos[1]) / f64::from(size)) as f32,
+                        ],
+                        1. / size as f32,
+                    ))
+                } else {
+                    None
+                },
             ) as usize;
         }
     }
@@ -1056,6 +1368,7 @@ pub fn draw_line(
     let hi = (start[major].max(end[major]).ceil() as i32)
         .saturating_add(1)
         .min(bounds.1);
+    let coordinates = coordinate_units(sample, stages);
     let needs_gradients = sample.needs_gradients();
     let mut written = 0;
     for j in lo..hi {
@@ -1090,22 +1403,30 @@ pub fn draw_line(
                 let mut grad = [[0.; 4]; MAX_TEXTURE_STAGES];
                 if needs_gradients {
                     let dpdt = 1. / (ends[0].pos[3] * ends[1].pos[3] * iw * iw);
-                    for stage in stages {
-                        let unit = stage.unit;
+                    for unit in 0..MAX_TEXTURE_STAGES {
+                        if coordinates & (1 << unit) == 0 {
+                            continue;
+                        }
                         for axis in 0..2 {
                             for c in 0..2 {
-                                grad[unit][axis * 2 + c] = (ends[1].texcoord[unit][c]
-                                    - ends[0].texcoord[unit][c])
-                                    * dpdt
-                                    * (delta[axis] / length) as f32;
+                                let q = v.texcoord[unit][3];
+                                let ds = ends[1].texcoord[unit][c] - ends[0].texcoord[unit][c];
+                                let dq = ends[1].texcoord[unit][3] - ends[0].texcoord[unit][3];
+                                grad[unit][axis * 2 + c] = if q != 0. {
+                                    (ds * q - v.texcoord[unit][c] * dq) / (q * q)
+                                        * dpdt
+                                        * (delta[axis] / length) as f32
+                                } else {
+                                    0.
+                                };
                             }
                         }
                     }
                 }
                 let z = a[2] + f64::from(t) * (b[2] - a[2]);
-                written +=
-                    primitive_fragment(target, state, sample, stages, x, y, z as f32, &v, &grad)
-                        as usize;
+                written += primitive_fragment(
+                    target, state, sample, stages, x, y, z as f32, &v, &grad, None,
+                ) as usize;
             }
         }
     }
@@ -1115,8 +1436,14 @@ pub fn draw_line(
 /// The `glTexEnv` colour combiners GL ES 1.1 defines for a single unit.
 /// `frag` is the incoming colour: the interpolated vertex colour for the
 /// first stage, and the previous stage's result for every stage after.
-fn apply_tex_env(stage: &TextureStage, frag: [f32; 4], tex: [f32; 4]) -> [f32; 4] {
+fn apply_tex_env(
+    stage: &TextureStage,
+    frag: [f32; 4],
+    tex: [f32; 4],
+    primary: [f32; 4],
+) -> [f32; 4] {
     match stage.env {
+        TexEnvMode::Combine(c) => c.evaluate(frag, tex, stage.env_color, primary),
         TexEnvMode::Replace => tex,
         TexEnvMode::Modulate => [
             frag[0] * tex[0],
@@ -1205,6 +1532,64 @@ mod tests {
             color,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn intel2700g_depth_bias_matches_original_driver_integer_vectors() {
+        let mut state = PipelineState::default();
+        assert!(!state.intel2700g_depth_bias);
+        state.polygon_factor = -512.;
+        state.polygon_units = -512.;
+        assert_eq!(state.polygon_offset_parameters(), (-512., -512.));
+        assert_eq!(state.depth_bits(), 16);
+        state.intel2700g_depth_bias = true;
+        assert_eq!(state.depth_bits(), 24);
+        // Observed by executing the original driver, including arithmetic
+        // shift of negative fractional 16.16 values (not truncation to zero).
+        for (factor, units, expected) in [
+            (-512., -512., -512.),
+            (0., -512., -512.),
+            (1., -512., -512.),
+            (256., -0.25, -1.),
+            (0., 1.5, 1.),
+            (0., -32768., -32768.),
+        ] {
+            state.polygon_factor = factor;
+            state.polygon_units = units;
+            assert_eq!(state.polygon_offset_parameters(), (0., expected));
+        }
+        state.intel2700g_depth_bias = false;
+        assert_eq!(state.polygon_offset_parameters(), (0., -32768.));
+    }
+
+    #[test]
+    fn intel2700g_constant_bias_keeps_projected_light_behind_foreground() {
+        fn scene(legacy: bool) -> [u8; 4] {
+            let mut target = RenderTarget::new(32, 32);
+            let mut state = PipelineState {
+                viewport: (0, 0, 32, 32),
+                depth_test: true,
+                intel2700g_depth_bias: legacy,
+                ..Default::default()
+            };
+            let foreground = [(-0.9, -0.9), (0.9, -0.9), (0., 0.9)]
+                .map(|(x, y)| primitive_vertex(x, y, -0.2, [0., 0., 1., 1.]));
+            draw_triangle(&mut target, &state, &|_, _, _| None, &[], foreground);
+            let light = [(-0.9, -0.9, 0.2), (0.9, -0.9, 0.4), (0., 0.9, 0.3)]
+                .map(|(x, y, z)| primitive_vertex(x, y, z, [1., 0., 0., 1.]));
+            state.polygon_offset = true;
+            state.polygon_factor = -512.;
+            state.polygon_units = -512.;
+            state.blend = true;
+            state.blend_src = BlendFactor::One;
+            state.blend_dst = BlendFactor::One;
+            draw_triangle(&mut target, &state, &|_, _, _| None, &[], light);
+            target.color[(16 * 32 + 16) * 4..(16 * 32 + 16) * 4 + 4]
+                .try_into()
+                .unwrap()
+        }
+        assert_eq!(scene(true), [0, 0, 255, 255]);
+        assert_eq!(scene(false), [255, 0, 255, 255]);
     }
 
     #[test]
@@ -2073,7 +2458,7 @@ mod tests {
         let uv = [[0., 0.], [8., 0.], [0., 8.]];
         let vertices = std::array::from_fn(|i| Vertex {
             pos: positions[i],
-            texcoord: [uv[i]; 4],
+            texcoord: [[uv[i][0], uv[i][1], 0., 1.]; 6],
             ..Default::default()
         });
         let stage = TextureStage {
@@ -2125,7 +2510,7 @@ mod tests {
         let uv = [[0., 0.], [8., 0.], [0., 8.]];
         let vertices = std::array::from_fn(|i| Vertex {
             pos: positions[i],
-            texcoord: [uv[i]; 4],
+            texcoord: [[uv[i][0], uv[i][1], 0., 1.]; 6],
             ..Default::default()
         });
         let stage = TextureStage {
@@ -2154,5 +2539,368 @@ mod tests {
         for (actual, reference) in g.iter().zip(expected) {
             assert!((actual - reference).abs() < 1e-4, "{g:?} != {expected:?}");
         }
+    }
+}
+
+/// Clip assembled, lit vertices before either rasterizer consumes them. Topology
+/// is expanded only for draws which enable user planes, preserving fast draws.
+pub fn clip_user_primitives(
+    mode: u32,
+    vertices: &[Vertex],
+    planes: &[[f32; 4]],
+    smooth: bool,
+) -> (u32, Vec<Vertex>) {
+    use crate::consts::*;
+    let distance = |v: &Vertex, p: &[f32; 4]| (0..4).map(|i| v.eye[i] * p[i]).sum::<f32>();
+    let mut out = Vec::new();
+    if mode == GL_POINTS {
+        out.extend(
+            vertices
+                .iter()
+                .filter(|v| planes.iter().all(|p| distance(v, p) >= 0.))
+                .copied(),
+        );
+        return (GL_POINTS, out);
+    }
+    let mut primitive = |mut v: Vec<Vertex>| {
+        if !smooth {
+            let last = *v.last().unwrap();
+            for x in &mut v {
+                x.color = last.color;
+                x.back_color = last.back_color;
+            }
+        }
+        if v.len() == 2 {
+            for p in planes {
+                let a = distance(&v[0], p);
+                let b = distance(&v[1], p);
+                if a < 0. && b < 0. {
+                    return;
+                }
+                if (a < 0.) != (b < 0.) {
+                    let x = lerp_vertex(&v[0], &v[1], a / (a - b));
+                    if a < 0. {
+                        v[0] = x;
+                    } else {
+                        v[1] = x;
+                    }
+                }
+            }
+            out.extend(v);
+            return;
+        }
+        for p in planes {
+            let input = std::mem::take(&mut v);
+            if input.is_empty() {
+                return;
+            }
+            for i in 0..input.len() {
+                let a = &input[i];
+                let b = &input[(i + 1) % input.len()];
+                let da = distance(a, p);
+                let db = distance(b, p);
+                if da >= 0. {
+                    v.push(*a);
+                }
+                if (da < 0.) != (db < 0.) {
+                    v.push(lerp_vertex(a, b, da / (da - db)));
+                }
+            }
+        }
+        for i in 1..v.len().saturating_sub(1) {
+            out.extend([v[0], v[i], v[i + 1]]);
+        }
+    };
+    match mode {
+        GL_LINES => {
+            for v in vertices.chunks_exact(2) {
+                primitive(v.to_vec());
+            }
+        }
+        GL_LINE_STRIP | GL_LINE_LOOP => {
+            for v in vertices.windows(2) {
+                primitive(v.to_vec());
+            }
+            if mode == GL_LINE_LOOP && vertices.len() > 1 {
+                primitive(vec![*vertices.last().unwrap(), vertices[0]]);
+            }
+        }
+        GL_TRIANGLES => {
+            for v in vertices.chunks_exact(3) {
+                primitive(v.to_vec());
+            }
+        }
+        GL_TRIANGLE_STRIP => {
+            for i in 2..vertices.len() {
+                primitive(if i % 2 == 0 {
+                    vec![vertices[i - 2], vertices[i - 1], vertices[i]]
+                } else {
+                    vec![vertices[i - 1], vertices[i - 2], vertices[i]]
+                });
+            }
+        }
+        GL_TRIANGLE_FAN => {
+            for i in 2..vertices.len() {
+                primitive(vec![vertices[0], vertices[i - 1], vertices[i]]);
+            }
+        }
+        _ => {}
+    }
+    (
+        if matches!(mode, GL_LINES | GL_LINE_STRIP | GL_LINE_LOOP) {
+            GL_LINES
+        } else {
+            GL_TRIANGLES
+        },
+        out,
+    )
+}
+
+#[cfg(test)]
+mod logical_truth_table_tests {
+    #[test]
+    fn all_operations_match_the_spec_truth_tables_for_every_byte_pair() {
+        let tables = [
+            0x0u8, 0x8, 0x4, 0xc, 0x2, 0xa, 0x6, 0xe, 0x1, 0x9, 0x5, 0xd, 0x3, 0xb, 0x7, 0xf,
+        ];
+        for (op, table) in tables.into_iter().enumerate() {
+            for source in 0..=255u8 {
+                for destination in 0..=255u8 {
+                    let mut expected = 0;
+                    for bit in 0..8 {
+                        let index = (((source >> bit) & 1) << 1) | ((destination >> bit) & 1);
+                        expected |= ((table >> index) & 1) << bit;
+                    }
+                    assert_eq!(
+                        super::logic_byte(0x1500 + op as u32, source, destination),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod projective_coordinate_tests {
+    use super::*;
+    use std::cell::RefCell;
+    struct Samples(RefCell<Vec<(f32, f32, [f32; 4])>>);
+    impl TextureSampler for Samples {
+        fn sample(&self, _: usize, u: f32, v: f32) -> Option<[u8; 4]> {
+            Some([to_byte(u), to_byte(v), 255, 255])
+        }
+        fn needs_gradients(&self) -> bool {
+            true
+        }
+        fn sample_grad(&self, unit: usize, u: f32, v: f32, g: [f32; 4], _: f32) -> Option<[u8; 4]> {
+            self.0.borrow_mut().push((u, v, g));
+            self.sample(unit, u, v)
+        }
+    }
+    #[test]
+    fn clipped_projective_triangles_match_independent_quotient_and_derivatives() {
+        const N: u32 = 8;
+        for clip_w in [[1., 1., 1.], [1., 2., 4.]] {
+            let xy = [[-1., -1.], [3., -1.], [-1., 3.]];
+            let uv = [[0., 1., 0.2, 1.], [2., 1., 0.4, 3.], [0., -1., 0.6, 1.]];
+            let vertices = std::array::from_fn(|i| Vertex {
+                pos: [xy[i][0] * clip_w[i], xy[i][1] * clip_w[i], 0., clip_w[i]],
+                texcoord: [uv[i]; 6],
+                ..Default::default()
+            });
+            let mut target = RenderTarget::new(N, N);
+            // Unequal viewport dimensions keep triangulation edges off sample centers.
+            let state = PipelineState {
+                viewport: (0, 0, N as i32 + 1, N as i32),
+                ..Default::default()
+            };
+            let stages = [TextureStage {
+                unit: 0,
+                env: TexEnvMode::Replace,
+                env_color: [0.; 4],
+                lod_bias: 0.,
+            }];
+            let samples = Samples(RefCell::new(Vec::new()));
+            draw_triangle(&mut target, &state, &samples, &stages, vertices);
+            let values = samples.0.borrow();
+            assert_eq!(values.len(), (N * N) as usize);
+            for y in 0..N {
+                for x in 0..N {
+                    let lx = (x as f32 + 0.5) / (2. * (N + 1) as f32);
+                    let ly = (N as f32 - y as f32 - 0.5) / (2. * N as f32);
+                    let l = [1. - lx - ly, lx, ly];
+                    let mut a = [0.; 4];
+                    let mut dx = [0.; 4];
+                    let mut dy = [0.; 4];
+                    let step_x = 1. / (2. * (N + 1) as f32);
+                    let step_y = 1. / (2. * N as f32);
+                    for component in 0..4 {
+                        for i in 0..3 {
+                            a[component] += l[i] * uv[i][component] / clip_w[i];
+                            dx[component] +=
+                                [-step_x, step_x, 0.][i] * uv[i][component] / clip_w[i];
+                            dy[component] +=
+                                [step_y, 0., -step_y][i] * uv[i][component] / clip_w[i];
+                        }
+                    }
+                    let (u, v) = (a[0] / a[3], a[1] / a[3]);
+                    let expected = [
+                        (dx[0] * a[3] - a[0] * dx[3]) / (a[3] * a[3]),
+                        (dx[1] * a[3] - a[1] * dx[3]) / (a[3] * a[3]),
+                        (dy[0] * a[3] - a[0] * dy[3]) / (a[3] * a[3]),
+                        (dy[1] * a[3] - a[1] * dy[3]) / (a[3] * a[3]),
+                    ];
+                    let found = values
+                        .iter()
+                        .find(|(s, t, _)| (*s - u).abs() < 1e-5 && (*t - v).abs() < 1e-5)
+                        .expect("pixel sample follows s/q,t/q");
+                    for i in 0..4 {
+                        assert!(
+                            (found.2[i] - expected[i]).abs() < 1e-5,
+                            "x={x} y={y} derivative={i}: {:?} vs {expected:?}",
+                            found.2
+                        );
+                    }
+                    let offset = (y * N + x) as usize * 4;
+                    assert!(target.color[offset].abs_diff(to_byte(u)) <= 1);
+                    assert!(target.color[offset + 1].abs_diff(to_byte(v)) <= 1);
+                }
+            }
+        }
+    }
+    #[test]
+    fn clipping_interpolates_all_four_coordinates_before_projection() {
+        let a = Vertex {
+            texcoord: [[1., 2., 3., 4.]; 6],
+            ..Default::default()
+        };
+        let b = Vertex {
+            texcoord: [[5., 6., 7., 8.]; 6],
+            ..Default::default()
+        };
+        assert_eq!(lerp_vertex(&a, &b, 0.25).texcoord, [[2., 3., 4., 5.]; 6]);
+    }
+    #[test]
+    fn points_and_lines_preserve_homogeneous_coordinate_equivalence() {
+        for line in [false, true] {
+            let mut images = Vec::new();
+            let state = PipelineState {
+                viewport: (0, 0, 16, 16),
+                point_size: 3.,
+                ..Default::default()
+            };
+            let stages = [TextureStage {
+                unit: 0,
+                env: TexEnvMode::Replace,
+                env_color: [0.; 4],
+                lod_bias: 0.,
+            }];
+            for q in [1., 2., 4.] {
+                let mut target = RenderTarget::new(16, 16);
+                let sampler = Samples(RefCell::new(Vec::new()));
+                let vertices = std::array::from_fn(|i| Vertex {
+                    pos: [if i == 0 { -0.75 } else { 0.75 }, 0., 0., 1.],
+                    texcoord: [[
+                        if i == 0 { 0.25 * q } else { 0.75 * q },
+                        0.25 * q,
+                        0.5 * q,
+                        q,
+                    ]; 6],
+                    ..Default::default()
+                });
+                let written = if line {
+                    draw_line(&mut target, &state, &sampler, &stages, vertices)
+                } else {
+                    draw_point(&mut target, &state, &sampler, &stages, vertices[0])
+                };
+                assert!(written > 0);
+                images.push(target.color);
+            }
+            assert_eq!(images[0], images[1]);
+            assert_eq!(images[0], images[2]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sprite_formula_tests {
+    use super::*;
+    use std::cell::RefCell;
+    struct Capture(RefCell<Vec<[f32; 4]>>);
+    impl TextureSampler for Capture {
+        fn sample(&self, _: usize, s: f32, t: f32) -> Option<[u8; 4]> {
+            Some([to_byte(s), to_byte(t), 0, 255])
+        }
+        fn needs_gradients(&self) -> bool {
+            true
+        }
+        fn sample_grad(
+            &self,
+            unit: usize,
+            s: f32,
+            t: f32,
+            gradient: [f32; 4],
+            _: f32,
+        ) -> Option<[u8; 4]> {
+            self.0.borrow_mut().push(gradient);
+            self.sample(unit, s, t)
+        }
+    }
+    #[test]
+    fn sprite_uses_unrounded_center_fixed_origin_and_unclipped_gradients() {
+        let mut target = RenderTarget::new(16, 16);
+        let mut state = PipelineState {
+            viewport: (0, 0, 16, 16),
+            point_sprite: true,
+            point_coord_replace: [true; MAX_TEXTURE_STAGES],
+            point_size: 4.,
+            ..Default::default()
+        };
+        let stages = [TextureStage {
+            unit: 0,
+            env: TexEnvMode::Replace,
+            env_color: [0.; 4],
+            lod_bias: 0.,
+        }];
+        let samples = Capture(RefCell::new(Vec::new()));
+        let mut point = Vertex {
+            pos: [0.03125, 0.03125, 0., 1.],
+            ..Default::default()
+        };
+        assert_eq!(
+            draw_point(&mut target, &state, &samples, &stages, point),
+            16
+        );
+        for (x, y, color) in [
+            (6, 6, [16, 48, 0, 255]),
+            (9, 6, [207, 48, 0, 255]),
+            (6, 9, [16, 239, 0, 255]),
+            (9, 9, [207, 239, 0, 255]),
+        ] {
+            let i = (y * 16 + x) * 4;
+            assert_eq!(&target.color[i..i + 4], &color);
+        }
+        assert!(samples
+            .0
+            .borrow()
+            .iter()
+            .all(|g| *g == [0.25, 0., 0., 0.25]));
+        target.clear_color([0; 4], None);
+        point.pos = [-0.96875, 0.96875, 0., 1.];
+        state.scissor = Some((0, 15, 1, 1));
+        assert_eq!(draw_point(&mut target, &state, &samples, &stages, point), 1);
+        assert_eq!(
+            &target.color[..4],
+            &[143, 143, 0, 255],
+            "clipping must not stretch the visible part"
+        );
+        target.clear_color([0; 4], None);
+        point.pos[0] = -1.01;
+        assert_eq!(
+            draw_point(&mut target, &state, &samples, &stages, point),
+            0,
+            "clip the point center before expanding its square"
+        );
     }
 }

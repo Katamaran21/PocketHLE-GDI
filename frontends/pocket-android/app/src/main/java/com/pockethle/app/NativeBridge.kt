@@ -64,24 +64,22 @@ object NativeBridge {
     @JvmStatic external fun colorsLanguages(libraryRoot: String, id: String): String
     @JvmStatic external fun unlockColorsTurfWars(libraryRoot: String, id: String): String
 
-    /** Returns the freshly imported game as a JSON [GameEntry]. */
+    /** Prepares an import and returns its choices/token; commit returns the imported entries. */
     @JvmStatic external fun prepareImport(libraryRoot: String, source: String): String
     @JvmStatic external fun choosePreparedImportCabinet(libraryRoot: String, token: Long, index: Int): String
     @JvmStatic external fun choosePreparedImportPlatform(libraryRoot: String, token: Long, gameId: String, gizmondo: Boolean): String
     @JvmStatic external fun commitPreparedImport(libraryRoot: String, token: Long, allowUpdates: Boolean): String
     @JvmStatic external fun cancelPreparedImport(libraryRoot: String, token: Long)
 
-    @JvmStatic external fun importCab(libraryRoot: String, cabPath: String): String
     @JvmStatic external fun isDemoCard(libraryRoot: String, id: String): Boolean
     @JvmStatic external fun splitDemoCard(libraryRoot: String, id: String): String
-    /** Returns one JSON GameEntry, or an array for an automatic GZGA collection import. */
-    @JvmStatic external fun importZip(libraryRoot: String, zipPath: String): String
-    /** Imports a RAR archive containing a Pocket PC game. */
-    @JvmStatic external fun importRar(libraryRoot: String, rarPath: String): String
-    /** Imports a standalone ARM Pocket PC executable. */
-    @JvmStatic external fun importExe(libraryRoot: String, exePath: String): String
 
     /** Returns `{"ok":true}` on success or `{"ok":false,"error":...}`. */
+    /** Stage only; commit requires explicit overwrite consent if conflicts is nonempty. */
+    @JvmStatic external fun prepareGameData(libraryRoot: String, id: String, source: String, name: String, extract: Boolean): String
+    @JvmStatic external fun commitGameData(libraryRoot: String, token: Long, overwrite: Boolean, executable: String): String
+    @JvmStatic external fun cancelGameData(libraryRoot: String, token: Long)
+
     @JvmStatic external fun removeGame(libraryRoot: String, id: String): String
 
     /** Returns the launcher config as JSON. */
@@ -100,17 +98,6 @@ object NativeBridge {
         settingsJson: String,
     ): String
 
-    /**
-     * Legacy single-shot run. Blocks the caller until the emulator
-     * has finished, then returns a JSON object of the form
-     * `{"ok":true,"summary":"...","frame":{"width":W,"height":H,"rgba_b64":"..."}}`
-     * or `{"ok":false,"error":"..."}`. Kept for compatibility with
-     * other callers but no longer used by [GameActivity] because
-     * the real Unicorn backend takes long enough that the call
-     * looks like a hang to the user.
-     */
-    @JvmStatic external fun runGame(libraryRoot: String, id: String): String
-
     // -------------------------------------------------------------------
     // Session-based emulator API. See `pocket-android-jni::runner`.
     // -------------------------------------------------------------------
@@ -122,10 +109,32 @@ object NativeBridge {
      * [nativeFinishGame] is called, after which the handle is
      * invalid and **must not** be passed back in.
      */
-    @JvmStatic external fun nativeStartGame(libraryRoot: String, id: String): Long
+    @JvmStatic external fun nativeStartGame(libraryRoot: String, id: String, presentation: Long = 0): Long
 
-    /** Completed display presentations per second, or -1 for changed-image (IPS) fallback. */
-    @JvmStatic external fun nativePresentationFps(handle: Long): Float
+    /** Changed images per second, or -1 before the first change. */
+    @JvmStatic external fun nativePublishedImageIps(handle: Long): Float
+
+
+    const val MEDIA_PLAY_PAUSE = 0
+    const val MEDIA_STOP = 1
+    const val MEDIA_REWIND = 2
+    const val MEDIA_FORWARD = 3
+
+    @JvmStatic external fun nativeSystemMedia(handle: Long): String?
+    @JvmStatic external fun nativeSystemMediaCommand(handle: Long, command: Int)
+
+    /** GL-thread only; query 0 probes support without reading a result. */
+    @JvmStatic external fun nativeCreatePresentation(): Long
+    @JvmStatic external fun nativeCapturePresentationRoot(id: Long): Boolean
+    @JvmStatic external fun nativeAttachPresentation(id: Long, cpuFilter: Boolean): Boolean
+    @JvmStatic external fun nativeDetachPresentation(id: Long)
+    @JvmStatic external fun nativeClosePresentation(id: Long)
+    @JvmStatic external fun nativePresentationCpuFilter(id: Long, required: Boolean)
+    @JvmStatic external fun nativeReleasePresentationFrame(id: Long)
+    @JvmStatic external fun nativeDrawPresentation(id: Long, renderer: Any): Boolean
+    @JvmStatic external fun nativeSharedDisplayShader(): String
+    @JvmStatic external fun nativeRgb565DisplayShader(): String
+    @JvmStatic external fun nativeGpuQueryResult(query: Int): Long
 
     /**
      * Poll for the latest framebuffer the worker has produced.

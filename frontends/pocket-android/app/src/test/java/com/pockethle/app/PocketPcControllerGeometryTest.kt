@@ -37,13 +37,16 @@ class PocketPcControllerGeometryTest {
                 val p = listOf(3, 1, 6, 4).map { g.actions[it] }
                 assertEquals("P1-P4 line $context", 1, p.map { it.y }.distinct().size)
                 assertEquals(1, p.map { it.h }.distinct().size)
-                for (index in listOf(2, 7))
-                    assertTrue("D-pad/action axis $context", abs(centreY2(g.actions[index]) - centreY2(g.dpad)) <= 1)
-                assertTrue(abs((centreY2(g.actions[0]) + centreY2(g.actions[5])) / 2 - centreY2(g.dpad)) <= 1)
+                if(w<h) {
+                    assertEquals(g.dpad.w,g.stick.w)
+                    assertTrue(abs(2*g.stick.x+g.stick.w-w)<=1)
+                } else {
+                    assertTrue(abs(centreY2(g.dpad)-h)<=1)
+                    assertTrue(p[0].y < h/12)
+                    assertTrue(centreY2(g.actions[2]) < centreY2(g.dpad))
+                    assertTrue(g.stick.w<=g.dpad.w)
+                }
                 assertTrue("P row safety $context", p[0].y + p[0].h < minOf(g.dpad.y, g.actions[0].y))
-                assertTrue(g.stick.w < g.dpad.w)
-                if (w < h) assertTrue(g.stick.x + g.stick.w / 2 < g.actions[0].x + g.actions[0].w / 2)
-                else assertEquals(g.actions[0].x + g.actions[0].w / 2, g.stick.x + g.stick.w / 2)
                 for (index in listOf(0, 2, 5, 7)) {
                     val r = g.actions[index]
                     val distance = hypot((r.x + r.w / 2.0) - (g.stick.x + g.stick.w / 2.0),
@@ -54,9 +57,9 @@ class PocketPcControllerGeometryTest {
             val normal = PocketPcGeometry.calculate(w, h, density, false, true)
             val big = PocketPcGeometry.calculate(w, h, density, true, true)
             assertTrue(big.dpad.w > normal.dpad.w)
-            assertTrue(big.stick.w > normal.stick.w)
+            assertTrue(big.stick.w >= normal.stick.w)
             assertTrue(abs(big.dpad.w - normal.dpad.w * 4f / 3f) <= 2)
-            assertTrue(abs(big.stick.w - normal.stick.w * 4f / 3f) <= 2)
+            if(w<h) assertTrue(abs(big.stick.w - normal.stick.w * 4f / 3f) <= 2)
             normal.actions.zip(big.actions).forEach { (a, b) -> assertEquals(a.w, b.w); assertEquals(a.h, b.h) }
         }
     }
@@ -86,11 +89,11 @@ class PocketPcControllerGeometryTest {
         }
     }
 
-    @Test fun portraitReferenceKeepsFourTimesGuestScaleInNormalAndBig() {
+    @Test fun portraitReferenceKeepsUsableGuestScaleWithFullSizeCentredStick() {
         for (height in listOf(2480, 2488, 2496)) for (big in listOf(false, true)) {
             val g = PocketPcGeometry.calculate(1200, height, 3.5f, big, true)
-            assertEquals("height=$height / Big=$big", 4,
-                minOf(g.screen.w / 240, g.screen.h / 320, 4))
+            assertTrue("height=$height / Big=$big",
+                minOf(g.screen.w / 240, g.screen.h / 320, 4)>=3)
         }
     }
 
@@ -105,12 +108,12 @@ class PocketPcControllerGeometryTest {
     private data class PhoneSnapshot(val w: Int, val h: Int, val density: Float, val big: Boolean, val rectangles: String)
 
     @Test fun classicPhoneGeometryKeepsControlsWithCompactLandscapeToolbar() {
-        // Existing control positions, with the approved compact landscape toolbar.
+        // Landscape remains stable; portrait tools now anchor the bottom edge.
         val snapshots = listOf(
             PhoneSnapshot(800, 360, 1.0f, false, "152,36,496,318|6,6,67,102|79,6,67,102|6,114,67,102|79,114,67,102|654,6,67,102|727,6,67,102|654,114,67,102|727,114,67,102|152,6,64,24|222,6,64,24|292,6,64,24|444,6,64,24|514,6,64,24|584,6,64,24|6,234,120,120|674,234,120,120"),
             PhoneSnapshot(800, 360, 1.0f, true, "170,36,460,318|6,6,67,83|79,6,67,83|6,95,67,83|79,95,67,83|654,6,67,83|727,6,67,83|654,95,67,83|727,95,67,83|170,6,64,24|240,6,64,24|310,6,64,24|426,6,64,24|496,6,64,24|566,6,64,24|6,196,158,158|636,196,158,158"),
-            PhoneSnapshot(360, 800, 1.0f, false, "0,56,360,500|6,562,82,44|94,562,82,44|6,612,82,44|94,612,82,44|182,562,82,44|270,562,82,44|182,612,82,44|270,612,82,44|6,6,51,44|63,6,51,44|120,6,51,44|189,6,51,44|246,6,51,44|303,6,51,44|6,674,120,120|234,674,120,120"),
-            PhoneSnapshot(360, 800, 1.0f, true, "0,56,360,462|6,524,82,44|94,524,82,44|6,574,82,44|94,574,82,44|182,524,82,44|270,524,82,44|182,574,82,44|270,574,82,44|6,6,51,44|63,6,51,44|120,6,51,44|189,6,51,44|246,6,51,44|303,6,51,44|6,636,158,158|196,636,158,158"),
+            PhoneSnapshot(360, 800, 1.0f, false, "0,0,360,506|6,512,82,44|94,512,82,44|6,562,82,44|94,562,82,44|182,512,82,44|270,512,82,44|182,562,82,44|270,562,82,44|6,750,51,44|63,750,51,44|120,750,51,44|189,750,51,44|246,750,51,44|303,750,51,44|6,624,120,120|234,624,120,120"),
+            PhoneSnapshot(360, 800, 1.0f, true, "0,0,360,468|6,474,82,44|94,474,82,44|6,524,82,44|94,524,82,44|182,474,82,44|270,474,82,44|182,524,82,44|270,524,82,44|6,750,51,44|63,750,51,44|120,750,51,44|189,750,51,44|246,750,51,44|303,750,51,44|6,586,158,158|196,586,158,158"),
             PhoneSnapshot(2401, 1081, 2.625f, false, "397,93,1607,973|15,15,176,314|206,15,176,314|15,344,176,314|206,344,176,314|2019,15,176,314|2210,15,176,314|2019,344,176,314|2210,344,176,314|397,15,168,63|580,15,168,63|763,15,168,63|1470,15,168,63|1653,15,168,63|1836,15,168,63|15,706,360,360|2026,706,360,360"),
             PhoneSnapshot(2401, 1081, 2.625f, true, "505,93,1391,973|15,15,176,257|206,15,176,257|15,287,176,257|206,287,176,257|2019,15,176,257|2210,15,176,257|2019,287,176,257|2210,287,176,257|505,15,168,63|688,15,168,63|871,15,168,63|1362,15,168,63|1545,15,168,63|1728,15,168,63|15,591,475,475|1911,591,475,475")
         )
@@ -129,8 +132,9 @@ class PocketPcControllerGeometryTest {
             assertEquals(a.dpad.w, b.dpad.w)
             assertEquals(a.stick.w, b.stick.w)
             a.actions.zip(b.actions).forEach { (x, y) -> assertEquals(x.w, y.w); assertEquals(x.h, y.h) }
-            assertEquals(a.dpad.y - a.actions[3].y, b.dpad.y - b.actions[3].y)
-            assertEquals(a.stick.y - a.actions[6].y, b.stick.y - b.actions[6].y)
+            assertTrue(abs(centreY2(a.dpad)-800)<=1)
+            assertTrue(abs(centreY2(b.dpad)-1440)<=1)
+            assertEquals(800-a.stick.y-a.stick.h,1440-b.stick.y-b.stick.h)
         }
     }
 

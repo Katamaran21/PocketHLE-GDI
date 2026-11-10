@@ -32,10 +32,11 @@ fn preset(value: &str) -> (u8, u32) {
         _ => (75, 30),
     }
 }
-fn next_capture_deadline(next: Instant, now: Instant, fps: u32) -> Instant {
-    let period = Duration::from_secs_f64(1.0 / f64::from(fps));
-    let remainder = now.saturating_duration_since(next).as_nanos() % period.as_nanos();
-    now + period - Duration::from_nanos(remainder as u64)
+/// Quantize to the nearest output slot. A strict "after deadline" gate drops
+/// near-60Hz paints that arrive just before a deadline due to sub-ms jitter.
+fn capture_slot(epoch: Instant, at: Instant, fps: u32) -> u64 {
+    ((at.saturating_duration_since(epoch).as_nanos() * u128::from(fps) + 500_000_000)
+        / 1_000_000_000) as u64
 }
 #[derive(Default)]
 pub struct Recording {
@@ -44,6 +45,7 @@ pub struct Recording {
     result: Option<Receiver<Result<Vec<PathBuf>, String>>>,
     held_keys: Vec<u16>,
     touch_steering_enabled: bool,
+    gizmondo: bool,
     steering_axes: (i16, i16),
     pub label: Option<(String, Instant)>,
     pub direction: Option<(u16, Instant)>,
@@ -54,7 +56,8 @@ struct Session {
     tx: SyncSender<Frame>,
     audio: Arc<OutputRecording>,
     stop: Arc<Mutex<Option<Instant>>>,
-    next: Instant,
+    epoch: Instant,
+    last_slot: Option<u64>,
     fps: u32,
 }
 struct Frame {
@@ -120,7 +123,8 @@ impl Recording {
             tx,
             audio: audio.clone(),
             stop,
-            next: start,
+            epoch: start,
+            last_slot: None,
             fps,
         });
         self.result = Some(ready);
@@ -163,6 +167,12 @@ impl Recording {
                 Some(Err("Video encoder stopped unexpectedly".into()))
             }
             _ => None,
+        }
+    }
+    pub fn set_gizmondo(&mut self, enabled: bool) {
+        if self.gizmondo != enabled {
+            self.gizmondo = enabled;
+            self.refresh_keys(Instant::now());
         }
     }
     pub fn set_touch_steering_enabled(&mut self, enabled: bool) {
@@ -216,7 +226,7 @@ impl Recording {
             .rev()
             .copied()
             .find(|vk| !(0x25..=0x28).contains(vk))
-            .map(|vk| (key_label(vk), now));
+            .map(|vk| (key_label(vk, self.gizmondo), now));
     }
     pub fn aim(&mut self, x: i32, y: i32) {
         if !self.active() {
@@ -341,7 +351,26 @@ impl Drop for Recording {
         self.finish_and_wait();
     }
 }
-fn key_label(vk: u16) -> String {
+fn key_label(vk: u16, gizmondo: bool) -> String {
+    if gizmondo {
+        let label = match vk {
+            0x0d => Some("PLAY"),
+            0x11 => Some("STOP"),
+            0x10 => Some("REW"),
+            0x20 => Some("FWD"),
+            0x09 => Some("L"),
+            0x1b => Some("R"),
+            0x70 => Some("HOME"),
+            0x71 => Some("VOL"),
+            0x72 => Some("BRIGHTNESS"),
+            0x73 => Some("GEOFENCE"),
+            0x7a => Some("POWER"), // Piano 5 is VK_F11, not F5.
+            _ => None,
+        };
+        if let Some(label) = label {
+            return label.into();
+        }
+    }
     match vk {
         0x0d => "ACT".into(),
         0x1b => "Esc".into(),
@@ -372,10 +401,11 @@ pub fn capture(
     let Some(s) = r.session.as_mut() else {
         return;
     };
-    if now < s.next {
+    let slot = capture_slot(s.epoch, now, s.fps);
+    if s.last_slot.is_some_and(|last| slot <= last) {
         return;
     }
-    s.next = next_capture_deadline(s.next, now, s.fps);
+    s.last_slot = Some(slot);
     match crate::screenshot::read_game_pixels(gl, info) {
         Ok(pixels) => {
             let _ = s.tx.try_send(Frame {
@@ -407,6 +437,23 @@ fn circle(im: &mut image::RgbaImage, x: i32, y: i32, r: i32) {
                     blend(im, x + dx, y + dy, [90, 195, 255], 210)
                 } else {
                     blend(im, x + dx, y + dy, [8, 18, 32], 145)
+                }
+            }
+        }
+    }
+}
+// Longer console function names keep their full label instead of being truncated.
+fn label_marker(im: &mut image::RgbaImage, x: i32, y: i32, half: i32, r: i32) {
+    let straight = (half - r).max(0);
+    for dy in -r..=r {
+        for dx in -half..=half {
+            let edge = (dx.abs() - straight).max(0);
+            let distance = edge * edge + dy * dy;
+            if distance <= r * r {
+                if distance >= (r - 2) * (r - 2) {
+                    blend(im, x + dx, y + dy, [90, 195, 255], 210);
+                } else {
+                    blend(im, x + dx, y + dy, [8, 18, 32], 145);
                 }
             }
         }
@@ -449,10 +496,11 @@ fn draw_overlay(im: &mut image::RgbaImage, o: &Overlay) {
         line(im, tip, (x + dy / 2, y - dx / 2));
     }
     if let Some(text) = &o.button {
-        let x = x + 2 * r + 5 * scale;
-        circle(im, x, y, r);
-        let label: String = text.chars().take(5).collect();
+        let label: String = text.chars().take(10).collect();
         let w = (label.len() as u32 * 6).max(1);
+        let half = ((w as i32 * scale + 8 * scale) / 2).max(r);
+        let x = x + r + 5 * scale + half;
+        label_marker(im, x, y, half, r);
         let mut bitmap = pocket_core::kernel::gdi::Bitmap::new(w, 8);
         pocket_core::kernel::font::draw_str(
             &mut pocket_core::kernel::gdi::Surface::Bitmap(&mut bitmap),
@@ -679,6 +727,14 @@ impl Clip {
             Self::Mp4 { encoder, .. } => encoder.frame(video.pixels.as_raw(), audio),
         }
     }
+    /// AVI requires a sample in each constant-rate slot; MP4 represents a hold
+    /// with timestamp spacing and keeps encoding its continuous audio only.
+    fn hold(&mut self, video: &EncodedFrame, audio: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Avi(a) => a.frame(&video.jpeg, audio),
+            Self::Mp4 { encoder, .. } => encoder.hold_frame(audio),
+        }
+    }
     fn finish(&mut self) -> io::Result<()> {
         match self {
             Self::Avi(a) => a.finish(),
@@ -708,8 +764,7 @@ fn encode(
         if w == 0 || h == 0 || u64::from(w) * u64::from(h) > 33_554_432 {
             return Err(io::Error::other("Video dimensions exceed capture limit"));
         }
-        let target =
-            (frame.at.saturating_duration_since(epoch).as_secs_f64() * f64::from(fps)) as u64;
+        let target = capture_slot(epoch, frame.at, fps);
         // Never mux two captures into the same output time slot.
         if global > target {
             continue;
@@ -717,10 +772,13 @@ fn encode(
         if clip.as_ref().is_some_and(|c| c.rollover(w, h)) {
             if let Some(previous) = last.as_ref() {
                 while global < target {
-                    clip.as_mut().unwrap().frame(
-                        previous,
-                        &timeline.ready_frame(&audio, epoch, global * audio_per_frame)?,
-                    )?;
+                    let pcm = timeline.ready_frame(&audio, epoch, global * audio_per_frame)?;
+                    let clip = clip.as_mut().unwrap();
+                    if global + 1 == target {
+                        clip.frame(previous, &pcm)?;
+                    } else {
+                        clip.hold(previous, &pcm)?;
+                    }
                     global += 1;
                 }
             }
@@ -735,8 +793,7 @@ fn encode(
             clip = Some(Clip::new(&output, w, h, quality, compressed, fps)?);
             paths.push(output);
         }
-        let target =
-            (frame.at.saturating_duration_since(epoch).as_secs_f64() * f64::from(fps)) as u64;
+        let target = capture_slot(epoch, frame.at, fps);
         draw_overlay(&mut frame.pixels, &frame.overlay);
         let mut jpeg = Vec::new();
         if !compressed {
@@ -749,8 +806,16 @@ fn encode(
             pixels: frame.pixels,
             jpeg,
         };
-        while global < target {
+        // A delayed first capture still supplies the image at the clip origin.
+        if last.is_none() && global < target {
             clip.as_mut().unwrap().frame(
+                &current,
+                &timeline.ready_frame(&audio, epoch, global * audio_per_frame)?,
+            )?;
+            global += 1;
+        }
+        while global < target {
+            clip.as_mut().unwrap().hold(
                 last.as_ref().unwrap_or(&current),
                 &timeline.ready_frame(&audio, epoch, global * audio_per_frame)?,
             )?;
@@ -773,10 +838,12 @@ fn encode(
     if let Some(mut c) = clip {
         if let Some(last) = last {
             while global < target {
-                c.frame(
-                    &last,
-                    &timeline.ready_frame(&audio, epoch, global * audio_per_frame)?,
-                )?;
+                let pcm = timeline.ready_frame(&audio, epoch, global * audio_per_frame)?;
+                if global + 1 == target {
+                    c.frame(&last, &pcm)?;
+                } else {
+                    c.hold(&last, &pcm)?;
+                }
                 global += 1;
             }
         }
@@ -1017,18 +1084,36 @@ mod tests {
         }
     }
     #[test]
-    fn capture_deadlines_keep_their_phase_under_paint_jitter() {
+    fn capture_slots_keep_every_near_vsync_frame_despite_early_late_jitter() {
         let epoch = Instant::now();
-        for fps in [30, 60] {
-            let period = Duration::from_secs_f64(1.0 / f64::from(fps));
-            let mut next = epoch;
-            for i in 0..fps {
-                let now = epoch + period * i + Duration::from_micros(1000);
-                assert!(now >= next);
-                next = next_capture_deadline(next, now, fps);
-                assert_eq!(next, epoch + period * (i + 1));
+        let times_us = [0, 16400, 33800, 49900, 66500, 83900];
+        let slots: Vec<_> = times_us
+            .into_iter()
+            .map(|us| capture_slot(epoch, epoch + Duration::from_micros(us), 60))
+            .collect();
+        assert_eq!(slots, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            capture_slot(epoch, epoch + Duration::from_secs(600), 60),
+            36_000
+        );
+    }
+    #[test]
+    fn unlimited_paints_do_not_create_duplicate_output_slots_or_a_pause_backlog() {
+        let epoch = Instant::now();
+        let mut last = None;
+        let mut slots = Vec::new();
+        for ms in 0..1000 {
+            let slot = capture_slot(epoch, epoch + Duration::from_millis(ms), 60);
+            if last != Some(slot) {
+                slots.push(slot);
+                last = Some(slot);
             }
         }
+        assert_eq!(slots, (0..=60).collect::<Vec<_>>());
+        assert_eq!(
+            capture_slot(epoch, epoch + Duration::from_secs(10), 60),
+            600
+        );
     }
     #[test]
     fn input_markers_have_independent_columns_and_no_aim_tap_trail() {
@@ -1038,7 +1123,8 @@ mod tests {
             tx,
             audio: Arc::new(OutputRecording::default()),
             stop: Arc::new(Mutex::new(None)),
-            next: Instant::now(),
+            epoch: Instant::now(),
+            last_slot: None,
             fps: 30,
         });
         r.observe(InputEvent::KeyDown { vk: 0x26 });
@@ -1102,6 +1188,12 @@ mod tests {
                 },
             })
             .unwrap();
+            tx.send(Frame {
+                at: epoch + Duration::from_millis(500),
+                pixels: image::RgbaImage::from_pixel(321, 241, image::Rgba([180, 70, 30, 255])),
+                overlay: Default::default(),
+            })
+            .unwrap();
             drop(tx);
             let paths = encode(
                 rx,
@@ -1118,7 +1210,8 @@ mod tests {
             let bytes = std::fs::read(&paths[0]).unwrap();
             assert!(bytes.len() > 1000);
             // Inspect actual MP4 track metadata, not encoder settings: the video
-            // must contain fps samples over one second, with H.264 and AAC tracks.
+            // must hold the captured image for one second, with H.264/AAC tracks,
+            // without re-encoding it fps times when no new capture exists.
             fn boxes(mut data: &[u8]) -> Vec<([u8; 4], &[u8])> {
                 let mut result = Vec::new();
                 while !data.is_empty() {
@@ -1155,7 +1248,23 @@ mod tests {
                         assert_eq!(duration, timescale, "video duration must be one second");
                         let sizes = child(samples, b"stsz");
                         let count = u32::from_be_bytes(sizes[8..12].try_into().unwrap());
-                        assert_eq!(count, fps, "wrong native video frame rate");
+                        assert_eq!(count, 3, "two captures plus final duration marker must not encode every missing slot");
+                        let timing = child(samples, b"stts");
+                        let entries = u32::from_be_bytes(timing[4..8].try_into().unwrap()) as usize;
+                        let mut slots = 0u64;
+                        for i in 0..entries {
+                            let at = 8 + 8 * i;
+                            slots += u64::from(u32::from_be_bytes(
+                                timing[at..at + 4].try_into().unwrap(),
+                            )) * u64::from(u32::from_be_bytes(
+                                timing[at + 4..at + 8].try_into().unwrap(),
+                            ));
+                        }
+                        assert_eq!(
+                            slots,
+                            u64::from(timescale),
+                            "sample timing must preserve wall-clock duration"
+                        );
                         video_found = true;
                     }
                     b"soun" => {
@@ -1215,5 +1324,64 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(small.get_pixel(15, 226).0, [200, 50, 20, 255]);
         assert!(paths.iter().all(|p| p.metadata().unwrap().len() > 1000));
+    }
+}
+
+#[cfg(test)]
+mod gizmondo_label_tests {
+    use super::*;
+    #[test]
+    fn gizmondo_recording_uses_console_labels_that_fit_the_existing_marker() {
+        for (vk, label) in [
+            (0x0d, "PLAY"),
+            (0x11, "STOP"),
+            (0x10, "REW"),
+            (0x20, "FWD"),
+            (0x09, "L"),
+            (0x1b, "R"),
+            (0x70, "HOME"),
+            (0x71, "VOL"),
+            (0x72, "BRIGHTNESS"),
+            (0x73, "GEOFENCE"),
+            (0x7a, "POWER"),
+        ] {
+            assert_eq!(key_label(vk, true), label);
+            assert!(label.len() <= 10);
+        }
+        assert_eq!(key_label(0x0d, false), "ACT");
+        assert_eq!(key_label(0x11, false), "A");
+        assert_eq!(key_label(0x10, false), "C");
+        assert_eq!(key_label(0x20, false), "B");
+        assert_eq!(key_label(0xc1, false), "P1");
+        assert_eq!(key_label(0x26, true), "Up");
+    }
+    #[test]
+    fn longer_function_labels_are_fully_visible_and_short_markers_stay_unchanged() {
+        let mut before = image::RgbaImage::new(320, 240);
+        let mut after = before.clone();
+        circle(&mut before, 52, 221, 14);
+        label_marker(&mut after, 52, 221, 14, 14);
+        assert_eq!(before, after);
+        draw_overlay(
+            &mut after,
+            &Overlay {
+                button: Some("BRIGHTNESS".into()),
+                ..Default::default()
+            },
+        );
+        assert!(after
+            .enumerate_pixels()
+            .any(|(x, _, p)| x >= 96 && p[0] > 220 && p[1] > 220 && p[2] > 220));
+    }
+    #[test]
+    fn changing_recording_profile_updates_the_held_button_label() {
+        let mut recording = Recording::default();
+        recording.held_keys = vec![0x0d];
+        recording.refresh_keys(Instant::now());
+        assert_eq!(recording.label.as_ref().unwrap().0, "ACT");
+        recording.set_gizmondo(true);
+        assert_eq!(recording.label.as_ref().unwrap().0, "PLAY");
+        recording.set_gizmondo(false);
+        assert_eq!(recording.label.as_ref().unwrap().0, "ACT");
     }
 }

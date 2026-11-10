@@ -6,7 +6,8 @@
 //! ```text
 //! <library_root>/
 //!     library.json     # registry of installed games (this crate)
-//!     config.json      # global launcher settings (this crate)
+//!     config.json      # Standard launcher settings (CLI/Android/desktop)
+//!     config-steamdeck.json # optional runtime Deck settings
 //!     games/
 //!         <id>/
 //!             game.json    # per-game manifest (this crate)
@@ -27,9 +28,12 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+pub mod add_data;
 pub mod backup;
+pub mod center_tap;
 pub mod colors_save;
 pub mod frame_rate;
+pub mod input_gestures;
 pub use frame_rate::FrameRateLimit;
 
 use rars::ArchiveReader;
@@ -576,15 +580,21 @@ impl GameEntry {
 }
 
 /// Runtime settings stored per game.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameSettings {
+    /// Optional classic CE desktop session, shared by the Windows GUI runner
+    /// and its children. Ordinary PocketPC games retain their current profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_ce: Option<WindowsCeSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_heap: Option<bool>,
     /// Optional Gizmondo SD Card/Storage Card host directory for both frontends.
     /// Relative paths resolve against the library root; None keeps the imported card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_card_dir: Option<PathBuf>,
-    /// No additional ceiling by default; display synchronization remains unchanged.
-    #[serde(default)]
-    pub frame_rate_limit: FrameRateLimit,
+    /// None inherits the emulator ceiling; explicit overrides are limited to 60 fps.
+    #[serde(default, deserialize_with = "frame_rate::deserialize_game_limit")]
+    pub frame_rate_limit: Option<FrameRateLimit>,
     /// Display-relative arrows hold fixed touch zones; left-stick tilt controls position.
     #[serde(default)]
     pub pocketpc_touch_steering: bool,
@@ -618,12 +628,12 @@ pub struct GameSettings {
     /// Emulate a portrait LCD with positive column pitch and negative vertical pitch.
     #[serde(default)]
     pub pocketpc_gapi_columns: bool,
+    /// Offer only RGBA8888 EGL surfaces. Opt-in PocketPC compatibility profile.
+    #[serde(default)]
+    pub pocketpc_egl_rgba8888_only: bool,
     /// Experimental OpenGL host rasterization; None inherits the global choice.
     #[serde(default)]
     pub gpu_renderer: Option<bool>,
-    /// None inherits the global GPU-only anisotropic filter (0, 2, 4, 8).
-    #[serde(default)]
-    pub anisotropic_filtering: Option<u8>,
     /// Which CPU backend the user prefers for this game.
     #[serde(default)]
     pub cpu_backend: CpuBackendPref,
@@ -697,6 +707,29 @@ impl DpadDeadzone {
 }
 
 impl GameSettings {
+    /// Whether this game has saved overrides or nonstandard runtime settings.
+    pub fn has_custom_settings(&self, config: &LauncherConfig) -> bool {
+        let standard = Self {
+            cpu_backend: config.default_cpu_backend,
+            // Saving the explicit Normal control mode is equivalent to its default.
+            pocketpc_controls: self
+                .pocketpc_controls
+                .filter(|mode| *mode == stylus_grid::ControlsMode::Normal),
+            ..Self::default()
+        };
+        *self != standard
+    }
+
+    pub fn effective_executable_heap(&self, config: &LauncherConfig) -> bool {
+        self.executable_heap.unwrap_or(config.executable_heap)
+    }
+
+    pub fn effective_frame_rate_limit(&self, config: &LauncherConfig) -> Option<u32> {
+        self.frame_rate_limit
+            .unwrap_or(config.frame_rate_limit)
+            .fps()
+    }
+
     pub fn controls_mode(&self) -> stylus_grid::ControlsMode {
         self.pocketpc_controls
             .unwrap_or(if self.pocketpc_touch_steering {
@@ -758,8 +791,10 @@ impl GameSettings {
 impl Default for GameSettings {
     fn default() -> Self {
         Self {
+            windows_ce: None,
+            executable_heap: None,
             storage_card_dir: None,
-            frame_rate_limit: FrameRateLimit::default(),
+            frame_rate_limit: None,
             pocketpc_touch_steering: false,
             pocketpc_controls: None,
             pocketpc_swap_button_groups: false,
@@ -772,14 +807,39 @@ impl Default for GameSettings {
             pocketpc_random_seed: String::new(),
             pocketpc_platform_type: String::new(),
             pocketpc_gapi_columns: false,
+            pocketpc_egl_rgba8888_only: false,
             gpu_renderer: None,
-            anisotropic_filtering: None,
             cpu_backend: CpuBackendPref::default(),
             max_slices: default_max_slices(),
             instructions_per_slice: default_instructions_per_slice(),
             screen: ScreenPref::default(),
             rotation: RotationPref::default(),
             dpad_deadzone: DpadDeadzone::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowsCeSettings {
+    pub profile_name: String,
+    pub image_root: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
+    /// Guest directory under which the supplied EXE and its siblings appear.
+    pub app_prefix: String,
+    pub command_line: String,
+    pub classic_windows: bool,
+}
+
+impl Default for WindowsCeSettings {
+    fn default() -> Self {
+        Self {
+            profile_name: String::new(),
+            image_root: None,
+            data_dir: None,
+            app_prefix: "\\Application\\".into(),
+            command_line: String::new(),
+            classic_windows: true,
         }
     }
 }
@@ -876,10 +936,20 @@ pub enum ScreenPref {
 }
 
 impl ScreenPref {
+    /// Gizmondo normally exposes its native landscape LCD. An explicit QVGA
+    /// profile also supports software that rotates a portrait surface itself.
+    pub fn gizmondo_size(self) -> (u32, u32) {
+        if self == Self::Qvga {
+            self.size()
+        } else {
+            (320, 240)
+        }
+    }
+
     /// CEUX/HI_RES_AWARE is the Windows Mobile declaration that a program
     /// accepts native high-resolution coordinates. Use a VGA device for that
     /// declaration; keep legacy QVGA for unmarked software. Explicit profiles
-    /// always win, and Gizmondo callers continue to force 320x240.
+    /// always win. Gizmondo callers use their own native default.
     pub fn resolve_image(self, image: Option<&pocket_pe::LoadedImage>) -> (u32, u32) {
         if self != Self::Portrait {
             return self.size();
@@ -970,6 +1040,10 @@ impl CpuBackendPref {
     }
 }
 
+fn default_gles_internal_resolution() -> u8 {
+    1
+}
+
 fn default_gpu_renderer() -> bool {
     true
 }
@@ -994,8 +1068,27 @@ fn identity_revision() -> u8 {
 /// `<library_root>/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherConfig {
+    /// Android timing diagnostics; opt-in, applied at next launch.
+    #[serde(default)]
+    pub android_graphics_diagnostics: bool,
+    #[serde(default = "default_executable_heap")]
+    pub executable_heap: bool,
+    /// Default presentation ceiling for games that inherit emulator settings.
+    #[serde(default)]
+    pub frame_rate_limit: FrameRateLimit,
+    /// Desktop window swap synchronization. Applied when the window is created.
+    #[serde(default = "default_desktop_vsync")]
+    pub desktop_vsync: bool,
+
     #[serde(default = "default_pocketpc_processor")]
     pub pocketpc_processor: String,
+    /// Reproduce the Intel 2700G WinCE driver's constant polygon depth bias.
+    /// All PocketPC applications may opt in; Gizmondo always keeps standard ES.
+    #[serde(default)]
+    pub pocketpc_intel2700g_depth_bias: bool,
+    /// Allow detected PocketPC clients to use NVIDIA AR10/AR11 programs.
+    #[serde(default = "default_pocketpc_nv_combiners")]
+    pub pocketpc_nv_combiners: bool,
     #[serde(default = "default_recording_format")]
     pub recording_format: String,
     /// Video recording JPEG quality preset: low, medium or high.
@@ -1014,9 +1107,9 @@ pub struct LauncherConfig {
     /// Host GPU rendering is enabled by default; games may override it.
     #[serde(default = "default_gpu_renderer")]
     pub gpu_renderer: bool,
-    /// GPU-only texture anisotropy. Zero disables it.
-    #[serde(default)]
-    pub anisotropic_filtering: u8,
+    /// Host-only GLES resolution: 1=native, 2=double all, 3=double QVGA only, 4=triple QVGA only, 5=quadruple QVGA only.
+    #[serde(default = "default_gles_internal_resolution")]
+    pub gles_internal_resolution: u8,
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     /// Default CPU backend used when importing a new game.
@@ -1064,9 +1157,6 @@ pub struct LauncherConfig {
     /// Desktop smoothing filter, remembered across sessions.
     #[serde(default = "default_upscale_filter")]
     pub upscale_filter: String,
-    /// Android presentation scale: 0 = fit, 1..4 = native multiple (clamped to fit).
-    #[serde(default)]
-    pub android_display_scale: u32,
     /// Last folder the user picked a `.cab` from. Used to remember
     /// the file dialog start directory.
     #[serde(default)]
@@ -1079,6 +1169,8 @@ pub struct LauncherConfig {
     #[serde(default = "default_show_fps")]
     pub show_fps: bool,
     #[serde(default)]
+    pub show_ips: bool,
+    #[serde(default)]
     pub fullscreen: bool,
     #[serde(default = "default_fullscreen_mode")]
     pub fullscreen_mode: String,
@@ -1090,6 +1182,12 @@ pub struct LauncherConfig {
     /// the D-pad to match their keyboard once, not once per title.
     #[serde(default)]
     pub keybindings: KeyBindings,
+    /// Optional per-profile long actions; a matching short action waits for release.
+    #[serde(default)]
+    pub long_press_bindings: input_gestures::LongPressBindings,
+    /// Per-profile guest overrides. Null explicitly unbinds an input.
+    #[serde(default)]
+    pub short_press_bindings: std::collections::BTreeMap<String, Option<GuestButton>>,
     #[serde(default)]
     pub stylus_stick: stylus::StylusBindings,
     /// Physical controller inputs, independent of keyboard bindings.
@@ -1125,8 +1223,6 @@ pub struct LauncherConfig {
     /// Allow Android Gizmondo controls to overlay the full game viewport.
     #[serde(default)]
     pub android_gizmondo_maximize_screen: bool,
-    #[serde(default)]
-    pub optimizations: OptimizationSettings,
 }
 
 fn default_log_unimplemented_apis() -> bool {
@@ -1272,6 +1368,25 @@ fn default_fullscreen_mode() -> String {
 }
 
 impl LauncherConfig {
+    /// Effective PocketPC stylus keyboard inputs are unavailable to per-game grids.
+    /// Explicit guest overrides free an old direction key for another purpose.
+    pub fn stylus_keyboard_reserved(&self, key: &str) -> bool {
+        let id = input_gestures::binding_key(false, false, key);
+        if let Some(binding) = self.short_press_bindings.get(&id) {
+            return *binding == Some(GuestButton::StylusClick);
+        }
+        if self.long_press_bindings.contains_key(&id) {
+            return false;
+        }
+        keybindings::keyboard_button_for_profile(&self.keybindings, key, false)
+            == Some(GuestButton::StylusClick)
+            || self
+                .stylus_stick
+                .keyboard
+                .iter()
+                .any(|keys| keys.iter().any(|k| keybindings::keys_match(k, key)))
+    }
+
     pub fn gamepad_toggles_fullscreen(&self, control: &str) -> bool {
         // Preserve an existing custom guest binding when upgrading old configs.
         self.gamepad_fullscreen.as_deref() == Some(control)
@@ -1283,10 +1398,28 @@ fn default_pocketpc_processor() -> String {
     "pxa270".into()
 }
 
+fn default_pocketpc_nv_combiners() -> bool {
+    true
+}
+
+fn default_desktop_vsync() -> bool {
+    true
+}
+
+fn default_executable_heap() -> bool {
+    true
+}
+
 impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
+            android_graphics_diagnostics: false,
+            executable_heap: default_executable_heap(),
+            frame_rate_limit: FrameRateLimit::Fps60,
+            desktop_vsync: true,
             pocketpc_processor: default_pocketpc_processor(),
+            pocketpc_intel2700g_depth_bias: false,
+            pocketpc_nv_combiners: true,
             recording_quality: default_recording_quality(),
             recording_format: default_recording_format(),
             device_preset_id: default_device_preset_id(),
@@ -1295,7 +1428,7 @@ impl Default for LauncherConfig {
             gizmondo_platform_id: default_gizmondo_platform_id(),
             gizmondo_identity_revision: identity_revision(),
             gpu_renderer: true,
-            anisotropic_filtering: 0,
+            gles_internal_resolution: 1,
             schema_version: 1,
             default_cpu_backend: CpuBackendPref::default(),
             verbosity: 1,
@@ -1312,13 +1445,15 @@ impl Default for LauncherConfig {
             colors_terminal_id: String::new(),
             colors_language: default_colors_language(),
             upscale_filter: default_upscale_filter(),
-            android_display_scale: 0,
             last_import_dir: None,
             show_fps: default_show_fps(),
+            show_ips: false,
             fullscreen: false,
             fullscreen_mode: default_fullscreen_mode(),
             orientation: default_orientation(),
             keybindings: KeyBindings::default(),
+            long_press_bindings: Default::default(),
+            short_press_bindings: Default::default(),
             stylus_stick: Default::default(),
             gamepad_bindings: keybindings::default_gamepad_bindings(),
             gamepad_fullscreen: keybindings::default_gamepad_fullscreen(),
@@ -1328,27 +1463,6 @@ impl Default for LauncherConfig {
             android_pocketpc_touch_layout: PocketPcTouchLayout::Classic,
             android_gizmondo_controls_size: PocketPcControlsSize::Normal,
             android_gizmondo_maximize_screen: false,
-            optimizations: OptimizationSettings::default(),
-        }
-    }
-}
-
-/// Host performance policies. These are not emulated ARM hardware features.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct OptimizationSettings {
-    pub fast_memory_access: bool,
-    pub extended_tlb_cache: bool,
-    pub responsive_scheduling: bool,
-    pub extended_jump_cache: bool,
-}
-impl Default for OptimizationSettings {
-    fn default() -> Self {
-        Self {
-            fast_memory_access: true,
-            extended_tlb_cache: true,
-            responsive_scheduling: true,
-            extended_jump_cache: true,
         }
     }
 }
@@ -1377,6 +1491,7 @@ pub enum PocketPcControlsSize {
 /// registry; mutations are written through to disk immediately.
 #[derive(Debug, Clone)]
 pub struct Library {
+    profile: LauncherProfile,
     root: PathBuf,
     library: LibraryFile,
     config: LauncherConfig,
@@ -1388,6 +1503,7 @@ pub struct Library {
 pub struct PreparedImport {
     staging: tempfile::TempDir,
     target_root: PathBuf,
+    profile: LauncherProfile,
     zip_source: bool,
     entries: Vec<GameEntry>,
     updates: Vec<GameEntry>,
@@ -1419,8 +1535,8 @@ impl PreparedImport {
             .iter()
             .find(|c| c.index == index)
             .ok_or_else(|| LibraryError::InvalidId("Unknown installer cabinet selection".into()))?;
-        let target = Library::open(&self.target_root)?;
-        let mut provisional = Library::open(self.staging.path())?;
+        let target = Library::open_with_profile(&self.target_root, self.profile)?;
+        let mut provisional = Library::open_with_profile(self.staging.path(), self.profile)?;
         provisional.config = target.config.clone();
         import_installer_choice(&mut provisional, choice)?;
         let entries = provisional.games().to_vec();
@@ -1483,12 +1599,24 @@ struct LibraryFile {
     games: Vec<GameEntry>,
 }
 
-/// Deck settings are isolated while the imported catalogue remains shared.
-pub const CONFIG_FILE_NAME: &str = if cfg!(feature = "steam-deck") {
-    "config-steamdeck.json"
-} else {
-    "config.json"
-};
+/// Standard clients (including Android/CLI) use this default config file.
+pub const CONFIG_FILE_NAME: &str = "config.json";
+
+/// A per-library runtime profile; never a process-global or Cargo feature.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LauncherProfile {
+    #[default]
+    Standard,
+    SteamDeck,
+}
+impl LauncherProfile {
+    pub fn config_file_name(self) -> &'static str {
+        match self {
+            Self::Standard => CONFIG_FILE_NAME,
+            Self::SteamDeck => "config-steamdeck.json",
+        }
+    }
+}
 
 /// Resolve the default library root, in the order the desktop
 /// launcher has always used:
@@ -1525,7 +1653,7 @@ impl Library {
         let staging = tempfile::Builder::new()
             .prefix(".pending-import-")
             .tempdir_in(self.root.join("games"))?;
-        let mut provisional = Library::open(staging.path())?;
+        let mut provisional = Library::open_with_profile(staging.path(), self.profile)?;
         provisional.config = self.config.clone();
         let mut signature = [0; 4];
         let count = fs::File::open(path)?.read(&mut signature)?;
@@ -1550,6 +1678,7 @@ impl Library {
         if let Some(choices) = installer_cabinets.as_ref().filter(|c| c.len() > 1) {
             return Ok(PreparedImport {
                 target_root: self.root.clone(),
+                profile: self.profile,
                 zip_source: false,
                 entries: Vec::new(),
                 updates: Vec::new(),
@@ -1590,6 +1719,7 @@ impl Library {
         Ok(PreparedImport {
             staging,
             target_root: self.root.clone(),
+            profile: self.profile,
             zip_source,
             entries,
             updates,
@@ -1609,9 +1739,9 @@ impl Library {
                 "Choose an installer cabinet before importing".into(),
             ));
         }
-        if pending.target_root != self.root {
+        if pending.target_root != self.root || pending.profile != self.profile {
             return Err(LibraryError::InvalidId(
-                "import belongs to another library".into(),
+                "import belongs to another library or profile".into(),
             ));
         }
         let mut prepared = Vec::new();
@@ -1646,32 +1776,45 @@ impl Library {
     /// Open the library rooted at `root`, creating the directory and
     /// default `library.json` / `config.json` if they don't exist.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, LibraryError> {
+        Self::open_with_profile(root, LauncherProfile::Standard)
+    }
+
+    /// Open one settings profile while sharing the game catalogue.
+    pub fn open_with_profile(
+        root: impl Into<PathBuf>,
+        profile: LauncherProfile,
+    ) -> Result<Self, LibraryError> {
         let root = root.into();
+        let config_file = root.join(profile.config_file_name());
         fs::create_dir_all(&root)?;
         fs::create_dir_all(root.join("games"))?;
 
         let library = read_or_default::<LibraryFile>(&root.join("library.json"))?;
-        let mut config = read_or_default::<LauncherConfig>(&root.join(CONFIG_FILE_NAME))?;
+        let mut config = read_or_default::<LauncherConfig>(&config_file)?;
         // A fresh Android/PC library must support Merge backup restore before
         // its first game import. Restore reads the on-disk catalogue, while
         // read_or_default alone only supplies an in-memory empty library.
         if !root.join("library.json").exists() {
             write_json(&root.join("library.json"), &library)?;
         }
-        if !root.join(CONFIG_FILE_NAME).exists() {
-            write_json(&root.join(CONFIG_FILE_NAME), &config)?;
+        if !config_file.exists() {
+            write_json(&config_file, &config)?;
         }
         if config.gizmondo_identity_revision == 0 {
             config.gizmondo_platform_id = default_gizmondo_platform_id();
             config.gizmondo_identity_revision = identity_revision();
-            write_json(&root.join(CONFIG_FILE_NAME), &config)?;
+            write_json(&config_file, &config)?;
         }
-        keybindings::migrate_steam_deck_gamepad_bindings(&mut config.gamepad_bindings);
-        if keybindings::migrate_steam_deck_fullscreen(&mut config.gamepad_fullscreen) {
-            write_json(&root.join(CONFIG_FILE_NAME), &config)?;
+        if profile == LauncherProfile::Standard
+            && keybindings::migrate_legacy_pc_gamepad_layout(
+                &mut config.gamepad_bindings,
+                &mut config.gamepad_fullscreen,
+            )
+        {
+            write_json(&config_file, &config)?;
         }
-
         let mut this = Self {
+            profile,
             root,
             library,
             config,
@@ -1776,10 +1919,21 @@ impl Library {
             }
         }
         if config_changed {
-            if let Err(e) = write_json(&self.root.join(CONFIG_FILE_NAME), &self.config) {
-                log::warn!("could not save migrated config.json: {e}");
+            if let Err(e) = write_json(
+                &self.root.join(self.profile.config_file_name()),
+                &self.config,
+            ) {
+                log::warn!(
+                    "could not save migrated {}: {e}",
+                    self.profile.config_file_name()
+                );
             }
         }
+    }
+
+    /// Runtime settings profile used by this handle and its background work.
+    pub fn profile(&self) -> LauncherProfile {
+        self.profile
     }
 
     /// Library root directory.
@@ -1802,10 +1956,13 @@ impl Library {
         self.library.games.iter_mut().find(|g| g.id == id)
     }
 
-    /// Persist the current `library.json` and `config.json` to disk.
+    /// Persist the catalogue and this handle's selected settings file.
     pub fn save(&self) -> Result<(), LibraryError> {
         write_json(&self.root.join("library.json"), &self.library)?;
-        write_json(&self.root.join(CONFIG_FILE_NAME), &self.config)?;
+        write_json(
+            &self.root.join(self.profile.config_file_name()),
+            &self.config,
+        )?;
         Ok(())
     }
 
@@ -3531,16 +3688,17 @@ fn register_cab_install_dir(
         return;
     }
     let key = format!(r"HKLM\Software\Apps\{} {}", provider.trim(), app.trim());
-    if !registry
-        .iter()
-        .any(|v| v.key.eq_ignore_ascii_case(&key) && v.name.eq_ignore_ascii_case("InstallDir"))
-    {
-        registry.push(pocket_cab::SetupRegistryValue {
-            key,
-            name: "InstallDir".into(),
-            string: Some(directory.trim_end_matches('\\').into()),
-            dword: None,
-        });
+    for name in ["InstallDir", "InstlDir"] {
+        if !registry.iter().any(|value| {
+            value.key.eq_ignore_ascii_case(&key) && value.name.eq_ignore_ascii_case(name)
+        }) {
+            registry.push(pocket_cab::SetupRegistryValue {
+                key: key.clone(),
+                name: name.into(),
+                string: Some(directory.trim_end_matches('\\').into()),
+                dword: None,
+            });
+        }
     }
 }
 
@@ -3740,14 +3898,14 @@ fn import_installer_choice(
                 }
             }
         }
-        // Record this package's own installation path before rebasing its files.
-        let mut registry = header.registry.clone();
+        // The add-on's inferred install directory can be a common
+        // destination of its data files, such as a child directory of the
+        // application. Use the host application's root for the synthesized
+        // registration while keeping explicit CAB values and file paths.
+        header.install_dir = game.install_dir.clone();
+        let mut registry = std::mem::take(&mut header.registry);
         register_cab_install_dir(&mut registry, &header);
         header.registry = registry;
-        // Resolve every declared destination relative to the base game's root,
-        // not the add-on's root: a pack may install into a child directory.
-        // Preserve the destination strings from the CAB without guessing names.
-        header.install_dir = game.install_dir.clone();
         pocket_cab::materialise_install_header_names(&game_dir.join("extracted"), &files, &header);
         let mut entry = game.clone();
         for value in header.registry {
@@ -4128,6 +4286,24 @@ fn guess_screen(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn custom_settings_badge_follows_saved_overrides_and_reset() {
+        let config = super::LauncherConfig::default();
+        let mut settings = super::GameSettings::default();
+        assert!(!settings.has_custom_settings(&config));
+        settings.pocketpc_controls = Some(super::stylus_grid::ControlsMode::Normal);
+        assert!(!settings.has_custom_settings(&config));
+        settings.executable_heap = Some(config.executable_heap);
+        assert!(settings.has_custom_settings(&config));
+        settings.executable_heap = None;
+        assert!(!settings.has_custom_settings(&config));
+        settings.rotation = super::RotationPref::Cw90;
+        assert!(settings.has_custom_settings(&config));
+        settings = super::GameSettings::default();
+        settings.screen = super::ScreenPref::Qvga;
+        assert!(settings.has_custom_settings(&config));
+    }
+
+    #[test]
     fn android_touch_layout_defaults_and_roundtrips_independently_of_size() {
         use super::*;
         let mut old = serde_json::to_value(LauncherConfig::default()).unwrap();
@@ -4155,7 +4331,6 @@ mod tests {
                     loaded.android_gizmondo_controls_size,
                     PocketPcControlsSize::Normal
                 );
-                assert_eq!(loaded.optimizations, OptimizationSettings::default());
             }
         }
     }
@@ -4179,7 +4354,6 @@ mod tests {
                 restored.android_gizmondo_controls_size,
                 PocketPcControlsSize::Normal
             );
-            assert_eq!(restored.optimizations, OptimizationSettings::default());
         }
     }
 
@@ -4206,56 +4380,46 @@ mod tests {
             restored.android_pocketpc_controls_size,
             PocketPcControlsSize::Normal
         );
-        assert_eq!(restored.optimizations, OptimizationSettings::default());
     }
 
     #[test]
-    fn optimization_defaults_and_independent_roundtrip() {
-        use super::*;
-        let defaults = OptimizationSettings::default();
-        let mut legacy = serde_json::to_value(LauncherConfig::default()).unwrap();
-        legacy.as_object_mut().unwrap().remove("optimizations");
-        assert_eq!(
-            serde_json::from_value::<LauncherConfig>(legacy.clone())
-                .unwrap()
-                .optimizations,
-            defaults
-        );
-        legacy["optimizations"] = serde_json::json!({"fast_memory_access": false});
-        let partial = serde_json::from_value::<LauncherConfig>(legacy).unwrap();
-        assert_eq!(
-            partial.optimizations,
-            OptimizationSettings {
-                fast_memory_access: false,
-                ..defaults
-            }
-        );
-        for previous in [false, true] {
-            let legacy = serde_json::json!({"batch_image_loading": previous});
-            let restored: OptimizationSettings = serde_json::from_value(legacy).unwrap();
-            assert_eq!(restored, defaults);
-            assert!(serde_json::to_value(restored)
-                .unwrap()
-                .get("batch_image_loading")
-                .is_none());
-        }
-        for bits in 0..16 {
-            let settings = OptimizationSettings {
-                fast_memory_access: bits & 1 != 0,
-                extended_tlb_cache: bits & 2 != 0,
-                responsive_scheduling: bits & 4 != 0,
-                extended_jump_cache: bits & 8 != 0,
-            };
-            let mut config = LauncherConfig::default();
-            config.optimizations = settings;
-            let encoded = serde_json::to_string(&config).unwrap();
+    fn legacy_anisotropy_override_is_discarded_without_changing_filter_or_resolution() {
+        let mut value = serde_json::to_value(super::LauncherConfig::default()).unwrap();
+        value["anisotropic_filtering"] = serde_json::json!(8);
+        value["gles_internal_resolution"] = serde_json::json!(5);
+        value["upscale_filter"] = serde_json::json!("none");
+        let config: super::LauncherConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.gles_internal_resolution, 5);
+        assert_eq!(config.upscale_filter, "none");
+        assert!(serde_json::to_value(config)
+            .unwrap()
+            .get("anisotropic_filtering")
+            .is_none());
+    }
+
+    #[test]
+    fn qvga_resolution_policies_preserve_saved_values() {
+        for policy in [1, 2, 3, 4, 5] {
+            let mut value = serde_json::to_value(super::LauncherConfig::default()).unwrap();
+            value["gles_internal_resolution"] = serde_json::json!(policy);
+            let config: super::LauncherConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(config.gles_internal_resolution, policy);
             assert_eq!(
-                serde_json::from_str::<LauncherConfig>(&encoded)
-                    .unwrap()
-                    .optimizations,
-                settings
+                serde_json::to_value(config).unwrap()["gles_internal_resolution"],
+                policy
             );
         }
+    }
+
+    #[test]
+    fn legacy_optimization_switches_are_ignored_and_removed() {
+        let mut value = serde_json::to_value(super::LauncherConfig::default()).unwrap();
+        value["optimizations"] = serde_json::json!({"fast_memory_access":false,"extended_tlb_cache":false,"responsive_scheduling":false,"extended_jump_cache":false});
+        let config: super::LauncherConfig = serde_json::from_value(value).unwrap();
+        assert!(serde_json::to_value(config)
+            .unwrap()
+            .get("optimizations")
+            .is_none());
     }
 
     #[test]
@@ -4263,7 +4427,34 @@ mod tests {
         use super::*;
         let default = LauncherConfig::default();
         assert!(default.gpu_renderer);
-        assert_eq!(default.anisotropic_filtering, 0);
+        assert_eq!(default.gles_internal_resolution, 1);
+        assert!(!default.pocketpc_intel2700g_depth_bias);
+        let mut old_config = serde_json::to_value(&default).unwrap();
+        old_config
+            .as_object_mut()
+            .unwrap()
+            .remove("gles_internal_resolution");
+        assert_eq!(
+            serde_json::from_value::<LauncherConfig>(old_config.clone())
+                .unwrap()
+                .gles_internal_resolution,
+            1
+        );
+        old_config["gles_internal_resolution"] = serde_json::json!(2);
+        assert_eq!(
+            serde_json::from_value::<LauncherConfig>(old_config)
+                .unwrap()
+                .gles_internal_resolution,
+            2
+        );
+        let mut qvga_config = serde_json::to_value(&default).unwrap();
+        qvga_config["gles_internal_resolution"] = serde_json::json!(3);
+        assert_eq!(
+            serde_json::from_value::<LauncherConfig>(qvga_config)
+                .unwrap()
+                .gles_internal_resolution,
+            3
+        );
         let mut legacy = serde_json::to_value(&default).unwrap();
         legacy.as_object_mut().unwrap().remove("gpu_renderer");
         assert!(
@@ -4280,7 +4471,6 @@ mod tests {
         let settings: GameSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.dpad_deadzone, DpadDeadzone::Large);
         assert_eq!(settings.gpu_renderer, None);
-        assert_eq!(settings.anisotropic_filtering, None);
         let gpu = GameSettings {
             gpu_renderer: Some(true),
             ..GameSettings::default()
@@ -4306,21 +4496,90 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn edition_settings_save_without_replacing_the_other_edition() {
+    fn runtime_profiles_keep_settings_separate_and_share_the_catalogue() {
         let root = tempfile::tempdir().unwrap();
-        let other = if cfg!(feature = "steam-deck") {
-            "config.json"
-        } else {
-            "config-steamdeck.json"
-        };
-        let original = br#"{"schema_version":1,"colors_language":"fr","fullscreen":true}"#;
-        fs::write(root.path().join(other), original).unwrap();
-        let mut library = Library::open(root.path()).unwrap();
-        library.config_mut().fullscreen = false;
-        library.save().unwrap();
-        assert_eq!(fs::read(root.path().join(other)).unwrap(), original);
-        assert!(root.path().join(CONFIG_FILE_NAME).is_file());
+        let mut standard = Library::open(root.path()).unwrap();
+        standard.config_mut().fullscreen = false;
+        standard.config_mut().colors_language = "en".into();
+        standard.save().unwrap();
+        let original = fs::read(root.path().join(CONFIG_FILE_NAME)).unwrap();
+        let mut deck = Library::open_with_profile(root.path(), LauncherProfile::SteamDeck).unwrap();
+        deck.config_mut().fullscreen = true;
+        deck.config_mut().colors_language = "fr".into();
+        deck.save().unwrap();
+        assert_eq!(
+            fs::read(root.path().join(CONFIG_FILE_NAME)).unwrap(),
+            original
+        );
+        assert!(
+            Library::open_with_profile(root.path(), LauncherProfile::SteamDeck)
+                .unwrap()
+                .config()
+                .fullscreen
+        );
         assert!(!Library::open(root.path()).unwrap().config().fullscreen);
+        // Handles retain the selected profile across later saves and reloads.
+        standard.config_mut().colors_language = "de".into();
+        standard.save().unwrap();
+        assert_eq!(
+            Library::open_with_profile(root.path(), LauncherProfile::SteamDeck)
+                .unwrap()
+                .config()
+                .colors_language,
+            "fr"
+        );
+        assert_eq!(standard.root(), deck.root());
+        assert_eq!(standard.games().len(), deck.games().len());
+    }
+
+    #[test]
+    fn deck_profile_preserves_saved_bindings() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = LauncherConfig::default();
+        config
+            .gamepad_bindings
+            .insert("West".into(), GuestButton::ButtonA);
+        config.gamepad_fullscreen = Some("West".into());
+        write_json(
+            &root
+                .path()
+                .join(LauncherProfile::SteamDeck.config_file_name()),
+            &config,
+        )
+        .unwrap();
+        let deck = Library::open_with_profile(root.path(), LauncherProfile::SteamDeck).unwrap();
+        assert_eq!(deck.config().gamepad_bindings, config.gamepad_bindings);
+        assert_eq!(deck.config().gamepad_fullscreen, config.gamepad_fullscreen);
+        assert!(!root.path().join(CONFIG_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn prepared_import_retains_runtime_profile_without_touching_standard_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = update_fixture(root.path(), b"profile import");
+        let target = root.path().join("library");
+        let mut deck = Library::open_with_profile(&target, LauncherProfile::SteamDeck).unwrap();
+        deck.config_mut().colors_language = "fr".into();
+        deck.save().unwrap();
+        let pending = deck.prepare_import(archive).unwrap();
+        assert_eq!(pending.profile, LauncherProfile::SteamDeck);
+        assert!(pending
+            .staging
+            .path()
+            .join(LauncherProfile::SteamDeck.config_file_name())
+            .exists());
+        assert!(!pending.staging.path().join(CONFIG_FILE_NAME).exists());
+        let games = deck.apply_prepared_import(pending, false).unwrap();
+        assert!(!target.join(CONFIG_FILE_NAME).exists());
+        let standard = Library::open(&target).unwrap();
+        assert!(standard.get(&games[0].id).is_some());
+        assert_eq!(
+            Library::open_with_profile(&target, LauncherProfile::SteamDeck)
+                .unwrap()
+                .config()
+                .colors_language,
+            "fr"
+        );
     }
 
     #[test]
@@ -4752,12 +5011,15 @@ mod tests {
     fn save_and_reload_round_trips() {
         let root = tmpdir("roundtrip");
         let mut lib = Library::open(&root).unwrap();
+        assert!(!lib.config().android_graphics_diagnostics);
+        lib.config_mut().android_graphics_diagnostics = true;
         lib.config_mut().verbosity = 2;
         lib.config_mut().show_fps = false;
         lib.config_mut().upscale_filter = "smaa_soft".into();
         lib.save().unwrap();
 
         let lib2 = Library::open(&root).unwrap();
+        assert!(lib2.config().android_graphics_diagnostics);
         assert_eq!(lib2.config().verbosity, 2);
         assert!(!lib2.config().show_fps);
         assert_eq!(lib2.config().upscale_filter, "smaa_soft");
@@ -4840,11 +5102,14 @@ mod tests {
                         .unwrap();
                     let reopened = Library::open(&root).unwrap();
                     assert_eq!(reopened.config().gpu_renderer, global);
-                    assert_eq!(reopened.config().anisotropic_filtering, 8);
-                    assert_eq!(
-                        reopened.get(&id).unwrap().settings.anisotropic_filtering,
-                        level
-                    );
+                    assert!(serde_json::to_value(reopened.config())
+                        .unwrap()
+                        .get("anisotropic_filtering")
+                        .is_none());
+                    assert!(serde_json::to_value(&reopened.get(&id).unwrap().settings)
+                        .unwrap()
+                        .get("anisotropic_filtering")
+                        .is_none());
                     assert_eq!(reopened.get(&id).unwrap().settings.gpu_renderer, game);
                 }
             }
@@ -5533,6 +5798,48 @@ mod tests {
         );
         assert_eq!(fs::read(save).unwrap(), b"progress");
         assert_eq!(lib.games().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hardware_diag_imports_one_executable_with_private_fixture_assets() {
+        use std::io::Write;
+        let root = tmpdir("hardware_diag");
+        fs::create_dir_all(&root).unwrap();
+        let fixture = root.join("fixture.exe");
+        write_pe_importing(&fixture, &[]);
+        let pe = fs::read(fixture).unwrap();
+        let path = root.join("HARDWARE-DIAG.zip");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        for (name, bytes) in [
+            ("GZHD999989/AUTORUN.EXE", pe.as_slice()),
+            ("GZHD999989/GZHD999989", b"mark".as_slice()),
+            ("GZHD999989/ram/ramprobe.dll", pe.as_slice()),
+            (
+                "GZHD999989/ram/badproc.bin",
+                b"invalid PE fixture".as_slice(),
+            ),
+            ("GZHD999989/vfs/asset.bin", b"VFS fixture".as_slice()),
+        ] {
+            archive
+                .start_file(name, zip::write::FileOptions::default())
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        let mut lib = Library::open(root.join("library")).unwrap();
+        let entry = lib.import_zip(&path).unwrap().clone();
+        assert_eq!(lib.games().len(), 1);
+        assert_eq!(entry.display_name, "HARDWARE DIAG");
+        assert_eq!(
+            entry.executable,
+            PathBuf::from("extracted/GZHD999989/AUTORUN.EXE")
+        );
+        assert!(entry
+            .extracted_dir(lib.root())
+            .join("GZHD999989/ram/ramprobe.dll")
+            .is_file());
+        assert!(is_gizmondo_game(&entry, lib.root()));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6852,7 +7159,7 @@ mod resource_destination_tests {
         };
         let mut registry = Vec::new();
         super::register_cab_install_dir(&mut registry, &header);
-        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.len(), 2);
         assert_eq!(
             registry[0].key,
             r"HKLM\Software\Apps\Example Publisher Example App"
@@ -6861,11 +7168,13 @@ mod resource_destination_tests {
             registry[0].string.as_deref(),
             Some(r"\Program Files\Example")
         );
+        assert_eq!(registry[1].name, "InstlDir");
+        assert_eq!(registry[1].string, registry[0].string);
         registry[0].key.make_ascii_uppercase();
         registry[0].name.make_ascii_lowercase();
         registry[0].string = Some(r"\Storage Card\Example".into());
         super::register_cab_install_dir(&mut registry, &header);
-        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.len(), 2);
         assert_eq!(
             registry[0].string.as_deref(),
             Some(r"\Storage Card\Example")
@@ -6880,6 +7189,27 @@ mod resource_destination_tests {
         assert!(!matches(r"\Games\Example", r"\Games\Example\..\Other"));
         assert!(!matches(r"\Games\Example", r"Games\Example"));
         assert!(!matches(r"\", r"\Games\Example"));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn executable_heap_inherits_and_round_trips_an_explicit_override() {
+    let mut config: LauncherConfig = serde_json::from_str("{}").unwrap();
+    let inherited: GameSettings = serde_json::from_str("{}").unwrap();
+    assert!(inherited.effective_executable_heap(&config));
+    config.executable_heap = false;
+    assert!(!inherited.effective_executable_heap(&config));
+
+    for enabled in [false, true] {
+        config.executable_heap = !enabled;
+        let game = GameSettings {
+            executable_heap: Some(enabled),
+            ..Default::default()
+        };
+        let restored: GameSettings =
+            serde_json::from_str(&serde_json::to_string(&game).unwrap()).unwrap();
+        assert_eq!(restored.effective_executable_heap(&config), enabled);
     }
 }
 
@@ -6941,4 +7271,66 @@ fn android_directional_control_size_is_global_and_round_trips() {
         .as_object()
         .unwrap()
         .contains_key("android_pocketpc_controls_size"));
+}
+
+#[test]
+fn intel2700g_compatibility_is_opt_in_and_round_trips() {
+    let mut config = LauncherConfig::default();
+    let mut old = serde_json::to_value(&config).unwrap();
+    old.as_object_mut()
+        .unwrap()
+        .remove("pocketpc_intel2700g_depth_bias");
+    assert!(
+        !serde_json::from_value::<LauncherConfig>(old)
+            .unwrap()
+            .pocketpc_intel2700g_depth_bias
+    );
+    config.pocketpc_intel2700g_depth_bias = true;
+    let restored: LauncherConfig =
+        serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+    assert!(restored.pocketpc_intel2700g_depth_bias);
+    assert_eq!(
+        restored.gles_internal_resolution,
+        config.gles_internal_resolution
+    );
+    assert_eq!(restored.gpu_renderer, config.gpu_renderer);
+}
+
+#[test]
+fn pocketpc_nv_combiners_preserve_default_and_round_trip_disabled() {
+    let mut config = LauncherConfig::default();
+    assert!(config.pocketpc_nv_combiners);
+    let mut old = serde_json::to_value(&config).unwrap();
+    old.as_object_mut().unwrap().remove("pocketpc_nv_combiners");
+    assert!(
+        serde_json::from_value::<LauncherConfig>(old)
+            .unwrap()
+            .pocketpc_nv_combiners
+    );
+    config.pocketpc_nv_combiners = false;
+    let restored: LauncherConfig =
+        serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+    assert!(!restored.pocketpc_nv_combiners);
+    assert_eq!(
+        restored.pocketpc_intel2700g_depth_bias,
+        config.pocketpc_intel2700g_depth_bias
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn egl_format_profile_defaults_off_and_round_trips_independently() {
+    let inherited: GameSettings = serde_json::from_str("{}").unwrap();
+    assert!(!inherited.pocketpc_egl_rgba8888_only);
+    for enabled in [false, true] {
+        let settings = GameSettings {
+            pocketpc_egl_rgba8888_only: enabled,
+            pocketpc_gapi_columns: true,
+            gpu_renderer: Some(false),
+            ..Default::default()
+        };
+        let restored: GameSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored, settings);
+    }
 }

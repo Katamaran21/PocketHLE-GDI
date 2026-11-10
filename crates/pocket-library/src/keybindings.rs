@@ -80,11 +80,16 @@ pub enum GuestButton {
     PocketPcApp2,
     PocketPcApp3,
     PocketPcApp4,
+    /// Host-only quick stylus tap, consumed before the guest key path.
+    CenterTap,
+    RotateScreen,
+    Screenshot,
+    StylusClick,
 }
 
 impl GuestButton {
     /// Every button, in the order the settings UI lists them.
-    pub const ALL: [GuestButton; 20] = [
+    pub const ALL: [GuestButton; 24] = [
         GuestButton::DpadUp,
         GuestButton::DpadDown,
         GuestButton::DpadLeft,
@@ -105,9 +110,13 @@ impl GuestButton {
         GuestButton::PocketPcApp2,
         GuestButton::PocketPcApp3,
         GuestButton::PocketPcApp4,
+        GuestButton::CenterTap,
+        GuestButton::RotateScreen,
+        GuestButton::Screenshot,
+        GuestButton::StylusClick,
     ];
 
-    /// The virtual-key code this button sends into the guest.
+    /// Guest VK for device buttons, or a host-command tag consumed by frontends.
     pub fn vk(self) -> u16 {
         match self {
             GuestButton::DpadUp => vk::UP,
@@ -131,6 +140,10 @@ impl GuestButton {
             GuestButton::PocketPcApp2 => 0xC2,
             GuestButton::PocketPcApp3 => 0xC3,
             GuestButton::PocketPcApp4 => 0xC4,
+            GuestButton::CenterTap => crate::center_tap::COMMAND,
+            GuestButton::RotateScreen => ROTATION_COMMAND,
+            GuestButton::Screenshot => SCREENSHOT_COMMAND,
+            GuestButton::StylusClick => STYLUS_CLICK_COMMAND,
         }
     }
 
@@ -150,19 +163,24 @@ impl GuestButton {
             GuestButton::GizPiano1 => "Gizmondo Home (Piano 1)",
             GuestButton::GizPiano2 => "Gizmondo Volume (Piano 2)",
             GuestButton::GizPiano3 => "Gizmondo Brightness (Piano 3)",
-            GuestButton::GizPiano4 => "Gizmondo Alert (Piano 4)",
+            GuestButton::GizPiano4 => "Gizmondo Geofence (Piano 4)",
             GuestButton::GizPiano5 => "Gizmondo Power (Piano 5)",
             GuestButton::PocketPcApp1 => "Pocket PC hardware button 1",
             GuestButton::PocketPcApp2 => "Pocket PC hardware button 2",
             GuestButton::PocketPcApp3 => "Pocket PC hardware button 3",
             GuestButton::PocketPcApp4 => "Pocket PC hardware button 4",
+            GuestButton::CenterTap => "Center tap",
+            GuestButton::RotateScreen => "Rotation",
+            GuestButton::Screenshot => "Screenshot",
+            GuestButton::StylusClick => "Stylus click / mode",
         }
     }
 
     /// Host keys bound to this button out of the box.
     ///
-    /// Defaults shared by PocketPC and the Gizmondo skin. The guest VKs stay
-    /// compatible with GAPI; only the host-side shortcuts are user preferences.
+    /// Legacy base map kept compatible with persisted configurations. Effective
+    /// per-device defaults come from `keyboard_button_for_profile`; frontend
+    /// short/long profile assignments take precedence over that fallback.
     pub fn default_keys(self) -> &'static [&'static str] {
         match self {
             // Defaults are chosen for the Gizmondo skin while retaining the
@@ -187,9 +205,27 @@ impl GuestButton {
             GuestButton::PocketPcApp1
             | GuestButton::PocketPcApp2
             | GuestButton::PocketPcApp3
-            | GuestButton::PocketPcApp4 => &[],
+            | GuestButton::PocketPcApp4
+            | GuestButton::CenterTap
+            | GuestButton::RotateScreen
+            | GuestButton::Screenshot
+            | GuestButton::StylusClick => &[],
         }
     }
+}
+
+/// Physical F7-F12 belong to the frontend, never to a guest binding.
+/// This does not reserve guest VK_F11 (Gizmondo Power), which other host keys can send.
+pub const ROTATION_COMMAND: u16 = 0x1001;
+pub const SCREENSHOT_COMMAND: u16 = 0x1002;
+pub const STYLUS_CLICK_COMMAND: u16 = 0x1003;
+pub const STYLUS_RELEASE_COMMAND: u16 = 0x1004;
+
+pub fn reserved_host_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_uppercase().as_str(),
+        "F7" | "F8" | "F9" | "F10" | "F11" | "F12"
+    )
 }
 
 /// Whether two stored host-key names refer to the same key.
@@ -265,6 +301,9 @@ impl KeyBindings {
     pub fn set_keys(&mut self, button: GuestButton, keys: Vec<String>) {
         let mut deduped: Vec<String> = Vec::with_capacity(keys.len());
         for key in keys {
+            if reserved_host_key(&key) {
+                continue;
+            }
             if !deduped.iter().any(|k| keys_match(k, &key)) {
                 deduped.push(key);
             }
@@ -306,6 +345,9 @@ impl KeyBindings {
     /// The button a host key produces, if any. This is the lookup the
     /// desktop launcher's keyboard handler does on every key event.
     pub fn button_for_key(&self, key: &str) -> Option<GuestButton> {
+        if reserved_host_key(key) {
+            return None;
+        }
         self.bindings
             .iter()
             .find(|b| b.keys.iter().any(|k| keys_match(k, key)))
@@ -339,6 +381,18 @@ impl KeyBindings {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn host_function_keys_are_never_guest_bindings_even_in_legacy_json() {
+        let mut keys = super::KeyBindings::default();
+        for name in ["F7", "F8", "F9", "F10", "F11", "F12"] {
+            keys.bind(super::GuestButton::Action, name);
+            assert_eq!(keys.vk_for_key(name), None);
+            let raw = format!(r#"[{{"button":"action","keys":["{name}"]}}]"#);
+            let old: super::KeyBindings = serde_json::from_str(&raw).unwrap();
+            assert_eq!(old.vk_for_key(name), None);
+        }
+        assert_eq!(keys.vk_for_key("F5"), Some(0x7a)); // Guest Power/VK_F11 remains available.
+    }
+    #[test]
     fn pocket_pc_buttons_do_not_steal_legacy_bindings_and_survive_settings() {
         let mut bindings = super::KeyBindings::default();
         let before: Vec<_> = super::GuestButton::ALL[..16]
@@ -352,12 +406,12 @@ mod tests {
         for button in super::GuestButton::ALL[16..].iter() {
             assert!(bindings.keys_for(*button).is_empty());
         }
-        bindings.bind(super::GuestButton::PocketPcApp3, "F8");
-        bindings.bind(super::GuestButton::PocketPcApp4, "F9");
+        bindings.bind(super::GuestButton::PocketPcApp3, "F6");
+        bindings.bind(super::GuestButton::PocketPcApp4, "J");
         let json = serde_json::to_string(&bindings).unwrap();
         let restored: super::KeyBindings = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.vk_for_key("F8"), Some(0xc3));
-        assert_eq!(restored.vk_for_key("F9"), Some(0xc4));
+        assert_eq!(restored.vk_for_key("F6"), Some(0xc3));
+        assert_eq!(restored.vk_for_key("J"), Some(0xc4));
         let mut pad = super::xbox_gamepad_bindings();
         pad.insert("South".into(), super::GuestButton::PocketPcApp3);
         let json = serde_json::to_string(&pad).unwrap();
@@ -472,11 +526,7 @@ fn xbox_gamepad_bindings() -> std::collections::BTreeMap<String, GuestButton> {
 }
 
 pub fn default_gamepad_bindings() -> std::collections::BTreeMap<String, GuestButton> {
-    if cfg!(feature = "steam-deck") {
-        steam_deck_gamepad_bindings()
-    } else {
-        xbox_gamepad_bindings()
-    }
+    steam_deck_gamepad_bindings()
 }
 
 pub fn steam_deck_gamepad_bindings() -> std::collections::BTreeMap<String, GuestButton> {
@@ -489,20 +539,17 @@ pub fn steam_deck_gamepad_bindings() -> std::collections::BTreeMap<String, Guest
     bindings
 }
 
-/// Desktop launchers share the Deck layout. Upgrade only known factory
-/// maps; Android's defaults and explicitly customized maps stay untouched.
-pub fn migrate_desktop_gamepad_layout(
+/// Upgrade the old standard-PC factory map to the shared controller layout;
+/// explicitly customized maps stay untouched.
+pub fn migrate_legacy_pc_gamepad_layout(
     bindings: &mut std::collections::BTreeMap<String, GuestButton>,
     fullscreen: &mut Option<String>,
 ) -> bool {
-    let legacy_pc = *bindings == xbox_gamepad_bindings();
-    let mut legacy_deck = steam_deck_gamepad_bindings();
-    legacy_deck.insert("Start".into(), GuestButton::GizPiano1);
-    if !legacy_pc && *bindings != legacy_deck {
+    if *bindings != xbox_gamepad_bindings() {
         return false;
     }
     *bindings = steam_deck_gamepad_bindings();
-    if (legacy_pc && fullscreen.is_none()) || fullscreen.as_deref() == Some("LeftTrigger") {
+    if fullscreen.is_none() || fullscreen.as_deref() == Some("LeftTrigger") {
         *fullscreen = Some("Select".into());
     }
     true
@@ -513,116 +560,99 @@ pub fn migrate_desktop_gamepad_layout(
 pub fn steam_deck_guest_button(control: &str, gizmondo: bool) -> Option<GuestButton> {
     use GuestButton::*;
     if gizmondo {
-        return (control == "LeftTrigger").then_some(GizPiano2);
+        return match control {
+            "LeftTrigger" => Some(GizPiano2),
+            "Misc1" => Some(RotateScreen),
+            _ => None,
+        };
     }
     match control {
+        "Misc1" => Some(RotateScreen),
+        "Mode" => Some(Soft1),
         "LeftTrigger" => Some(PocketPcApp1),   // L1 = P1
         "RightTrigger" => Some(PocketPcApp2),  // R1 = P2
         "LeftTrigger2" => Some(PocketPcApp3),  // L2 = P3
         "RightTrigger2" => Some(PocketPcApp4), // R2 = P4
         "LeftThumb" => Some(Soft2),            // L3 = ESC (VK_ESCAPE)
-        "RightThumb" => Some(Action),          // R3 = Action (VK_RETURN)
-        "South" => Some(ButtonA),
+        "RightThumb" => None,                  // Reserved stylus mode/click control.
+        "South" => Some(Action),
         "East" => Some(ButtonB),
         "West" => Some(ButtonC),
-        "North" => Some(Soft1), // TAB
+        "North" => Some(ButtonA),
         _ => None,
     }
 }
 
-/// Recognize either Steam Deck FN/system button as an EXIT long-press source,
-/// but *only* in PocketPC mode. The launcher event loop must still measure the
-/// hold duration and invoke its existing EXIT action; this keybinding module
-/// does not receive key-down/key-up events or close the launcher itself.
-/// SDL Guide is normalized to Mode by our worker; also accept the raw name.
-/// Misc1 = right Quick Access (...), when SteamOS exposes it to SDL.
-pub fn steam_deck_pocketpc_fn_exit_control(control: &str, gizmondo: bool) -> bool {
-    !gizmondo && matches!(control, "Guide" | "Mode" | "Misc1")
-}
-
 /// Upgrade only the exact first factory Deck preset, preserving user mappings.
-pub fn migrate_steam_deck_gamepad_bindings(
-    bindings: &mut std::collections::BTreeMap<String, GuestButton>,
-) {
-    if !cfg!(feature = "steam-deck") {
-        return;
-    }
-    let mut previous = steam_deck_gamepad_bindings();
-    previous.insert("Start".into(), GuestButton::GizPiano1);
-    if *bindings == previous {
-        *bindings = steam_deck_gamepad_bindings();
-    }
-}
-
 /// Steam Deck View toggles host fullscreen in both UI and game.
 pub fn default_gamepad_fullscreen() -> Option<String> {
-    cfg!(feature = "steam-deck").then(|| "Select".to_owned())
-}
-
-/// Move the previous factory fullscreen shortcut; preserve other assignments.
-pub fn migrate_steam_deck_fullscreen(binding: &mut Option<String>) -> bool {
-    if cfg!(feature = "steam-deck") && binding.as_deref() == Some("LeftTrigger") {
-        *binding = default_gamepad_fullscreen();
-        true
-    } else {
-        false
-    }
+    Some("Select".to_owned())
 }
 
 #[cfg(test)]
 mod controller_tests {
+    #[test]
+    fn android_reference_fixture_matches_deck_factory() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../frontends/pocket-desktop/assets/input/deck-input-defaults.json"
+        ))
+        .unwrap();
+        for button in GuestButton::ALL {
+            let name = serde_json::to_value(button).unwrap();
+            assert_eq!(
+                fixture["vk_codes"][name.as_str().unwrap()].as_u64(),
+                Some(button.vk() as u64)
+            );
+        }
+        assert_eq!(
+            fixture["keyboard"],
+            serde_json::to_value(KeyBindings::default()).unwrap()
+        );
+        assert_eq!(
+            fixture["controller"],
+            serde_json::to_value(default_gamepad_bindings()).unwrap()
+        );
+        assert_eq!(
+            fixture["fullscreen"],
+            serde_json::to_value(default_gamepad_fullscreen()).unwrap()
+        );
+        for (name, button) in fixture["ppc_overrides"].as_object().unwrap() {
+            assert_eq!(
+                *button,
+                serde_json::to_value(steam_deck_guest_button(name, false)).unwrap()
+            );
+        }
+        for (name, button) in fixture["gizmondo_overrides"].as_object().unwrap() {
+            assert_eq!(
+                *button,
+                serde_json::to_value(steam_deck_guest_button(name, true)).unwrap()
+            );
+        }
+    }
+
     use super::*;
     #[test]
     fn desktop_factory_layout_migrates_and_keeps_explicit_customizations() {
         let mut pc = xbox_gamepad_bindings();
         let mut fullscreen = None;
-        assert!(migrate_desktop_gamepad_layout(&mut pc, &mut fullscreen));
+        assert!(migrate_legacy_pc_gamepad_layout(&mut pc, &mut fullscreen));
         assert_eq!(pc, steam_deck_gamepad_bindings());
         assert_eq!(fullscreen.as_deref(), Some("Select"));
-        assert!(!migrate_desktop_gamepad_layout(&mut pc, &mut fullscreen));
+        assert!(!migrate_legacy_pc_gamepad_layout(&mut pc, &mut fullscreen));
         fullscreen = None; // explicit disable after migration must remain disabled
-        assert!(!migrate_desktop_gamepad_layout(&mut pc, &mut fullscreen));
+        assert!(!migrate_legacy_pc_gamepad_layout(&mut pc, &mut fullscreen));
         assert_eq!(fullscreen, None);
         let mut custom = xbox_gamepad_bindings();
         custom.insert("Start".into(), GuestButton::ButtonA);
         let saved = custom.clone();
         fullscreen = Some("West".into());
-        assert!(!migrate_desktop_gamepad_layout(
+        assert!(!migrate_legacy_pc_gamepad_layout(
             &mut custom,
             &mut fullscreen
         ));
         assert_eq!(custom, saved);
         assert_eq!(fullscreen.as_deref(), Some("West"));
-        let mut old_deck = steam_deck_gamepad_bindings();
-        old_deck.insert("Start".into(), GuestButton::GizPiano1);
-        fullscreen = Some("LeftTrigger".into());
-        assert!(migrate_desktop_gamepad_layout(
-            &mut old_deck,
-            &mut fullscreen
-        ));
-        assert_eq!(old_deck, steam_deck_gamepad_bindings());
-        assert_eq!(fullscreen.as_deref(), Some("Select"));
     }
-    #[test]
-    fn legacy_fullscreen_moves_to_view_without_changing_custom_shortcuts() {
-        let mut legacy = Some("LeftTrigger".to_owned());
-        let changed = migrate_steam_deck_fullscreen(&mut legacy);
-        assert_eq!(changed, cfg!(feature = "steam-deck"));
-        assert_eq!(
-            legacy.as_deref(),
-            Some(if cfg!(feature = "steam-deck") {
-                "Select"
-            } else {
-                "LeftTrigger"
-            })
-        );
-        for binding in [None, Some("West".to_owned()), Some("Select".to_owned())] {
-            let mut saved = binding.clone();
-            assert!(!migrate_steam_deck_fullscreen(&mut saved));
-            assert_eq!(saved, binding);
-        }
-    }
-
     #[test]
     fn deck_pocketpc_keys_and_gizmondo_volume_are_separate() {
         use GuestButton::*;
@@ -632,11 +662,11 @@ mod controller_tests {
             ("LeftTrigger2", PocketPcApp3),
             ("RightTrigger2", PocketPcApp4),
             ("LeftThumb", Soft2),
-            ("RightThumb", Action),
-            ("South", ButtonA),
+            ("Mode", Soft1),
+            ("South", Action),
             ("East", ButtonB),
             ("West", ButtonC),
-            ("North", Soft1),
+            ("North", ButtonA),
         ] {
             assert_eq!(steam_deck_guest_button(control, false), Some(button));
             assert_eq!(
@@ -656,52 +686,15 @@ mod controller_tests {
             steam_deck_guest_button("LeftThumb", false).unwrap().vk(),
             0x1B
         );
-        assert_eq!(
-            steam_deck_guest_button("RightThumb", false).unwrap().vk(),
-            0x0D
-        );
-        assert_eq!(steam_deck_guest_button("North", false).unwrap().vk(), 0x09);
+        assert_eq!(steam_deck_guest_button("Mode", false).unwrap().vk(), 0x09);
+        assert_eq!(steam_deck_guest_button("North", false).unwrap().vk(), 0x11);
     }
 
     #[test]
-    fn deck_fn_long_press_exit_sources_are_pocketpc_only() {
-        assert!(steam_deck_pocketpc_fn_exit_control("Guide", false));
-        assert!(steam_deck_pocketpc_fn_exit_control("Mode", false));
-        assert!(steam_deck_pocketpc_fn_exit_control("Misc1", false));
-        assert!(!steam_deck_pocketpc_fn_exit_control("Guide", true));
-        assert!(!steam_deck_pocketpc_fn_exit_control("Mode", true));
-        assert!(!steam_deck_pocketpc_fn_exit_control("Misc1", true));
-        assert!(!steam_deck_pocketpc_fn_exit_control("Start", false));
-    }
-
-    #[test]
-    fn legacy_deck_factory_preset_migrates_without_overwriting_custom_controls() {
-        let current = steam_deck_gamepad_bindings();
-        let mut previous = current.clone();
-        previous.insert("Start".into(), GuestButton::GizPiano1);
-        migrate_steam_deck_gamepad_bindings(&mut previous);
-        if cfg!(feature = "steam-deck") {
-            assert_eq!(previous, current);
-        } else {
-            assert_eq!(previous.get("Start"), Some(&GuestButton::GizPiano1));
-        }
-        let mut custom = current.clone();
-        custom.insert("Start".into(), GuestButton::ButtonA);
-        let saved = custom.clone();
-        migrate_steam_deck_gamepad_bindings(&mut custom);
-        assert_eq!(custom, saved);
-    }
-
-    #[test]
-    fn build_defaults_are_scoped_to_the_deck_edition() {
+    fn build_defaults_match_the_deck_reference() {
         let config: crate::LauncherConfig = serde_json::from_str("{}").unwrap();
-        if cfg!(feature = "steam-deck") {
-            assert!(config.gamepad_toggles_fullscreen("Select"));
-            assert_eq!(config.gamepad_bindings, steam_deck_gamepad_bindings());
-        } else {
-            assert_eq!(config.gamepad_fullscreen, None);
-            assert_eq!(config.gamepad_bindings, xbox_gamepad_bindings());
-        }
+        assert!(config.gamepad_toggles_fullscreen("Select"));
+        assert_eq!(config.gamepad_bindings, steam_deck_gamepad_bindings());
     }
     #[test]
     fn xbox_deck_preset_separates_host_fullscreen_from_gizmondo_keys() {
@@ -800,5 +793,75 @@ mod controller_tests {
         let empty: crate::LauncherConfig =
             serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
         assert!(empty.gamepad_bindings.is_empty());
+    }
+}
+
+/// Profile-specific factory keyboard policy; explicit short/long profile overrides
+/// are resolved by the frontends before this shared fallback.
+pub fn keyboard_button_for_profile(
+    bindings: &KeyBindings,
+    key: &str,
+    gizmondo: bool,
+) -> Option<GuestButton> {
+    use GuestButton::*;
+    let button = bindings.button_for_key(key);
+    if gizmondo {
+        return button.filter(|b| {
+            !matches!(
+                b,
+                Turbo
+                    | PocketPcApp1
+                    | PocketPcApp2
+                    | PocketPcApp3
+                    | PocketPcApp4
+                    | CenterTap
+                    | StylusClick
+            )
+        });
+    }
+    if matches!(
+        button,
+        Some(GizPiano1 | GizPiano2 | GizPiano3 | GizPiano4 | GizPiano5)
+    ) {
+        return None;
+    }
+    match (key, button) {
+        (_, None | Some(StylusClick)) if key.eq_ignore_ascii_case("p") => Some(StylusClick),
+        ("Tab", None | Some(CenterTap)) => Some(CenterTap),
+        ("1", None | Some(Soft1 | PocketPcApp1)) => Some(PocketPcApp1),
+        ("2", None | Some(Soft2 | PocketPcApp2)) => Some(PocketPcApp2),
+        ("3", None | Some(PocketPcApp3)) => Some(PocketPcApp3),
+        ("4", None | Some(PocketPcApp4)) => Some(PocketPcApp4),
+        _ => button,
+    }
+}
+
+#[cfg(test)]
+mod keyboard_profile_tests {
+    use super::*;
+    #[test]
+    fn factory_keyboard_profiles_are_distinct_and_custom_keys_survive() {
+        let mut keys = KeyBindings::default();
+        for (key, button) in [
+            ("1", GuestButton::PocketPcApp1),
+            ("2", GuestButton::PocketPcApp2),
+            ("3", GuestButton::PocketPcApp3),
+            ("4", GuestButton::PocketPcApp4),
+        ] {
+            assert_eq!(keyboard_button_for_profile(&keys, key, false), Some(button));
+        }
+        for key in ["F1", "F2", "F3", "F4", "F5"] {
+            assert_eq!(keyboard_button_for_profile(&keys, key, false), None);
+        }
+        assert_eq!(keyboard_button_for_profile(&keys, "T", true), None);
+        assert_eq!(
+            keyboard_button_for_profile(&keys, "F3", true),
+            Some(GuestButton::GizPiano3)
+        );
+        keys.bind(GuestButton::Action, "1");
+        assert_eq!(
+            keyboard_button_for_profile(&keys, "1", false),
+            Some(GuestButton::Action)
+        );
     }
 }

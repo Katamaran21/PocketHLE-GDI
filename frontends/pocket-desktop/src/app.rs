@@ -2,6 +2,11 @@
 
 #[path = "stylus_controls_ui.rs"]
 mod stylus_controls_ui;
+#[path = "add_data_ui.rs"]
+mod add_data_ui;
+#[path = "add_data_prompt.rs"]
+mod add_data_prompt;
+use add_data_prompt::DataPrompt;
 #[path = "title_scroll.rs"]
 mod title_scroll;
 use pocket_library::stylus_grid::{ControlsMode, GridRouter, HostInput};
@@ -19,7 +24,8 @@ use pocket_library::{
     PreparedImport, RotationPref, ScreenPref,
 };
 
-use crate::runner::{FrameSnapshot, InputCommand, RunOutcome, Runner};
+use crate::runner::{FrameSnapshot, InputCommand, RunOutcome, Runner, SystemMediaView};
+use pocket_core::winceapi::SystemMediaCommand;
 
 #[derive(Clone)]
 struct TitleMarquee {
@@ -81,6 +87,7 @@ fn library_title(ui: &mut egui::Ui, game_id: &str, title: &str) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpscaleFilter {
+    None,
     Reconstruction,
     Smaa,
     SmaaSoft,
@@ -90,8 +97,14 @@ enum UpscaleFilter {
     Bilinear,
     Nearest,
 }
+const GAME_MENU_LABELS: [&str; 7] = [
+    "Information", "Play", "Rename...", "Settings", "Add/Replace Data", "Remove", "Game ID",
+];
+const EXECUTABLE_HEAP_HELP: &str = "Some games need this setting to start or run correctly. It can slow down other games. If a game runs slowly, try turning it off in that game’s settings.";
+
 impl UpscaleFilter {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
+        Self::None,
         Self::Reconstruction,
         Self::Smaa,
         Self::SmaaSoft,
@@ -103,6 +116,7 @@ impl UpscaleFilter {
     ];
     fn id(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Reconstruction => "reconstruction",
             Self::Smaa => "smaa",
             Self::SmaaSoft => "smaa_soft",
@@ -121,6 +135,7 @@ impl UpscaleFilter {
     }
     fn label(self) -> &'static str {
         match self {
+            Self::None => "No filter",
             Self::Reconstruction => "GPU reconstruction (sharp contours; GPU)",
             Self::Smaa => "SMAA + reconstruction (anti-aliasing; GPU)",
             Self::SmaaSoft => "SMAA + bilinear (very soft; GPU)",
@@ -129,6 +144,13 @@ impl UpscaleFilter {
             Self::Lanczos => "Lanczos (sharp; intensive)",
             Self::Bilinear => "Bilinear (soft; fast)",
             Self::Nearest => "Nearest (crisp pixels; fastest)",
+        }
+    }
+    fn toolbar_label(self) -> &'static str {
+        match self {
+            Self::None => "None", Self::Reconstruction => "Reconstruction", Self::Smaa => "SMAA",
+            Self::SmaaSoft => "SMAA soft", Self::Xbrz => "xBRZ ×3", Self::Bicubic => "Bicubic",
+            Self::Lanczos => "Lanczos", Self::Bilinear => "Bilinear", Self::Nearest => "Nearest",
         }
     }
     fn stepped(self, forward: bool) -> Self {
@@ -146,7 +168,7 @@ impl UpscaleFilter {
 
     fn gpu_filter(self) -> i32 {
         match self {
-            Self::Nearest => 0,
+            Self::None | Self::Nearest => 0,
             Self::Bilinear => 1,
             Self::Bicubic => 2,
             Self::Reconstruction => 3,
@@ -156,12 +178,7 @@ impl UpscaleFilter {
             Self::SmaaSoft => 7,
         }
     }
-    fn needs_gpu(self) -> bool {
-        matches!(
-            self,
-            Self::Reconstruction | Self::Smaa | Self::SmaaSoft | Self::Xbrz
-        )
-    }
+
     fn image_filter(self) -> image::imageops::FilterType {
         match self {
             Self::Reconstruction | Self::Smaa | Self::Xbrz | Self::Bicubic => {
@@ -169,8 +186,59 @@ impl UpscaleFilter {
             }
             Self::Lanczos => image::imageops::FilterType::Lanczos3,
             Self::Bilinear | Self::SmaaSoft => image::imageops::FilterType::Triangle,
-            Self::Nearest => image::imageops::FilterType::Nearest,
+            Self::None | Self::Nearest => image::imageops::FilterType::Nearest,
         }
+    }
+}
+
+/// Library window state is independent of temporary game sizing/fullscreen.
+#[derive(Clone, Copy, Debug)]
+struct LibraryViewport {
+    fullscreen: bool,
+    maximized: bool,
+    size: Option<Vec2>,
+    position: Option<Pos2>,
+}
+impl LibraryViewport {
+    fn capture(ctx: &egui::Context) -> Self {
+        ctx.input(|input| {
+            let viewport = input.viewport();
+            Self {
+                fullscreen: viewport.fullscreen.unwrap_or(false),
+                maximized: viewport.maximized.unwrap_or(false),
+                size: viewport.inner_rect.map(|rect| rect.size()),
+                position: viewport.outer_rect.map(|rect| rect.min),
+            }
+        })
+    }
+    /// Wait for native mode acknowledgements before requesting window geometry.
+    /// Resizing a still-fullscreen surface can leave a small backbuffer in a
+    /// fullscreen Windows window. Game F12 restore sizes must not compete here.
+    fn restore(self, ctx: &egui::Context) -> bool {
+        let actual = Self::capture(ctx);
+        if actual.fullscreen != self.fullscreen {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return false;
+        }
+        if self.fullscreen {
+            return true;
+        }
+        if actual.maximized != self.maximized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.maximized));
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return false;
+        }
+        if !self.maximized {
+            if let Some(position) = self.position {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+            }
+            if let Some(size) = self.size {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+        }
+        ctx.request_repaint();
+        true
     }
 }
 
@@ -185,24 +253,28 @@ impl UpscaleFilter {
 // `pocket_core::kernel::gapi` — the table `gx.dll`'s `GXGetDefaultKeys`
 // hands the guest — by `guest_button_vks_match_the_gapi_table` below.
 
+// Prefer retained GPU frames when the UI and guest contexts can share them.
+// Unsupported sharing and consumers requiring CPU pixels keep the CPU path.
+const SHARED_PRESENTATION_READY: bool = true;
+
 /// Top-level egui app.
 pub struct PocketLauncher {
-    icon_cache: std::collections::HashMap<String, egui::TextureHandle>,
-    screen_cache: std::collections::HashMap<String, (ScreenPref, (u32, u32))>,
+    icon_cache: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    game_card_metadata: std::collections::HashMap<String, (bool, Option<String>)>,
+    screen_cache: std::collections::HashMap<String, (ScreenPref, (u32, u32), Option<&'static str>)>,
     analysis_cache: std::collections::HashMap<String, GameAnalysis>,
-    gizmondo_skin: Option<egui::TextureHandle>,
     upscale_x2: bool,
     upscale_filter: UpscaleFilter,
-    deck_filter_notice: Option<(String, Instant)>,
+    control_notice: Option<(String, Instant)>,
     deck_menu_press: Option<(usize, Instant)>,
     deck_view_press: Option<(usize, Instant)>,
     /// PocketPC only: additional Steam / Quick Access FN buttons, when exposed by SDL.
-    deck_fn_press: std::collections::HashMap<(usize, String), Instant>,
-    deck_piano_release: Option<(usize, Instant)>,
-    upscale_window_size: Option<Vec2>,
-    console_fit_pending: bool,
-    library_window_size: Option<Vec2>,
+    library_viewport: LibraryViewport,
+    library_restore_pending: Option<LibraryViewport>,
+    game_viewport_active: bool,
+    menu_host_press: std::collections::HashMap<(usize, String), Instant>,
     display_fullscreen: bool,
+    startup_window: Option<bool>,
     fullscreen_window_size: Option<Vec2>,
     reconstruction: Option<std::sync::Arc<std::sync::Mutex<crate::reconstruction::Reconstruction>>>,
     screenshot: crate::screenshot::SharedScreenshot,
@@ -221,13 +293,19 @@ pub struct PocketLauncher {
     controller_ui: crate::controller_ui::Navigation,
     recordings_gallery: crate::recordings_gallery::Gallery,
     rename_draft: Option<(String, String, bool)>,
+    remove_game: Option<crate::remove_game::Prompt>,
+    add_data: Option<DataPrompt>,
+    data_game: Option<String>,
     demo_import: Option<(String, String)>,
     pending_import: Option<PreparedImport>,
+    pocketpc_import_options: std::collections::VecDeque<(String, bool)>,
     updating_import: bool,
     library_busy: bool,
     restore_archive: Option<std::path::PathBuf>,
     file_dialog: Option<crate::file_dialog::FileDialog>,
     pending_run: Option<GameEntry>,
+    ce_launch: crate::ce_launch::CeLaunch,
+    ce_profiles: crate::ce_launch::CeProfiles,
     colors_startup_prompt: Option<(
         GameEntry,
         Vec<pocket_library::ColorsLanguage>,
@@ -235,14 +313,17 @@ pub struct PocketLauncher {
     )>,
     colors_startup_notice: Option<(String, String)>,
     screen: Screen,
+    about_parent: Screen,
     runner: Runner,
+    shared_gpu_context: Option<pocket_core::winceapi::gles::ExternalGpuContext>,
+    run_thread: Option<std::thread::JoinHandle<()>>,
     events_rx: Receiver<UiEvent>,
     events_tx: Sender<UiEvent>,
     release_update: Option<pocket_library::updates::Update>,
     /// Live framebuffer updates streamed by [`Runner`] while a game
     /// is running. `Some` between [`Self::spawn_run`] and
     /// `UiEvent::RunFinished`; `None` otherwise.
-    frame_rx: Option<Receiver<FrameSnapshot>>,
+    frame_rx: Option<crate::latest_frame::Receiver<FrameSnapshot>>,
     gps_notice_rx: Option<Receiver<(f64, f64)>>,
     dependency_notice_rx: Option<Receiver<String>>,
     dependency_notice: Option<String>,
@@ -250,6 +331,8 @@ pub struct PocketLauncher {
     /// Channel for sending [`InputCommand`]s (taps / D-pad / stop)
     /// to the running emulator. Mirrors `frame_rx`.
     input_tx: Option<Sender<InputCommand>>,
+    system_media: SystemMediaView,
+    media_keys_down: [bool; 2],
     /// Which guest buttons are held right now, and by which input
     /// source, so we can fire the matching `WM_KEYUP` on release.
     held: HeldButtons,
@@ -258,11 +341,11 @@ pub struct PocketLauncher {
     gamepad_selected: Option<usize>,
     gamepad_error: Option<String>,
     gamepad_held: std::collections::HashMap<(usize, String), u16>,
-    gamepad_capture: Option<ControllerCapture>,
-    gamepad_last_input: Option<String>,
     /// `Some` while a stylus drag is in progress — carries the last
     /// reported game-space coordinates so we don't spam the guest
     /// with redundant events.
+    pending_binding_commands: std::cell::RefCell<Vec<u16>>,
+    center_tap: std::cell::RefCell<pocket_library::center_tap::CenterTap>,
     pointer_down_at: Option<(u16, u16)>,
     /// Game currently being launched, used as a status caption
     /// while the run is in progress.
@@ -274,10 +357,12 @@ pub struct PocketLauncher {
     config_draft: Option<LauncherConfig>,
     game_settings_draft: Option<(String, GameSettings)>,
     last_frame_texture: Option<egui::TextureHandle>,
+    uploaded_image_id: Option<u64>,
     /// Latest native guest framebuffer, retained for input and filtered screenshots.
     last_frame_snapshot: Option<FrameSnapshot>,
     last_frame_status: Option<String>,
     frame_stats: FrameStats,
+    rate_badge: Option<(Instant, String)>,
     /// How far the presented frame is turned. Initialised from the
     /// running game's persisted [`RotationPref`] and editable live on
     /// the Run screen, where a change is written straight back to the
@@ -288,15 +373,21 @@ pub struct PocketLauncher {
     running_game_id: Option<String>,
     /// True while the current title is a Gizmondo game.
     running_is_gizmondo: bool,
+    running_is_windows_ce: bool,
     /// Guest button waiting for the user to press the host key that
     /// should drive it, while the keybinding editor is in "press a
     /// key" mode.
-    binding_capture: Option<GuestButton>,
-    stylus_capture: Option<usize>,
+    input_gestures: pocket_library::input_gestures::GestureTracker,
+    input_gesture_clock: Instant,
+    input_controller: bool,
+    bindings_visual: crate::bindings_visual::Editor,
     stylus_keyboard: std::collections::HashSet<String>,
     stylus_gamepad: std::collections::HashMap<(usize, String), f32>,
     stylus_touch: [f32; 4],
     stylus_last: (i16, i16),
+    stylus_pointer: pocket_library::stylus::StylusPointer,
+    stylus_clock: Instant,
+    stylus_tick: Instant,
     steering_axes: (i16, i16),
     stylus_editor: Option<StylusEditor>,
     stylus_grid_router: GridRouter,
@@ -557,11 +648,13 @@ fn draw_gizmondo_sd(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Library,
+    WindowsCe,
     Settings,
     GizmondoOptions,
     PocketPcOptions,
     InputSettings,
     GameSettings,
+    About,
     Run,
 }
 
@@ -569,18 +662,12 @@ enum Screen {
 ///
 /// The on-screen pad and the physical keyboard can hold the same VK at
 /// the same time, so [`HeldButtons`] keeps one set per source.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ControllerCapture {
-    Guest(GuestButton),
-    Fullscreen,
-    Stylus(usize),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputSource {
     Keyboard,
     Pointer,
     Gamepad,
+    Gesture,
 }
 
 /// Which guest buttons are down, tracked per input source.
@@ -600,6 +687,7 @@ struct HeldButtons {
     keyboard: std::collections::HashSet<u16>,
     pointer: std::collections::HashSet<u16>,
     gamepad: std::collections::HashSet<u16>,
+    gesture: std::collections::HashSet<u16>,
 }
 
 impl HeldButtons {
@@ -608,6 +696,7 @@ impl HeldButtons {
             InputSource::Keyboard => &mut self.keyboard,
             InputSource::Pointer => &mut self.pointer,
             InputSource::Gamepad => &mut self.gamepad,
+            InputSource::Gesture => &mut self.gesture,
         }
     }
 
@@ -630,7 +719,7 @@ impl HeldButtons {
     }
 
     fn is_held(&self, vk: u16) -> bool {
-        self.keyboard.contains(&vk) || self.pointer.contains(&vk) || self.gamepad.contains(&vk)
+        self.keyboard.contains(&vk) || self.pointer.contains(&vk) || self.gamepad.contains(&vk) || self.gesture.contains(&vk)
     }
 
     fn is_held_by(&self, source: InputSource, vk: u16) -> bool {
@@ -638,6 +727,7 @@ impl HeldButtons {
             InputSource::Keyboard => self.keyboard.contains(&vk),
             InputSource::Pointer => self.pointer.contains(&vk),
             InputSource::Gamepad => self.gamepad.contains(&vk),
+            InputSource::Gesture => self.gesture.contains(&vk),
         }
     }
 
@@ -648,6 +738,7 @@ impl HeldButtons {
             .drain()
             .chain(self.pointer.drain())
             .chain(self.gamepad.drain())
+            .chain(self.gesture.drain())
             // A VK held on both at once must only be released once.
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
@@ -657,95 +748,94 @@ impl HeldButtons {
 
 #[derive(Debug)]
 pub enum UiEvent {
+    DataPrepared(Result<pocket_library::add_data::PreparedData, String>),
+    DataFinished(Result<String, String>),
     BackupFinished(Result<String, String>),
     ColorsUnlocked(Result<String, String>),
     ReleaseAvailable(pocket_library::updates::Update),
-    ImportFinished(Result<Vec<GameEntry>, String>),
+    ImportFinished(Result<ImportedGames, String>),
     ImportPrepared(PreparedImport),
     DemoSplitFinished(String, Result<Vec<GameEntry>, String>),
     RunFinished(RunOutcome),
 }
 
-#[derive(Debug, Clone)]
-struct FrameStats {
-    presentation_stats: Option<pocket_core::kernel::framebuffer::PresentationStats>,
-    fps: f32,
-    window_started_at: Option<Instant>,
-    window_frames: u32,
-    last_frame_at: Option<Instant>,
+#[derive(Debug)]
+pub struct ImportedGames {
+    entries: Vec<GameEntry>,
+    pocketpc_import_options: Vec<(String, bool)>,
 }
 
-impl Default for FrameStats {
-    fn default() -> Self {
+impl ImportedGames {
+    fn analyze(entries: Vec<GameEntry>, library: &Library, existing_ids: &[String]) -> Self {
+        let pocketpc_import_options = entries
+            .iter()
+            .filter(|game| !existing_ids.contains(&game.id) && !library.is_demo_card(&game.id))
+            .filter(|game| !is_gizmondo_game(game, library.root()))
+            .map(|game| {
+                let may_run_fast =
+                    crate::frame_pacing::may_run_fast(&game.executable_path(library.root()));
+                (game.id.clone(), may_run_fast)
+            })
+            .collect();
         Self {
-            presentation_stats: None,
-            fps: 0.0,
-            window_started_at: None,
-            window_frames: 0,
-            last_frame_at: None,
+            entries,
+            pocketpc_import_options,
         }
     }
 }
 
+/// Frontend draw completions, never guest submissions or queued uploads.
+#[derive(Debug, Clone, Default)]
+struct FrameStats {
+    state: std::sync::Arc<
+        std::sync::Mutex<(
+            Option<u64>,
+            pocket_core::kernel::framebuffer::PresentationStats,
+        )>,
+    >,
+}
 impl FrameStats {
     fn reset(&mut self) {
         *self = Self::default();
     }
-
-    fn record_frame(&mut self) {
-        let now = Instant::now();
-        self.last_frame_at = Some(now);
-        self.window_frames = self.window_frames.saturating_add(1);
-
-        let started_at = match self.window_started_at {
-            Some(t) => t,
-            None => {
-                self.window_started_at = Some(now);
-                now
-            }
-        };
-        let elapsed = now.duration_since(started_at);
-        if elapsed >= Duration::from_secs(1) {
-            self.fps = self.window_frames as f32 / elapsed.as_secs_f32();
-            self.window_frames = 0;
-            self.window_started_at = Some(now);
+    fn record_frame(&self, image_id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.0 != Some(image_id) {
+            state.0 = Some(image_id);
+            state.1.record_present();
         }
     }
-
     fn current_fps(&self) -> f32 {
-        if let Some(fps) = self
-            .presentation_stats
-            .as_ref()
-            .and_then(|stats| stats.fps())
-        {
-            return fps;
-        }
-        if self
-            .last_frame_at
-            .map(|t| t.elapsed() > Duration::from_secs(1))
-            .unwrap_or(true)
-        {
-            0.0
-        } else {
-            self.fps
-        }
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .fps()
+            .unwrap_or(0.0)
     }
 }
 
+/// CPU-owned capture data is detached from any UI share group.
+pub(crate) fn filtered_snapshot_image(
+    frame: &FrameSnapshot,
+    factor: u32,
+    filter: image::imageops::FilterType,
+) -> Result<image::RgbaImage, String> {
+    let frame = frame.cpu_only()?;
+    let source = image::RgbaImage::from_raw(frame.texture_width, frame.texture_height, frame.rgba)
+        .ok_or_else(|| "invalid RGBA framebuffer size".to_string())?;
+    if factor == 1 {
+        return Ok(source);
+    }
+    Ok(image::imageops::resize(
+        &source,
+        frame.texture_width * factor,
+        frame.texture_height * factor,
+        filter,
+    ))
+}
 impl PocketLauncher {
-    pub fn new(cc: &eframe::CreationContext<'_>, mut library: Library) -> Self {
-        let migrated = {
-            let config = library.config_mut();
-            pocket_library::keybindings::migrate_desktop_gamepad_layout(
-                &mut config.gamepad_bindings,
-                &mut config.gamepad_fullscreen,
-            )
-        };
-        if migrated {
-            if let Err(error) = library.save() {
-                log::warn!("Could not save controller layout migration: {error}");
-            }
-        }
+    pub fn new(cc: &eframe::CreationContext<'_>, library: Library) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(23, 25, 30);
         visuals.window_fill = Color32::from_rgb(41, 45, 54);
@@ -756,13 +846,12 @@ impl PocketLauncher {
         visuals.override_text_color = Some(Color32::from_rgb(230, 232, 237));
         cc.egui_ctx.set_visuals(visuals);
         let (tx, rx) = mpsc::channel();
+        let profile = library.profile();
         let updates_tx = tx.clone();
         let updates_ctx = cc.egui_ctx.clone();
         std::thread::spawn(move || {
             use pocket_library::updates::{self, Platform};
-            let platform = if cfg!(feature = "steam-deck") {
-                Platform::SteamDeck
-            } else if cfg!(windows) {
+            let platform = if cfg!(windows) {
                 Platform::Windows
             } else {
                 Platform::Linux
@@ -772,14 +861,32 @@ impl PocketLauncher {
                 updates_ctx.request_repaint();
             }
         });
-        let runner = Runner::new();
+        // CreationContext runs on the UI GL thread. The framework keeps its
+        // context alive until on_exit, where we close this capability and join
+        // the emulation worker before returning ownership to the framework.
+        let shared_gpu_context = if SHARED_PRESENTATION_READY {
+            cc.gl.as_ref().and_then(|_| unsafe {
+                match pocket_core::winceapi::gles::ExternalGpuContext::capture_current(){
+                    Ok(context)=>Some(context),
+                    Err(error)=>{log::warn!("UI GPU sharing capability unavailable; using CPU presentation: {error}");None}
+                }
+            })
+        } else {
+            None
+        };
+        let runner = Runner::new(profile);
+        runner.set_shared_context_source(shared_gpu_context.as_ref().map(|c| c.source()));
         runner.set_missing_api_logging(library.config().log_unimplemented_apis);
         let upscale_filter = UpscaleFilter::from_id(&library.config().upscale_filter);
         let library_gizmondo = library
             .games()
             .iter()
             .any(|g| is_gizmondo_game(g, library.root()));
+        let ce_launch = crate::ce_launch::CeLaunch::load(library.root());
+        let ce_profiles = crate::ce_launch::CeProfiles::load(library.root());
         Self {
+            ce_launch,
+            ce_profiles,
             library,
             library_tab: if library_gizmondo {
                 crate::deck_navigation::LibraryTab::Gizmondo
@@ -793,23 +900,28 @@ impl PocketLauncher {
             controller_ui: Default::default(),
             recordings_gallery: Default::default(),
             icon_cache: std::collections::HashMap::new(),
+            game_card_metadata: std::collections::HashMap::new(),
             screen_cache: std::collections::HashMap::new(),
             analysis_cache: std::collections::HashMap::new(),
-            gizmondo_skin: None,
             upscale_x2: false,
             upscale_filter,
-            deck_filter_notice: None,
+            control_notice: None,
             deck_menu_press: None,
             deck_view_press: None,
-            deck_fn_press: Default::default(),
-            deck_piano_release: None,
-            upscale_window_size: None,
-            console_fit_pending: false,
-            library_window_size: None,
+            library_viewport: LibraryViewport::capture(&cc.egui_ctx),
+            library_restore_pending: None,
+            game_viewport_active: false,
+            menu_host_press: Default::default(),
             display_fullscreen: false,
+            startup_window: None,
             fullscreen_window_size: None,
             reconstruction: cc.gl.as_ref().and_then(|gl| {
-                match crate::reconstruction::Reconstruction::new(gl) {
+                match crate::reconstruction::Reconstruction::new(
+                    gl,
+                    shared_gpu_context.as_ref().map(|c| c.consumer()),
+                    runner.shared_export_policy(),
+                    SHARED_PRESENTATION_READY,
+                ) {
                     Ok(renderer) => Some(std::sync::Arc::new(std::sync::Mutex::new(renderer))),
                     Err(error) => {
                         log::warn!("GPU reconstruction unavailable: {error}");
@@ -825,8 +937,12 @@ impl PocketLauncher {
             library_columns: 1,
             deck_nav_repeat: None,
             rename_draft: None,
+            remove_game: None,
+            add_data: None,
+            data_game: None,
             demo_import: None,
             pending_import: None,
+            pocketpc_import_options: Default::default(),
             updating_import: false,
             library_busy: false,
             restore_archive: None,
@@ -834,7 +950,10 @@ impl PocketLauncher {
             pending_run: None,
             colors_startup_prompt: None,
             screen: Screen::Library,
+            about_parent: Screen::Library,
             runner,
+            shared_gpu_context,
+            run_thread: None,
             events_rx: rx,
             events_tx: tx,
             release_update: None,
@@ -845,14 +964,16 @@ impl PocketLauncher {
             dependency_notice: None,
             gps_notice: None,
             input_tx: None,
+            system_media: SystemMediaView::default(),
+            media_keys_down: [false; 2],
             held: HeldButtons::default(),
-            gamepad_rx: crate::gamepad::start(cc.egui_ctx.clone()),
+            gamepad_rx: crate::gamepad::start(cc.egui_ctx.clone(), profile == pocket_library::LauncherProfile::SteamDeck),
             gamepad_devices: Vec::new(),
             gamepad_selected: None,
             gamepad_error: None,
             gamepad_held: Default::default(),
-            gamepad_capture: None,
-            gamepad_last_input: None,
+            pending_binding_commands: Default::default(),
+            center_tap: Default::default(),
             pointer_down_at: None,
             running_game: None,
             status: String::new(),
@@ -862,18 +983,26 @@ impl PocketLauncher {
             config_draft: None,
             game_settings_draft: None,
             last_frame_texture: None,
+            uploaded_image_id: None,
             last_frame_snapshot: None,
             last_frame_status: None,
             frame_stats: FrameStats::default(),
+            rate_badge: None,
             game_rotation: RotationPref::None,
             running_game_id: None,
             running_is_gizmondo: false,
-            binding_capture: None,
-            stylus_capture: None,
+            running_is_windows_ce: false,
+            input_gestures: Default::default(),
+            input_gesture_clock: Instant::now(),
+            input_controller: false,
+            bindings_visual: Default::default(),
             stylus_keyboard: Default::default(),
             stylus_gamepad: Default::default(),
             stylus_touch: [0.0; 4],
             stylus_last: (0, 0),
+            stylus_pointer: Default::default(),
+            stylus_clock: Instant::now(),
+            stylus_tick: Instant::now(),
             steering_axes: (0, 0),
             stylus_editor: None,
             stylus_grid_router: Default::default(),
@@ -914,8 +1043,8 @@ impl PocketLauncher {
                     update.version
                 ));
                 ui.add_space(12.0);
-                download |= crate::controller_ui::button(ui, "Download (Enter / A)").clicked();
-                dismiss |= crate::controller_ui::button(ui, "Later (Escape / B)").clicked();
+                download |= crate::controller_ui::button(ui, crate::controller_labels::text(ctx,"Download (Enter / {South})")).clicked();
+                dismiss |= crate::controller_ui::button(ui, crate::controller_labels::text(ctx,"Later (Escape / {East})")).clicked();
             });
         });
         if download {
@@ -929,8 +1058,63 @@ impl PocketLauncher {
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = self.frame_rx.as_ref() {
+            let native_wake = ctx.data(|data| {
+                data.get_temp::<std::sync::Arc<dyn Fn() + Send + Sync>>(egui::Id::new(
+                    "pockethle.native_image_wake",
+                ))
+            });
+            let ctx = ctx.clone();
+            rx.set_waker_once(std::sync::Arc::new(move || {
+                if let Some(wake) = native_wake.as_ref() {
+                    wake();
+                } else {
+                    ctx.request_repaint();
+                }
+            }));
+        }
         while let Ok(ev) = self.events_rx.try_recv() {
             match ev {
+                UiEvent::DataPrepared(result) => {
+                    self.controller_ui.stop_repeat();
+                    self.deck_library_actions.clear();
+                    self.library_busy = false;
+                    // Returning to the library during preparation cancels the
+                    // staged operation, including its automatic no-conflict commit.
+                    if self.data_game.take().is_none() {
+                        self.status = "Add/Replace Data cancelled.".into();
+                        continue;
+                    }
+                    match result {
+                        Ok(pending) if !pending.executables().is_empty() => {
+                            self.add_data = Some(DataPrompt::Executable(pending));
+                        }
+                        Ok(pending) => self.confirm_data(pending),
+                        Err(message) => {
+                            self.add_data = Some(DataPrompt::Notice {
+                                title: "Add/Replace Data failed",
+                                message,
+                            });
+                        }
+                    }
+                }
+                UiEvent::DataFinished(result) => {
+                    self.controller_ui.stop_repeat();
+                    self.deck_library_actions.clear();
+                    self.library_busy = false;
+                    let (title, message) = match result {
+                        Ok(message) => {
+                            self.analysis_cache.clear();
+                            self.game_card_metadata.clear();
+                            self.screen_cache.clear();
+                            self.icon_cache.clear();
+                            self.reload_library();
+                            ("Add/Replace Data complete", message)
+                        }
+                        Err(message) => ("Add/Replace Data failed", message),
+                    };
+                    self.add_data = Some(DataPrompt::Notice { title, message });
+                }
                 UiEvent::BackupFinished(result) => {
                     self.library_busy = false;
                     match result {
@@ -938,6 +1122,7 @@ impl PocketLauncher {
                             self.status = message;
                             self.reload_library();
                             self.icon_cache.clear();
+                            self.game_card_metadata.clear();
                             self.screen_cache.clear();
                             self.selected_game = None;
                         }
@@ -962,7 +1147,11 @@ impl PocketLauncher {
                     self.pending_import = Some(pending);
                     self.status = "Waiting for import confirmation...".into();
                 }
-                UiEvent::ImportFinished(Ok(entries)) => {
+                UiEvent::ImportFinished(Ok(ImportedGames {
+                    entries,
+                    pocketpc_import_options,
+                })) => {
+                    self.pocketpc_import_options.extend(pocketpc_import_options);
                     self.library_busy = false;
                     let updated = self.updating_import;
                     self.updating_import = false;
@@ -977,6 +1166,7 @@ impl PocketLauncher {
                     );
                     self.reload_library();
                     self.icon_cache.clear();
+                    self.game_card_metadata.clear();
                     if let Some(game) = entries.first() {
                         let (id, name) = (game.id.clone(), game.display_name.clone());
                         self.library_tab = if is_gizmondo_game(game, self.library.root()) {
@@ -1009,6 +1199,7 @@ impl PocketLauncher {
                     self.library_busy = false;
                     self.reload_library();
                     self.icon_cache.clear();
+                    self.game_card_metadata.clear();
                     match result {
                         Ok(entries) => {
                             self.status = format!("Imported {} separate games.", entries.len());
@@ -1023,17 +1214,30 @@ impl PocketLauncher {
                     }
                 }
                 UiEvent::RunFinished(outcome) => {
+                    if let Some(worker) = self.run_thread.take() {
+                        let _ = worker.join();
+                    }
                     self.last_frame_status = Some(outcome.summary.clone());
-                    if let Some(frame) = outcome.framebuffer {
-                        self.upload_frame_texture(ctx, &frame);
+                    // A finished game's final image is not displayed in the
+                    // library. Drop it and all UI-held sources before retirement.
+                    drop(outcome.framebuffer);
+                    self.last_frame_snapshot = None;
+                    self.last_frame_texture = None;
+                    self.uploaded_image_id = None;
+                    if let Some(renderer) = self.reconstruction.as_ref() {
+                        renderer
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .end_session();
                     }
                     self.status = outcome.summary;
                     self.frame_rx = None;
                     self.input_tx = None;
+                    self.system_media = SystemMediaView::default();
                     self.release_all_keys();
                     self.pointer_down_at = None;
                     self.running_game = None;
-                    if self.screen == Screen::Run && self.pending_run.is_none() {
+                    if self.game_viewport_active && self.pending_run.is_none() {
                         self.return_to_library(ctx);
                     }
                 }
@@ -1051,9 +1255,9 @@ impl PocketLauncher {
         // have produced since the last UI tick.
         let mut latest: Option<FrameSnapshot> = None;
         if let Some(rx) = self.frame_rx.as_ref() {
-            while let Ok(frame) = rx.try_recv() {
-                latest = Some(frame);
-            }
+            // The mailbox already discards superseded images on the producer.
+            // Take once: a fast producer must not keep the UI draining forever.
+            latest = rx.try_recv().ok();
         }
         if self.dependency_notice.is_none() {
             if let Some(rx) = &self.dependency_notice_rx {
@@ -1089,15 +1293,22 @@ impl PocketLauncher {
     }
 
     fn upload_frame_texture(&mut self, ctx: &egui::Context, frame: &FrameSnapshot) {
-        if !self.running_is_gizmondo
-            && self
+        if self
+            .last_frame_snapshot
+            .as_ref()
+            .map(|old| (old.width, old.height, old.texture_width, old.texture_height))
+            != Some((
+                frame.width,
+                frame.height,
+                frame.texture_width,
+                frame.texture_height,
+            ))
+        {
+            if self
                 .last_frame_snapshot
                 .as_ref()
-                .map(|old| (old.width, old.height))
-                != Some((frame.width, frame.height))
-        {
-            self.console_fit_pending = true;
-            if self.last_frame_snapshot.is_some() {
+                .is_some_and(|old| (old.width, old.height) != (frame.width, frame.height))
+            {
                 self.release_all_keys();
             }
         }
@@ -1112,8 +1323,6 @@ impl PocketLauncher {
         // Keep native pixels for input coordinates and rebuilding filtered images.
         self.last_frame_snapshot = Some(frame.clone());
         self.refresh_frame_texture(ctx, frame);
-        self.frame_stats.presentation_stats = Some(frame.presentation_stats.clone());
-        self.frame_stats.record_frame();
     }
 
     fn filtered_frame_image(
@@ -1121,30 +1330,31 @@ impl PocketLauncher {
         frame: &FrameSnapshot,
         factor: u32,
     ) -> Result<image::RgbaImage, String> {
-        let source = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba.clone())
-            .ok_or_else(|| "invalid RGBA framebuffer size".to_string())?;
-        if factor == 1 {
-            return Ok(source);
-        }
-        Ok(image::imageops::resize(
-            &source,
-            frame.width * factor,
-            frame.height * factor,
-            self.upscale_filter.image_filter(),
-        ))
+        filtered_snapshot_image(frame, factor, self.upscale_filter.image_filter())
     }
 
     fn refresh_frame_texture(&mut self, ctx: &egui::Context, frame: &FrameSnapshot) {
-        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        let smooth_scale = self.upscale_x2 || fullscreen;
+        let smooth_scale = !matches!(
+            self.upscale_filter,
+            UpscaleFilter::None | UpscaleFilter::Nearest
+        );
         if let Some(renderer) = self.reconstruction.as_ref() {
             renderer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .queue(frame, self.upscale_filter.gpu_filter());
         }
-        let gpu_scale =
-            self.reconstruction.is_some() && (fullscreen || self.upscale_filter.needs_gpu());
+        if self.reconstruction.is_some() {
+            if self.last_frame_texture.is_none() {
+                self.last_frame_texture = Some(ctx.load_texture(
+                    "pockethle-frame-ready",
+                    egui::ColorImage::new([1, 1], Color32::BLACK),
+                    egui::TextureOptions::NEAREST,
+                ));
+            }
+            return;
+        }
+        let gpu_scale = self.reconstruction.is_some();
         let factor = if smooth_scale && !gpu_scale { 2 } else { 1 };
         let source = match self.filtered_frame_image(frame, factor) {
             Ok(source) => source,
@@ -1167,6 +1377,7 @@ impl PocketLauncher {
         } else {
             self.last_frame_texture = Some(ctx.load_texture("pockethle-fb", img, options));
         }
+        self.uploaded_image_id = Some(frame.image_id);
     }
 
     fn set_upscale_x2(&mut self, ctx: &egui::Context, enabled: bool) {
@@ -1178,13 +1389,6 @@ impl PocketLauncher {
             self.send_input(InputEvent::PointerUp { x, y });
         }
         self.upscale_x2 = enabled;
-        self.console_fit_pending = true;
-        if enabled {
-            self.upscale_window_size =
-                ctx.input(|input| input.viewport().inner_rect.map(|r| r.size()));
-        } else if let Some(size) = self.upscale_window_size.take() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        }
         if let Some(frame) = self.last_frame_snapshot.clone() {
             self.refresh_frame_texture(ctx, &frame);
         }
@@ -1228,6 +1432,7 @@ impl PocketLauncher {
         if self.screen != Screen::Run || self.last_frame_snapshot.is_none() {
             return;
         }
+        recording.set_gizmondo(self.running_is_gizmondo);
         let directory = self.library.root().join("recordings");
         let result = std::fs::create_dir_all(&directory)
             .map_err(|e| e.to_string())
@@ -1264,6 +1469,7 @@ impl PocketLauncher {
             });
         match result {
             Ok(audio) => {
+                recording.set_gizmondo(self.running_is_gizmondo);
                 recording.set_touch_steering_enabled(self.touch_steering_enabled());
                 for vk in self
                     .held
@@ -1272,7 +1478,7 @@ impl PocketLauncher {
                     .chain(self.held.pointer.iter())
                     .chain(self.held.gamepad.iter())
                 {
-                    recording.observe(InputEvent::KeyDown { vk: *vk });
+                    if !matches!(*vk, pocket_library::center_tap::COMMAND | pocket_library::keybindings::ROTATION_COMMAND | pocket_library::keybindings::SCREENSHOT_COMMAND | pocket_library::keybindings::STYLUS_CLICK_COMMAND) { recording.observe(InputEvent::KeyDown { vk: *vk }); }
                 }
                 recording.observe(InputEvent::TouchSteeringPosition {
                     x: self.steering_axes.0,
@@ -1312,79 +1518,204 @@ impl PocketLauncher {
     }
 
     fn reload_library(&mut self) {
-        match Library::open(self.library.root()) {
+        match Library::open_with_profile(self.library.root(), self.library.profile()) {
             Ok(lib) => {
                 self.library = lib;
                 self.analysis_cache.clear();
+                self.screen_cache.clear();
             }
             Err(e) => self.status = format!("Could not reload library: {e}"),
         }
     }
 
     fn ui_top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("PocketHLE").on_hover_text("L3 (left-stick click) / F6: switch between toolbar and page");
-            ui.label(
-                RichText::new("Pocket PC / Windows Mobile launcher")
-                    .small()
-                    .color(Color32::from_gray(160)),
-            );
-            ui.add_space(16.0);
-            crate::controller_ui::menu_button(ui, "Game library", |ui| {
-                if crate::controller_ui::button(ui, "Open library").clicked() {
-                    self.return_to_library(ui.ctx()); ui.close_menu();
-                }
-                if crate::controller_ui::button(ui, "Import .CAB / .ZIP / .RAR…").clicked() {
-                    self.spawn_import_dialog(); ui.close_menu();
-                }
-                ui.separator();
-                let available = !self.library_busy && self.running_game.is_none() && self.pending_run.is_none();
-                if crate::controller_ui::add_enabled(ui, available, egui::Button::new("Save library backup (ZIP)…")).clicked() {
-                    self.spawn_backup_dialog(false); ui.close_menu();
-                }
-                if crate::controller_ui::add_enabled(ui, available, egui::Button::new("Restore library backup (ZIP)…")).clicked() {
-                    self.spawn_backup_dialog(true); ui.close_menu();
-                }
-                if !available { ui.label("Stop the game and finish imports before backing up or restoring."); }
-            });
-            crate::controller_ui::menu_button(ui, "Settings", |ui| self.ui_settings_menu(ui));
-            crate::controller_ui::menu_button(ui, "About", |ui| {
-                ui.label(format!("PocketHLE v{}",env!("CARGO_PKG_VERSION")));
-                crate::controller_ui::hyperlink_to(ui, "PocketHLE fork — guizmox", "https://github.com/guizmox/PocketHLE");
-                crate::controller_ui::hyperlink_to(ui, "Original project", "https://github.com/j92580498-max/PocketHLE");
-                ui.label("Windows and Linux share this desktop frontend.");
-            });
-            let can_screenshot = self.screen==Screen::Run && self.last_frame_snapshot.is_some();
-            if crate::controller_ui::add_enabled(ui, can_screenshot, egui::Button::new("Screenshot (F10)"))
-                .on_hover_text("Save the displayed game pixels, including filtering and rotation, without UI or black bars")
-                .clicked()
-            {
-                self.capture_screenshot();
+        use crate::toolbar_ui::{Action, State};
+        let selected = match self.screen {
+            Screen::Library | Screen::WindowsCe => Some(Action::Library),
+            Screen::Settings => Some(Action::Emulator),
+            Screen::GameSettings => Some(Action::Game),
+            Screen::PocketPcOptions => Some(Action::PocketPc),
+            Screen::GizmondoOptions => Some(Action::Gizmondo),
+            Screen::About => Some(Action::About),
+            Screen::InputSettings => Some(if self.input_controller {
+                Action::Controller
+            } else {
+                Action::Keyboard
+            }),
+            Screen::Run => None,
+        };
+        let (recording, encoding) = {
+            let r = self.recording.lock().unwrap_or_else(|e| e.into_inner());
+            (r.active(), r.busy())
+        };
+        let state = State {
+            version: env!("CARGO_PKG_VERSION"),
+            selected,
+            resume: self.running_game.is_some() && self.screen != Screen::Run,
+            import: !self.library_busy && self.file_dialog.is_none(),
+            backup: !self.library_busy && self.running_game.is_none() && self.pending_run.is_none(),
+            game: self
+                .running_game_id
+                .as_ref()
+                .or(self.selected_game.as_ref())
+                .is_some_and(|id| self.library.get(id).is_some()),
+            frame: self.last_frame_snapshot.is_some(),
+            capture: self.screen == Screen::Run && self.last_frame_snapshot.is_some(),
+            recording,
+            encoding,
+            upscale: self.upscale_x2,
+            fullscreen: ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false)),
+            filter: self.upscale_filter.toolbar_label(),
+            filter_help: self.upscale_filter.label(),
+            rotation: self.game_rotation.degrees(),
+        };
+        let output = crate::toolbar_ui::show(ui, &state);
+        if let Some(action) = output.action {
+            self.handle_toolbar_action(ui.ctx(), action);
+        }
+    }
+
+    fn handle_toolbar_action(&mut self, ctx: &egui::Context, action: crate::toolbar_ui::Action) {
+        use crate::toolbar_ui::Action;
+        match action {
+            Action::Library => self.return_to_library(ctx),
+            Action::Import => self.spawn_import_dialog(),
+            Action::Backup => self.spawn_backup_dialog(false),
+            Action::Restore => self.spawn_backup_dialog(true),
+            Action::Resume => {
+                self.release_all_keys();
+                self.screen = Screen::Run;
             }
-            let (active,busy)={let r=self.recording.lock().unwrap_or_else(|e|e.into_inner());(r.active(),r.busy())};
-            if crate::controller_ui::add_enabled(ui, active||(can_screenshot&&!busy),egui::Button::new(if active {"Stop video (F11)"} else if busy {"Saving video…"} else {"Record video (F11)"}))
-                .on_hover_text("Record the displayed game and its audio. Resizing starts a new video segment. Input indicators appear only in the recording.")
-                .clicked(){self.toggle_recording();}
+            Action::Game => {
+                let id = self
+                    .running_game_id
+                    .as_ref()
+                    .or(self.selected_game.as_ref());
+                let game = id.and_then(|id| self.library.get(id)).cloned();
+                if let Some(game) = game {
+                    self.release_all_keys();
+                    self.game_settings_draft = Some((game.id, game.settings));
+                    self.screen = Screen::GameSettings;
+                }
+            }
+            Action::Emulator
+            | Action::Keyboard
+            | Action::Controller
+            | Action::PocketPc
+            | Action::Gizmondo => {
+                self.release_all_keys();
+                self.config_draft = Some(self.settings_draft(ctx));
+                self.screen = match action {
+                    Action::Emulator => Screen::Settings,
+                    Action::PocketPc => Screen::PocketPcOptions,
+                    Action::Gizmondo => Screen::GizmondoOptions,
+                    _ => {
+                        self.input_controller = action == Action::Controller;
+                        self.bindings_visual.clear_live();
+                        Screen::InputSettings
+                    }
+                };
+            }
+            Action::About => {
+                if self.screen != Screen::About {
+                    self.about_parent = self.screen;
+                }
+                self.release_all_keys();
+                self.screen = Screen::About;
+            }
+            Action::Upscale => self.set_upscale_x2(ctx, !self.upscale_x2),
+            Action::Filter => self.cycle_deck_upscale_filter(ctx, true),
+            Action::Rotation => self.cycle_rotation(ctx),
+            Action::Fullscreen => {
+                let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                self.set_fullscreen(ctx, !full);
+            }
+            Action::Screenshot => self.capture_screenshot(),
+            Action::Recording => self.toggle_recording(),
+        }
+        ctx.request_repaint();
+    }
+
+    fn close_about(&mut self) {
+        self.screen = if self.about_parent == Screen::Run && self.running_game.is_none() {
+            Screen::Library
+        } else {
+            self.about_parent
+        };
+    }
+
+    fn ui_about(&mut self, ui: &mut egui::Ui) {
+        crate::controller_ui::page_scope(ui, "about_page", |ui| {
+            ScrollArea::vertical().show(ui, |ui| {
+                ui.heading(format!("PocketHLE v{}", env!("CARGO_PKG_VERSION")));
+                crate::controller_ui::hyperlink_to(
+                    ui, "PocketHLE GDI — Windows CE fork",
+                    "https://github.com/Katamaran21/PocketHLE-GDI",
+                );
+                crate::controller_ui::hyperlink_to(
+                    ui,
+                    "PocketHLE fork — guizmox",
+                    "https://github.com/guizmox/PocketHLE",
+                );
+                crate::controller_ui::hyperlink_to(
+                    ui,
+                    "Original project — j92580498-max",
+                    "https://github.com/j92580498-max/PocketHLE",
+                );
+                crate::controller_ui::hyperlink_to(
+                    ui,
+                    "GTShell support — Katamaran21",
+                    "https://github.com/Katamaran21/PocketHLE-GTShell",
+                );
+                ui.label("Windows and Linux share this desktop frontend.");
+                ui.separator();
+                ui.strong("Thanks");
+                egui::Grid::new("about_thanks")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        for names in [
+                            ["Nekomo", "OLego"],
+                            ["TimofeyLednev", "Benoît (FX-man)"],
+                            ["Jérôme (SoldatGG)", "Tim (Firefly)"],
+                            ["Marat", "torrenia"],
+                        ] {
+                            ui.label(names[0]);
+                            ui.label(names[1]);
+                            ui.end_row();
+                        }
+                    });
+                ui.separator();
+                if crate::controller_ui::button(ui, "Back").clicked() {
+                    self.close_about();
+                }
+                crate::controller_ui::scroll_focus(ui);
+            });
         });
-        ui.separator();
     }
 
     fn return_to_library(&mut self, ctx: &egui::Context) {
+        self.remove_game = None;
+        self.add_data = None;
+        self.data_game = None;
+        self.deck_library_actions.clear();
         self.pending_run = None;
         self.release_all_keys();
         if let Some(tx) = self.input_tx.as_ref() {
             let _ = tx.send(InputCommand::Stop);
         }
-        self.set_upscale_x2(ctx, false);
-        self.console_fit_pending = false;
-        if let Some(size) = self.library_window_size.take() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        }
+        // Reset image zoom without emitting an InnerSize while native
+        // fullscreen may still be active. Restore from the library snapshot.
+        self.upscale_x2 = false;
+        self.fullscreen_window_size = None;
+        self.library_restore_pending = Some(self.library_viewport);
+        self.game_viewport_active = false;
         self.screen = Screen::Library;
+        ctx.request_repaint();
     }
 
-    fn settings_draft(&mut self) -> LauncherConfig {
+    fn settings_draft(&mut self, ctx: &egui::Context) -> LauncherConfig {
         let mut draft = self.library.config().clone();
+        draft.fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
         for (file, platform) in [
             ("registry-pocketpc.json", &mut draft.device_platform_id),
             ("registry-gizmondo.json", &mut draft.gizmondo_platform_id),
@@ -1411,128 +1742,11 @@ impl PocketLauncher {
         draft
     }
 
-    fn ui_settings_menu(&mut self, ui: &mut egui::Ui) {
-        if self.running_game.is_some()
-            && self.screen != Screen::Run
-            && crate::controller_ui::button(ui, "Return to game").clicked()
-        {
-            self.screen = Screen::Run;
-            ui.close_menu();
-        }
-        ui.separator();
-        ui.add_enabled_ui(self.last_frame_snapshot.is_some(), |ui| {
-            let mut enabled = self.upscale_x2;
-            if crate::controller_ui::checkbox(ui, &mut enabled, "Upscale ×2").changed() {
-                self.set_upscale_x2(ui.ctx(), enabled);
-            }
-            crate::controller_ui::menu_button(ui, "Filter", |ui| {
-                let previous = self.upscale_filter;
-                for filter in UpscaleFilter::ALL {
-                    if crate::controller_ui::selectable_value(
-                        ui,
-                        &mut self.upscale_filter,
-                        filter,
-                        filter.label(),
-                    )
-                    .clicked()
-                    {
-                        ui.close_menu();
-                    }
-                }
-                if previous != self.upscale_filter {
-                    self.library.config_mut().upscale_filter = self.upscale_filter.id().into();
-                    if let Err(e) = self.library.save() {
-                        self.status = format!("Could not save filter: {e}");
-                    }
-                    if let Some(frame) = self.last_frame_snapshot.clone() {
-                        self.refresh_frame_texture(ui.ctx(), &frame);
-                    }
-                }
-            });
-        });
-        ui.add_enabled_ui(self.last_frame_snapshot.is_some(), |ui| {
-            crate::controller_ui::menu_button(ui, "Rotation", |ui| {
-                let mut rotation = self.game_rotation;
-                for choice in RotationPref::ALL {
-                    if crate::controller_ui::selectable_value(
-                        ui,
-                        &mut rotation,
-                        choice,
-                        choice.label(),
-                    )
-                    .clicked()
-                    {
-                        ui.close_menu();
-                    }
-                }
-                if rotation != self.game_rotation {
-                    self.release_all_keys();
-                    self.game_rotation = rotation;
-                    self.persist_rotation(rotation);
-                    if !self.running_is_gizmondo {
-                        self.console_fit_pending = true;
-                    }
-                }
-            });
-        });
-        ui.separator();
-        let game_id = self
-            .running_game_id
-            .clone()
-            .or_else(|| self.selected_game.clone());
-        let game = game_id.and_then(|id| self.library.games().iter().find(|g| g.id == id).cloned());
-        if crate::controller_ui::add_enabled(ui, game.is_some(), egui::Button::new("Game options…"))
-            .clicked()
-        {
-            if let Some(game) = game {
-                self.release_all_keys();
-                self.game_settings_draft = Some((game.id, game.settings));
-                self.screen = Screen::GameSettings;
-                ui.close_menu();
-            }
-        }
-        if crate::controller_ui::button(ui, "Emulator Settings").clicked() {
-            self.release_all_keys();
-            self.config_draft = Some(self.settings_draft());
-            self.screen = Screen::Settings;
-            ui.close_menu();
-        }
-        if crate::controller_ui::button(ui, "Keyboard & Controller").clicked() {
-            self.release_all_keys();
-            self.gamepad_capture = None;
-            self.binding_capture = None;
-            self.stylus_capture = None;
-            self.config_draft = Some(self.settings_draft());
-            self.screen = Screen::InputSettings;
-            ui.close_menu();
-        }
-        if crate::controller_ui::button(ui, "PocketPC options").clicked() {
-            self.release_all_keys();
-            self.config_draft = Some(self.settings_draft());
-            self.screen = Screen::PocketPcOptions;
-            ui.close_menu();
-        }
-        if crate::controller_ui::button(ui, "Gizmondo options").clicked() {
-            self.release_all_keys();
-            self.gamepad_capture = None;
-            self.binding_capture = None;
-            self.stylus_capture = None;
-            self.config_draft = Some(self.settings_draft());
-            self.screen = Screen::GizmondoOptions;
-            ui.close_menu();
-        }
-        if crate::controller_ui::button(ui, "Fullscreen (F12)").clicked() {
-            let fullscreen = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
-            self.set_fullscreen(ui.ctx(), !fullscreen);
-            ui.close_menu();
-        }
-    }
-
     fn ui_library(&mut self, ui: &mut egui::Ui) {
         let all: Vec<GameEntry> = self.library.games().to_vec();
         let (gizmondo, pocketpc): (Vec<_>, Vec<_>) = all
             .into_iter()
-            .partition(|g| is_gizmondo_game(g, self.library.root()));
+            .partition(|g| self.cached_game_card_metadata(g).0);
         let previous_tab = self.library_tab;
         ui.horizontal(|ui| {
             crate::controller_ui::selectable_value(
@@ -1553,6 +1767,7 @@ impl PocketLauncher {
                 crate::deck_navigation::LibraryTab::Recordings,
                 "Recordings",
             );
+            if crate::controller_ui::button(ui,"Windows CE…").clicked() { self.screen = Screen::WindowsCe; }
         });
         if self.library_tab != previous_tab {
             self.game_menu = None;
@@ -1582,7 +1797,7 @@ impl PocketLauncher {
         }
         if !self.gamepad_devices.is_empty() {
             ui.label(
-                "D-pad / stick: select • A: play • L1/L2/R1/R2: tabs • Y: game options • Start: settings",
+                crate::controller_labels::text(ui.ctx(), "D-pad / stick: select • {South}: play • Shoulders / triggers: tabs • {North}: game options"),
             );
         }
         if games.is_empty() {
@@ -1629,7 +1844,7 @@ impl PocketLauncher {
                         }
                         direction => {
                             if let Some(next) =
-                                crate::deck_navigation::menu_index(*selection, direction, 6)
+                                crate::deck_navigation::menu_index(*selection, direction, GAME_MENU_LABELS.len())
                             {
                                 *selection = next;
                             }
@@ -1698,6 +1913,48 @@ impl PocketLauncher {
         });
     }
 
+    fn ui_windows_ce(&mut self, ui: &mut egui::Ui) {
+        use crate::ce_launch::Action;
+        match self.ce_launch.ui(ui, &self.ce_profiles) {
+            Some(Action::SaveProfile) => {
+                if let Err(error) = self.ce_profiles.remember(self.library.root(), &mut self.ce_launch)
+                    .and_then(|()| self.ce_launch.save(self.library.root())) {
+                    self.import_error_title = "Windows CE profile";
+                    self.import_error = Some(format!("{error:#}"));
+                }
+            }
+            Some(Action::PickExecutable) => {
+                self.library_busy = true;
+                let directory = std::path::Path::new(&self.ce_launch.executable).parent().map(std::path::Path::to_path_buf);
+                self.open_file_dialog(crate::file_dialog::Purpose::CeExecutable,directory,String::new());
+            }
+            Some(Action::PickImage) => {
+                self.library_busy = true;
+                let directory = (!self.ce_launch.image_root.trim().is_empty()).then(||std::path::PathBuf::from(&self.ce_launch.image_root));
+                self.open_file_dialog(crate::file_dialog::Purpose::CeImage,directory,String::new());
+            }
+            Some(Action::PickData) => {
+                self.library_busy = true;
+                let directory = (!self.ce_launch.data_dir.trim().is_empty()).then(||std::path::PathBuf::from(&self.ce_launch.data_dir));
+                self.open_file_dialog(crate::file_dialog::Purpose::CeData,directory,String::new());
+            }
+            Some(Action::Run) => {
+                let result = (|| {
+                    if !self.ce_launch.profile_name.trim().is_empty() { self.ce_profiles.remember(self.library.root(), &mut self.ce_launch)?; }
+                    let game = self.ce_launch.entry()?;
+                    self.ce_launch.save(self.library.root())?;
+                    Ok::<_, anyhow::Error>(game)
+                })();
+                match result {
+                    Ok(game) => self.spawn_run_selected(&game),
+                    Err(error) => { self.import_error_title = "Windows CE launch"; self.import_error = Some(format!("{error:#}")); }
+                }
+            }
+            Some(Action::Back) => self.screen = Screen::Library,
+            None => {}
+        }
+    }
+
     fn ui_game_information(&mut self, ctx: &egui::Context) {
         let Some(game) = self
             .information_game
@@ -1716,7 +1973,7 @@ impl PocketLauncher {
             (bounds.width() - 24.0).clamp(1.0, 560.0),
             (bounds.height() - 60.0).clamp(1.0, 540.0),
         );
-        egui::Window::new("Informations")
+        egui::Window::new("Information")
             .id(egui::Id::new("game_information"))
             .open(&mut open)
             .constrain_to(bounds)
@@ -1729,11 +1986,46 @@ impl PocketLauncher {
         }
     }
 
+    fn cached_game_card_metadata(&mut self, game: &GameEntry) -> (bool, Option<String>) {
+        self.game_card_metadata
+            .entry(game.id.clone())
+            .or_insert_with(|| {
+                (
+                    is_gizmondo_game(game, self.library.root()),
+                    game_gizmondo_title_id(game, self.library.root()),
+                )
+            })
+            .clone()
+    }
+
+    fn cached_game_icon(
+        &mut self,
+        ctx: &egui::Context,
+        game: &GameEntry,
+    ) -> Option<(egui::TextureId, Vec2)> {
+        let texture = self.icon_cache.entry(game.id.clone()).or_insert_with(|| {
+            let path = game.icon_path(self.library.root())?;
+            let bytes = std::fs::read(path).ok()?;
+            let image = load_image_bytes(&bytes).ok()?;
+            Some(ctx.load_texture(
+                format!("icon-{}", game.id),
+                image,
+                egui::TextureOptions::LINEAR,
+            ))
+        });
+        texture
+            .as_ref()
+            .map(|texture| (texture.id(), texture.size_vec2()))
+    }
+
     fn ui_game_card(&mut self, ui: &mut egui::Ui, game: &GameEntry, size: Vec2, selected: bool) {
         let (card_rect, card_response) = ui.allocate_exact_size(size, Sense::click());
         if selected && self.deck_scroll_selection {
             ui.scroll_to_rect(card_rect, Some(egui::Align::Center));
             self.deck_scroll_selection = false;
+        }
+        if !ui.is_rect_visible(card_rect) {
+            return;
         }
         let stroke = if selected {
             egui::Stroke::new(2.0_f32, Color32::from_rgb(95, 170, 225))
@@ -1771,19 +2063,11 @@ impl PocketLauncher {
             let mut chosen = None;
             egui::popup_below_widget(ui, popup_id, &menu_response, |ui| {
                 ui.set_min_width(170.0);
-                for (index, label) in [
-                    "Informations",
-                    "Play",
-                    "Rename...",
-                    "Settings",
-                    "Remove",
-                    "Game ID",
-                ]
-                .into_iter()
-                .enumerate()
+                for (index, label) in GAME_MENU_LABELS.into_iter().enumerate()
                 {
-                    if ui.selectable_label(index == selection, label).clicked()
-                        || (activate && index == selection)
+                    let enabled = index != 4 || (self.running_game.is_none() && self.pending_run.is_none());
+                    if (ui.add_enabled(enabled, egui::SelectableLabel::new(index == selection, label)).clicked()
+                        || (activate && index == selection)) && enabled
                     {
                         chosen = Some(index);
                     }
@@ -1809,13 +2093,17 @@ impl PocketLauncher {
                         self.screen = Screen::GameSettings;
                     }
                     4 => {
-                        if let Err(e) = self.library.remove(&game.id) {
-                            self.status = format!("Remove failed: {e}");
-                        } else {
-                            self.status = format!("Removed {}", game.display_name);
-                        }
+                        self.data_game = Some(game.id.clone());
+                        self.open_file_dialog(crate::file_dialog::Purpose::AddData, None, String::new());
                     }
                     5 => {
+                        self.remove_game=Some(crate::remove_game::Prompt {id:game.id.clone(),name:game.display_name.clone()});
+                        self.deck_library_actions.clear();
+                        self.deck_nav_repeat=None;
+                        self.game_menu=None;
+                        self.game_menu_parent=None;
+                    }
+                    6 => {
                         ui.ctx().output_mut(|o| o.copied_text = game.id.clone());
                         self.game_id_popup = Some(game.id.clone());
                     }
@@ -1831,31 +2119,10 @@ impl PocketLauncher {
             Pos2::new(card_rect.left(), card_rect.top() + 4.0),
             Vec2::new(size.x, 126.0),
         );
-        let giz = is_gizmondo_game(game, self.library.root());
+        let (giz, title_id) = self.cached_game_card_metadata(game);
         if giz {
-            let title_id = game_gizmondo_title_id(game, self.library.root());
             let artwork = if game.icon.as_deref() == Some(std::path::Path::new("cartridge.png")) {
-                if let Some(path) = game.icon_path(self.library.root()) {
-                    if let Ok(bytes) = std::fs::read(path) {
-                        if let Ok(image) = load_image_bytes(&bytes) {
-                            let texture =
-                                self.icon_cache.entry(game.id.clone()).or_insert_with(|| {
-                                    ui.ctx().load_texture(
-                                        format!("cartridge-{}", game.id),
-                                        image,
-                                        egui::TextureOptions::LINEAR,
-                                    )
-                                });
-                            Some((texture.id(), texture.size_vec2()))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                self.cached_game_icon(ui.ctx(), game)
             } else {
                 None
             };
@@ -1880,20 +2147,7 @@ impl PocketLauncher {
                 device.max - Vec2::new(8.0, 24.0),
             );
             painter.rect_filled(screen, 3.0, Color32::from_rgb(38, 61, 80));
-            let artwork = game
-                .icon_path(self.library.root())
-                .and_then(|path| std::fs::read(path).ok())
-                .and_then(|bytes| load_image_bytes(&bytes).ok())
-                .map(|image| {
-                    let texture = self.icon_cache.entry(game.id.clone()).or_insert_with(|| {
-                        ui.ctx().load_texture(
-                            format!("icon-{}", game.id),
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        )
-                    });
-                    (texture.id(), texture.size_vec2())
-                });
+            let artwork = self.cached_game_icon(ui.ctx(), game);
             if let Some((texture, size)) = artwork {
                 let available = screen.shrink(5.0).size();
                 let scale = (available.x / size.x).min(available.y / size.y);
@@ -1939,26 +2193,37 @@ impl PocketLauncher {
             label_rect.shrink2(Vec2::new(10.0, 7.0)),
             egui::Layout::top_down(egui::Align::Min),
         );
+        text_ui.spacing_mut().item_spacing.y = 1.0;
         library_title(&mut text_ui, &game.id, &game.display_name);
-        let (width, height) = match self.screen_cache.get(&game.id) {
-            Some((pref, size)) if *pref == game.settings.screen => *size,
+        let ((width, height), graphics_api) = match self.screen_cache.get(&game.id) {
+            Some((pref, size, api)) if *pref == game.settings.screen => (*size, *api),
             _ => {
                 let size = game.resolved_screen_size(self.library.root());
+                let api = pocket_library::analysis::detect_graphics_api(
+                    &game.executable_path(self.library.root()),
+                );
                 self.screen_cache
-                    .insert(game.id.clone(), (game.settings.screen, size));
-                size
+                    .insert(game.id.clone(), (game.settings.screen, size, api));
+                (size, api)
             }
         };
-        let caption = format!(
-            "{} • {width}×{height}",
-            if giz { "GIZMONDO" } else { "POCKET PC / WINCE" }
-        );
+        let caption = match graphics_api {
+            Some(api) => format!("{width}×{height} • {api}"),
+            None => format!("{width}×{height}"),
+        };
         text_ui.label(
             RichText::new(caption)
                 .size(12.0)
                 .color(Color32::from_gray(185)),
         );
-        if let Some(id) = game_gizmondo_title_id(game, self.library.root()) {
+        if game.settings.has_custom_settings(self.library.config()) {
+            text_ui.label(
+                RichText::new("Custom settings")
+                    .size(11.0)
+                    .color(Color32::from_rgb(215, 181, 116)),
+            );
+        }
+        if let Some(id) = title_id {
             text_ui.label(
                 RichText::new(id)
                     .monospace()
@@ -2044,12 +2309,16 @@ impl PocketLauncher {
         }
         if pending.updates().is_empty() {
             let pending = self.pending_import.take().unwrap();
+            let profile = self.library.profile();
             let root = self.library.root().to_path_buf();
             let tx = self.events_tx.clone();
             self.status = "Importing...".into();
             std::thread::spawn(move || {
-                let result = Library::open(root)
-                    .and_then(|mut lib| lib.apply_prepared_import(pending, false))
+                let result = Library::open_with_profile(root, profile)
+                    .and_then(|mut lib| {
+                        let entries = lib.apply_prepared_import(pending, false)?;
+                        Ok(ImportedGames::analyze(entries, &lib, &[]))
+                    })
                     .map_err(|e| e.to_string());
                 let _ = tx.send(UiEvent::ImportFinished(result));
             });
@@ -2091,17 +2360,75 @@ impl PocketLauncher {
             self.status = "Import cancelled.".into();
         } else if update {
             let pending = self.pending_import.take().unwrap();
+            let profile = self.library.profile();
             let root = self.library.root().to_path_buf();
             let tx = self.events_tx.clone();
             self.updating_import = true;
             self.status = "Updating game files...".into();
             std::thread::spawn(move || {
-                let result = Library::open(root)
-                    .and_then(|mut lib| lib.apply_prepared_import(pending, true))
+                let result = Library::open_with_profile(root, profile)
+                    .and_then(|mut lib| {
+                        let existing_ids: Vec<_> =
+                            lib.games().iter().map(|game| game.id.clone()).collect();
+                        let entries = lib.apply_prepared_import(pending, true)?;
+                        Ok(ImportedGames::analyze(entries, &lib, &existing_ids))
+                    })
                     .map_err(|e| e.to_string());
                 let _ = tx.send(UiEvent::ImportFinished(result));
             });
         }
+    }
+
+    fn ui_pocketpc_import_options(&mut self, ctx: &egui::Context) -> bool {
+        if self.screen != Screen::Library || self.rename_draft.is_some() {
+            return false;
+        }
+        let Some((id, may_run_fast)) = self.pocketpc_import_options.front() else {
+            return false;
+        };
+        let Some(game) = self.library.games().iter().find(|game| &game.id == id) else {
+            self.pocketpc_import_options.pop_front();
+            ctx.request_repaint();
+            return false;
+        };
+        self.deck_nav_repeat = None;
+        let mut open_settings = self.deck_library_actions.iter().any(|c| c == "East")
+            || ctx.input(|i| i.key_pressed(egui::Key::B));
+        let mut dismiss = self.deck_library_actions.iter().any(|c| c == "South")
+            || ctx.input(|i| i.key_pressed(egui::Key::A));
+        self.deck_library_actions.clear();
+        self.controller_ui.stop_repeat();
+        crate::controller_ui::claim_modal_input(ctx);
+        egui::CentralPanel::default().show(ctx, |_| {});
+        egui::Window::new("PocketPC display settings")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.strong(&game.display_name);
+                ui.label("PocketPC games were designed for different screen sizes and orientations. If the game appears sideways, stretched, or cut off, you can adjust Screen and Rotate display in its launch settings.");
+                if *may_run_fast {
+                    ui.label("This game may run too fast at higher frame rates. If that happens, try setting an FPS limit in the same settings.");
+                }
+                ui.label("Would you like to open the launch settings now?");
+                ui.horizontal(|ui| {
+                    dismiss |= crate::controller_ui::button(ui, crate::controller_labels::text(ctx, "Not Now ({South})")).clicked();
+                    open_settings |= crate::controller_ui::button(ui, crate::controller_labels::text(ctx, "Settings ({East})")).clicked();
+                });
+                ui.weak("Keyboard: A = Not Now · B = Settings");
+            });
+        if open_settings {
+            self.selected_game = Some(game.id.clone());
+            self.game_settings_draft = Some((game.id.clone(), game.settings.clone()));
+            self.screen = Screen::GameSettings;
+        }
+        if open_settings || dismiss {
+            self.pocketpc_import_options.pop_front();
+            ctx.request_repaint();
+        }
+        self.controller_ui.show(ctx);
+        true
     }
 
     fn ui_demo_import(&mut self, ctx: &egui::Context) {
@@ -2123,10 +2450,11 @@ impl PocketLauncher {
             self.demo_import = None;
             self.library_busy = true;
             self.status = "Separating demo card games…".into();
+            let profile = self.library.profile();
             let root = self.library.root().to_path_buf();
             let tx = self.events_tx.clone();
             std::thread::spawn(move || {
-                let result = Library::open(root)
+                let result = Library::open_with_profile(root, profile)
                     .and_then(|mut library| library.split_demo_card(&id))
                     .map_err(|e| e.to_string());
                 let _ = tx.send(UiEvent::DemoSplitFinished(id, result));
@@ -2268,8 +2596,8 @@ impl PocketLauncher {
             "emulator_options_scroll"
         };
         ScrollArea::vertical().id_source(scroll_id).auto_shrink([false,false]).show(ui,|ui| {
-        ui.heading(if input { "Keyboard & Controller" } else if gizmondo { "Gizmondo options" } else if pocketpc { "PocketPC options" } else { "Emulator Settings" });
-        if input { self.ui_keybindings(ui, &mut draft); } else {
+        ui.heading(if input { if self.input_controller { "External controller bindings" } else { "Keyboard bindings" } } else if gizmondo { "Gizmondo options" } else if pocketpc { "PocketPC options" } else { "Emulator Settings" });
+        if input { self.ui_keybindings(ui, &mut draft);save_clicked |= self.bindings_visual.take_quick_save(); } else {
         if gizmondo {
         crate::controller_ui::checkbox(ui, &mut draft.gps_enabled, "GPS / host location (GPS1)")
             .on_hover_text("Allow games to read the host location service where available.");
@@ -2294,9 +2622,17 @@ impl PocketLauncher {
                     });
                 ui.end_row();
                 ui.label("");
-                ui.small("Identity reported to ARM PocketPC games; applies next launch. Does not change CPU speed or backend. MIPS games retain MIPS identity.");
+                ui.add(egui::Label::new("Identity reported to ARM PocketPC games; applies next launch. Does not change CPU speed or backend. MIPS games retain MIPS identity.").wrap(true));
                 ui.end_row();
         });
+        ui.separator();
+        ui.heading("Graphics compatibility");
+        crate::controller_ui::checkbox(ui, &mut draft.pocketpc_intel2700g_depth_bias,
+            "Intel 2700G depth-bias compatibility");
+        ui.add(egui::Label::new("Use if projected lights or ground decals show through foreground objects. Reproduces the original WinCE driver's integer constant bias without its slope term, with 24-bit depth. Applies to PocketPC games on the next launch, in software and GPU modes.").wrap(true));
+        crate::controller_ui::checkbox(ui, &mut draft.pocketpc_nv_combiners,
+            "NVIDIA GoForce 5500 AR10/AR11 combiners");
+        ui.add(egui::Label::new("Enable NVIDIA GoForce 5500 combiner programs for PocketPC games that request them. Applies on the next launch, in software and GPU modes.").wrap(true));
         } else {
         let library_root = self.library.root().display().to_string();
         ui.add_space(10.0);
@@ -2314,21 +2650,47 @@ impl PocketLauncher {
                         if crate::controller_ui::button(ui, "Choose GPU in Windows…").clicked() {
                             crate::host_gpu::open_settings();
                         }
-                        ui.small("Select this PocketHLE executable in Windows Graphics settings, choose a GPU, then restart PocketHLE. By default, PocketHLE lets the system choose the GPU.");
+                        ui.add(egui::Label::new("Select this PocketHLE executable in Windows Graphics settings, choose a GPU, then restart PocketHLE. By default, PocketHLE lets the system choose the GPU.").wrap(true));
                     });
                     ui.end_row();
                 }
-                ui.label("Anisotropic filtering (GPU only)");
+                ui.label("OpenGLES internal resolution (GPU only)");
                 ui.add_enabled_ui(draft.gpu_renderer, |ui| {
-                    crate::controller_ui::ComboBox::from_id_source("global_anisotropy")
-                        .selected_text(match draft.anisotropic_filtering { 2 => "2×", 4 => "4×", 8 => "8×", _ => "Off" })
+                    crate::controller_ui::ComboBox::from_id_source("gles_internal_resolution")
+                        .selected_text(match draft.gles_internal_resolution { 5 => "4x - only for 320x240 games", 4 => "3x - only for 320x240 games", 3 => "2x - only for 320x240 games", 2 => "2x - also for 640x480 games", _ => "Native (1×)" })
                         .show_ui(ui, |ui| {
-                            for (value, label) in [(0,"Off"),(2,"2×"),(4,"4×"),(8,"8×")] {
-                                crate::controller_ui::selectable_value(ui, &mut draft.anisotropic_filtering, value, label);
-                            }
+                            crate::controller_ui::selectable_value(ui, &mut draft.gles_internal_resolution, 1, "Native (1×)");
+                            crate::controller_ui::selectable_value(ui, &mut draft.gles_internal_resolution, 3, "2x - only for 320x240 games");
+                            crate::controller_ui::selectable_value(ui, &mut draft.gles_internal_resolution, 4, "3x - only for 320x240 games");
+                            crate::controller_ui::selectable_value(ui, &mut draft.gles_internal_resolution, 5, "4x - only for 320x240 games");
+                            crate::controller_ui::selectable_value(ui, &mut draft.gles_internal_resolution, 2, "2x - also for 640x480 games");
                         });
-                }).response.on_hover_text("Sharper textures at oblique angles. Limited by the GPU driver. Applies on the next launch.");
+                }).response.on_hover_text("Includes portrait equivalents (240x320 and 480x640). QVGA-only 2x/3x/4x modes leave larger surfaces native; the other 2x mode doubles them. Display zoom uses the rendered image; touch coordinates stay logical. More GPU/readback work; no extra detail for 2D assets. Applies next launch.");
                 ui.end_row();
+                ui.label("");
+                ui.add(egui::Label::new("2x/3x/4x increases the rendered resolution; display zoom then scales that image. Applies next launch.").wrap(true));
+                ui.end_row();
+                ui.label("VSync (PC / Steam Deck)");
+                crate::controller_ui::checkbox(ui, &mut draft.desktop_vsync, "Synchronize with the display");
+                ui.end_row();
+                ui.label("");
+                ui.add(egui::Label::new("Limits window presentation to the display refresh rate and prevents tearing. Restart PocketHLE after changing this setting.").wrap(true));
+                ui.end_row();
+                ui.label("Frame rate limit");
+                crate::controller_ui::ComboBox::from_id_source("global_frame_rate_limit")
+                    .selected_text(draft.frame_rate_limit.label())
+                    .show_ui(ui, |ui| {
+                        for value in pocket_library::FrameRateLimit::ALL {
+                            crate::controller_ui::selectable_value(ui, &mut draft.frame_rate_limit, value, value.label());
+                        }
+                    });
+                ui.end_row();
+                ui.label("");
+                ui.add(egui::Label::new("Default maximum game FPS. Games can inherit this limit or choose another value, including Unlimited. Applies next launch.").wrap(true));
+                ui.end_row();
+
+
+
 
 
         });
@@ -2381,8 +2743,23 @@ impl PocketLauncher {
                     self.set_fullscreen(ui.ctx(), draft.fullscreen);
                 }
                 ui.end_row();
-                ui.label("Show FPS in status bar");
+                ui.label("Show FPS on game screen");
                 crate::controller_ui::checkbox(ui, &mut draft.show_fps, "");
+                ui.end_row();
+                ui.label("Show IPS on game screen")
+                    .on_hover_text("Applies on next launch. Uses CPU pixel readback for OpenGL ES.");
+                crate::controller_ui::checkbox(ui, &mut draft.show_ips, "");
+                ui.end_row();
+                ui.label("Executable heap");
+                crate::controller_ui::ComboBox::from_id_source("emulator_executable_heap")
+                    .selected_text(if draft.executable_heap { "Enabled" } else { "Disabled" })
+                    .show_ui(ui, |ui| {
+                        crate::controller_ui::selectable_value(ui, &mut draft.executable_heap, true, "Enabled");
+                        crate::controller_ui::selectable_value(ui, &mut draft.executable_heap, false, "Disabled");
+                    });
+                ui.end_row();
+                ui.label("");
+                ui.add(egui::Label::new(EXECUTABLE_HEAP_HELP).wrap(true));
                 ui.end_row();
                 ui.label("Library root");
                 ui.label(library_root);
@@ -2410,21 +2787,7 @@ impl PocketLauncher {
         crate::controller_ui::text_edit(ui, platform, "");
         ui.label("Device names are encoded automatically. Changes apply at the next launch.");
         }
-        if !gizmondo && !pocketpc {
-        ui.add_space(10.0);
-        ui.separator();
-        ui.heading("Optimizations");
-        ui.small("Changes apply on the next game launch. These settings do not change the emulated CPU speed or FPS limit.");
-        crate::controller_ui::checkbox(ui, &mut draft.optimizations.fast_memory_access, "Fast memory access");
-        ui.small("Reduce overhead when writing to private RAM. Code invalidation, memory hooks and permissions remain active.");
-        crate::controller_ui::checkbox(ui, &mut draft.optimizations.extended_tlb_cache, "Extended memory translation cache");
-        ui.small("Remember more guest-to-host address translations to avoid repeated lookups. Uses additional host memory.");
-        crate::controller_ui::checkbox(ui, &mut draft.optimizations.responsive_scheduling, "Responsive thread scheduling");
-        ui.small("Resume ready guest workers sooner while the main thread waits for messages. Disable for compatibility comparisons.");
-        crate::controller_ui::checkbox(ui, &mut draft.optimizations.extended_jump_cache, "Extended jump cache");
-        ui.small("Remember more translated-code destinations to reduce jump lookups. Disabling restores the smaller active cache; allocated storage stays unchanged.");
-        ui.separator();
-        }
+
         }
         ui.add_space(12.0);
         ui.horizontal(|ui| {
@@ -2463,9 +2826,6 @@ impl PocketLauncher {
         }
         if save_clicked {
             self.release_all_keys();
-            self.gamepad_capture = None;
-            self.binding_capture = None;
-            self.stylus_capture = None;
             self.runner
                 .set_missing_api_logging(draft.log_unimplemented_apis);
             *self.library.config_mut() = draft;
@@ -2481,9 +2841,6 @@ impl PocketLauncher {
             };
         } else if cancel_clicked {
             self.stylus_editor = None;
-            self.gamepad_capture = None;
-            self.binding_capture = None;
-            self.stylus_capture = None;
             self.screen = if self.running_game.is_some() {
                 Screen::Run
             } else {
@@ -2494,361 +2851,124 @@ impl PocketLauncher {
         }
     }
 
-    /// Keyboard editor: one row per guest button, listing the host keys
-    /// bound to it with an ✕ to drop each and an "Add key" that waits
-    /// for the next key press.
-    ///
-    /// Edits land in `draft`, so they are only written to `config.json`
-    /// when the user saves the settings screen — and once written they
-    /// are what [`Self::handle_physical_keyboard`] reads on every key
-    /// event, which is what makes a rebind survive a restart.
+    /// One input-first assistant; the device picture and summary only inspect
+    /// bindings. Changes are persisted by Save or the assistant's Save and finish.
     fn ui_keybindings(&mut self, ui: &mut egui::Ui, draft: &mut LauncherConfig) {
-        ui.label(RichText::new("Keyboard & controller").strong());
-        ui.label(
-            RichText::new(
-                "Host keys for PocketPC and Gizmondo controls. Existing PocketPC buttons are reused \
-                 for their Gizmondo equivalents; only the five Gizmondo piano buttons are extra. \
-                 A key only ever drives one button, so rebinding it moves it from the old control.",
-            )
-            .small()
-            .color(Color32::from_gray(160)),
-        );
-        ui.add_space(6.0);
-
-        ui.label("Connect your controller by USB or pair it in the operating system's Bluetooth settings.");
-        if let Some(error) = &self.gamepad_error {
-            ui.colored_label(
-                Color32::LIGHT_RED,
-                format!("Controller input unavailable: {error}"),
-            );
+        self.bindings_visual.profile(ui);
+        self.bindings_visual
+            .quick_assign(ui, draft, self.input_controller);
+        if self.bindings_visual.quick_active() {
+            ui.set_enabled(false);
         }
-        if self.gamepad_devices.is_empty() {
-            ui.label("No controller detected.");
-        } else {
-            let old = self.gamepad_selected;
-            crate::controller_ui::ComboBox::from_id_source("selected_controller")
-                .selected_text(
-                    self.gamepad_devices
-                        .iter()
-                        .find(|(id, _)| Some(*id) == old)
-                        .map(|(_, name)| name.as_str())
-                        .unwrap_or("Controller"),
-                )
-                .show_ui(ui, |ui| {
-                    for (id, name) in &self.gamepad_devices {
-                        crate::controller_ui::selectable_value(
-                            ui,
-                            &mut self.gamepad_selected,
-                            Some(*id),
-                            name,
-                        );
-                    }
-                });
-            if old != self.gamepad_selected {
-                self.deck_nav_repeat = None;
-                self.deck_menu_press = None;
-                self.deck_view_press = None;
-                self.deck_fn_press.clear();
-                let keys: Vec<_> = self.gamepad_held.keys().cloned().collect();
-                for key in keys {
-                    self.release_gamepad_control(&key);
-                }
-            }
-        }
-        ui.label(format!(
-            "Last controller input: {}",
-            self.gamepad_last_input
-                .as_deref()
-                .unwrap_or("waiting for a button / stick…")
-        ));
-
-        if !ui.ctx().input(|i| i.viewport().focused.unwrap_or(true)) {
-            ui.colored_label(
-                Color32::YELLOW,
-                "Window inactive: controller assignment is paused.",
-            );
-        }
-
-        // Copied out so the closures below can mutate the capture state
-        // without holding a second borrow of `self`.
-        let mut capture = self.binding_capture;
-        let mut reset_clicked = false;
-
-        // A capture is armed: the next key press the window sees becomes
-        // the binding. Read the events directly rather than waiting for
-        // a widget to be focused, because the key the user wants may be
-        // one egui would otherwise treat as navigation (Tab, arrows).
-        if let Some(button) = capture {
-            let captured = ui.ctx().input(|input| {
-                input.events.iter().find_map(|event| match event {
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        repeat: false,
-                        ..
-                    } => Some(*key),
-                    _ => None,
-                })
-            });
-            if let Some(key) = captured {
-                draft.keybindings.bind(button, key.name());
-                capture = None;
-            }
-        }
-
-        // Bound assignment columns keep long lists from growing the grid or
-        // wrapping key names between the removal and capture buttons.
-        let assignment_width = ((ui.available_width() - 125.0) / 2.0).clamp(120.0, 280.0);
-        egui::Grid::new("keybindings_grid")
-            .num_columns(3)
-            .spacing(Vec2::new(12.0, 10.0))
-            .show(ui, |ui| {
-                ui.label(RichText::new("Control").strong());
-                ui.label(RichText::new("Keyboard").strong());
-                ui.label(RichText::new("Controller").strong());
-                ui.end_row();
-                for (index, button) in GuestButton::ALL.into_iter().enumerate() {
-                    let section = match index {
-                        0 => Some("Shared controls — Pocket PC and Gizmondo"),
-                        10 => Some("Emulator shortcuts"),
-                        11 => Some("Gizmondo only — console system buttons"),
-                        16 => Some("Pocket PC only — hardware buttons"),
-                        _ => None,
-                    };
-                    if let Some(section) = section {
-                        ui.label(RichText::new(section).strong());
-                        ui.label("");
-                        ui.label("");
-                        ui.end_row();
-                    }
-                    ui.add(egui::Label::new(button.label()).wrap(false));
-                    let keys: Vec<String> = draft.keybindings.keys_for(button).to_vec();
-                    ui.vertical(|ui| {
-                        egui::ScrollArea::horizontal()
-                            .id_source(("keyboard_assignments", button.label()))
-                            .max_width(assignment_width)
-                            .min_scrolled_width(assignment_width)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.set_min_height(ui.spacing().interact_size.y);
-                                    if keys.is_empty() {
-                                        ui.label(
-                                            RichText::new("unbound")
-                                                .small()
-                                                .color(Color32::from_gray(140)),
-                                        );
-                                    }
-                                    for key in &keys {
-                                        ui.add(
-                                            egui::Label::new(RichText::new(key).monospace())
-                                                .wrap(false),
-                                        );
-                                        if crate::controller_ui::small_button(ui, "✕")
-                                            .on_hover_text(format!("Remove {key}"))
-                                            .clicked()
-                                        {
-                                            draft.keybindings.unbind(button, key);
-                                        }
-                                    }
-                                });
-                            });
-                        if capture == Some(button) {
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new("press a key…")
-                                            .small()
-                                            .color(Color32::LIGHT_BLUE),
-                                    )
-                                    .wrap(false),
-                                );
-                                if crate::controller_ui::small_button(ui, "Cancel").clicked() {
-                                    capture = None;
-                                }
-                            });
-                        } else if crate::controller_ui::button(ui, "Add key").clicked() {
-                            self.gamepad_capture = None;
-                            capture = Some(button);
-                        }
-                    });
-                    ui.vertical(|ui| {
-                        let controls: Vec<_> = draft
-                            .gamepad_bindings
-                            .iter()
-                            .filter(|(_, mapped)| **mapped == button)
-                            .map(|(control, _)| control.clone())
-                            .collect();
-                        egui::ScrollArea::horizontal()
-                            .id_source(("controller_assignments", button.label()))
-                            .max_width(assignment_width)
-                            .min_scrolled_width(assignment_width)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.set_min_height(ui.spacing().interact_size.y);
-                                    if controls.is_empty() {
-                                        ui.label(
-                                            RichText::new("unbound")
-                                                .small()
-                                                .color(Color32::from_gray(140)),
-                                        );
-                                    }
-                                    for control in controls {
-                                        let label = crate::gamepad::label(&control);
-                                        ui.add(egui::Label::new(&label).wrap(false));
-                                        if crate::controller_ui::small_button(ui, "✕")
-                                            .on_hover_text(format!("Remove {label}"))
-                                            .clicked()
-                                        {
-                                            draft.gamepad_bindings.remove(&control);
-                                        }
-                                    }
-                                });
-                            });
-                        if self.gamepad_capture == Some(ControllerCapture::Guest(button)) {
-                            ui.add(egui::Label::new("Press a controller input…").wrap(false));
-                            if crate::controller_ui::small_button(ui, "Cancel controller").clicked()
-                            {
-                                self.gamepad_capture = None;
-                            }
-                        } else if crate::controller_ui::button(ui, "Add controller input").clicked()
-                        {
-                            self.gamepad_capture = Some(ControllerCapture::Guest(button));
-                            capture = None;
-                        }
-                    });
-                    ui.end_row();
-                }
-            });
-
-        ui.add_space(6.0);
-        {
-            ui.horizontal(|ui| {
-                ui.label("Controller fullscreen:");
-                ui.label(
-                    draft
-                        .gamepad_fullscreen
-                        .as_deref()
-                        .map(crate::gamepad::label)
-                        .unwrap_or_else(|| "disabled".into()),
+        let controller = self.input_controller;
+        if controller {
+            ui.separator();
+            ui.heading("Controller");
+            ui.label("Connect your controller by USB or pair it in the operating system's Bluetooth settings.");
+            if let Some(error) = &self.gamepad_error {
+                ui.colored_label(
+                    Color32::LIGHT_RED,
+                    format!("Controller input unavailable: {error}"),
                 );
-                if self.gamepad_capture == Some(ControllerCapture::Fullscreen) {
-                    ui.label("Press a controller input…");
-                    if crate::controller_ui::button(ui, "Cancel fullscreen assignment").clicked() {
-                        self.gamepad_capture = None;
+            }
+            if self.gamepad_devices.is_empty() {
+                ui.label("No controller detected.");
+            } else {
+                let old = self.gamepad_selected;
+                crate::controller_ui::ComboBox::from_id_source("selected_controller")
+                    .selected_text(
+                        self.gamepad_devices
+                            .iter()
+                            .find(|(id, _)| Some(*id) == old)
+                            .map(|(_, name)| name.as_str())
+                            .unwrap_or("Controller"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (id, name) in &self.gamepad_devices {
+                            crate::controller_ui::selectable_value(
+                                ui,
+                                &mut self.gamepad_selected,
+                                Some(*id),
+                                name,
+                            );
+                        }
+                    });
+                if old != self.gamepad_selected {
+                    if let Some(device)=self.gamepad_selected {crate::controller_labels::activate(ui.ctx(),device);}
+                    self.bindings_visual.clear_live();
+                    self.deck_nav_repeat = None;
+                    self.deck_menu_press = None;
+                    self.deck_view_press = None;
+                    let keys: Vec<_> = self.gamepad_held.keys().cloned().collect();
+                    for key in keys {
+                        self.release_gamepad_control(&key);
                     }
-                } else if crate::controller_ui::button(ui, "Assign fullscreen").clicked() {
-                    self.gamepad_capture = Some(ControllerCapture::Fullscreen);
-                    capture = None;
                 }
-                if crate::controller_ui::button(ui, "Disable fullscreen button").clicked() {
-                    draft.gamepad_fullscreen = None;
-                    if self.gamepad_capture == Some(ControllerCapture::Fullscreen) {
-                        self.gamepad_capture = None;
-                    }
-                }
-            });
-            ui.label("View tap toggles fullscreen in the UI and in game. PocketPC: View hold = exit, L3 = ESC, R3 = Action. Gizmondo: View hold = brightness; L1 = volume. Both: Menu / right FN tap = filter, hold = start/stop video. L1/L2/R1/R2 cycle catalogue tabs.");
-            if crate::controller_ui::button(ui, "Apply Steam Deck preset").clicked() {
-                draft.gamepad_bindings = pocket_library::keybindings::steam_deck_gamepad_bindings();
-                draft.gamepad_fullscreen = Some("Select".to_owned());
-                self.gamepad_capture = None;
+            }
+            if !ui.ctx().input(|i| i.viewport().focused.unwrap_or(true)) {
+                ui.colored_label(
+                    Color32::YELLOW,
+                    "Window inactive: controller assignment is paused.",
+                );
             }
         }
-        if crate::controller_ui::button(ui, "Reset keys to defaults").clicked() {
-            reset_clicked = true;
-        }
-        if reset_clicked {
-            draft.keybindings = pocket_library::KeyBindings::default();
-            capture = None;
-        }
-        ui.separator();
-        ui.heading("Pocket PC only — stylus stick");
-        crate::controller_ui::checkbox(
+        self.bindings_visual.show(ui, draft, controller);
+        if crate::controller_ui::button(
             ui,
-            &mut draft.stylus_stick.enabled,
-            "Enable stylus stick (right stick by default)",
-        );
-        ui.label("Emulates held-stylus drags; lifts and recentres at screen edges. Physical touch takes priority.");
-        let slider = ui.add(
-            egui::Slider::new(&mut draft.stylus_stick.speed, 30..=1200)
-                .text("Stylus speed (pixels/s)"),
-        );
-        crate::controller_ui::track_focus(ui, &slider);
-        if let Some(direction) = self.stylus_capture {
-            if let Some(key) = ui.ctx().input(|i| {
-                i.events.iter().find_map(|e| match e {
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        repeat: false,
-                        ..
-                    } => Some(*key),
-                    _ => None,
-                })
-            }) {
-                for names in &mut draft.stylus_stick.keyboard {
-                    names.retain(|n| !pocket_library::keybindings::keys_match(n, key.name()));
-                }
-                draft.stylus_stick.keyboard[direction].push(key.name().into());
-                self.stylus_capture = None;
+            if controller {
+                "Reset controller defaults"
+            } else {
+                "Reset keys to defaults"
+            },
+        )
+        .clicked()
+        {
+            let marker = if controller {
+                ":controller:"
+            } else {
+                ":keyboard:"
+            };
+            draft
+                .short_press_bindings
+                .retain(|key, _| !key.contains(marker));
+            draft
+                .long_press_bindings
+                .retain(|key, _| !key.contains(marker));
+            if controller {
+                draft.gamepad_bindings = pocket_library::keybindings::steam_deck_gamepad_bindings();
+                draft.gamepad_fullscreen = Some("Select".into());
+            } else {
+                draft.keybindings = pocket_library::KeyBindings::default();
             }
         }
-        egui::Grid::new("stylus_bindings").show(ui, |ui| {
-            for (i, name) in pocket_library::stylus::DIRECTIONS.iter().enumerate() {
-                ui.label(format!("Stylus {name}"));
-                ui.label(draft.stylus_stick.keyboard[i].join(", "));
-                if crate::controller_ui::button(
-                    ui,
-                    if self.stylus_capture == Some(i) {
-                        "Press a key…"
-                    } else {
-                        "Assign key"
-                    },
-                )
-                .clicked()
-                {
-                    self.stylus_capture = if self.stylus_capture == Some(i) {
-                        None
-                    } else {
-                        Some(i)
-                    };
-                    capture = None;
-                    self.gamepad_capture = None;
-                }
-                if crate::controller_ui::small_button(ui, "Clear key").clicked() {
-                    draft.stylus_stick.keyboard[i].clear();
-                    self.stylus_capture = None;
-                }
-                ui.label(draft.stylus_stick.controller[i].join(", "));
-                if crate::controller_ui::button(
-                    ui,
-                    if self.gamepad_capture == Some(ControllerCapture::Stylus(i)) {
-                        "Move controller…"
-                    } else {
-                        "Assign controller"
-                    },
-                )
-                .clicked()
-                {
-                    self.gamepad_capture =
-                        if self.gamepad_capture == Some(ControllerCapture::Stylus(i)) {
-                            None
-                        } else {
-                            Some(ControllerCapture::Stylus(i))
-                        };
-                    self.stylus_capture = None;
-                    capture = None;
-                }
-                if crate::controller_ui::small_button(ui, "Clear controller").clicked() {
-                    draft.stylus_stick.controller[i].clear();
-                    self.gamepad_capture = None;
-                }
-                ui.end_row();
+        if controller {
+            egui::CollapsingHeader::new("Controller shortcuts").show(ui, |ui| {
+                ui.colored_label(
+                    crate::bindings_visual::PURPLE,
+                    "View tap: fullscreen · Menu tap: next filter",
+                );
+                ui.colored_label(
+                    crate::bindings_visual::LONG_PRESS,
+                    "View hold: return to library · Menu hold: recording",
+                );
+                ui.label("Library shoulders / triggers: previous / next catalogue tab");
+            });
+        }
+        if !self.bindings_visual.is_gizmondo() {
+            ui.separator();
+            ui.heading("Stylus");
+            if controller {
+                ui.label("Double-click R3 to switch stylus mode. Stick: automatic drags, single click unused. Pointer: move the cursor, single click to tap. Right stick and R3 are reserved.");
+            } else {
+                ui.label("Stylus click / mode: P by default. Double-press to switch mode; single press taps in Pointer mode. Reassign this key and stylus directions with Assign an input. Current stylus keys cannot be used in per-game grids.");
             }
-        });
-        self.binding_capture = capture;
+            let slider = ui.add(
+                egui::Slider::new(&mut draft.stylus_stick.speed, 30..=1200)
+                    .text("Stylus speed (pixels)"),
+            );
+            crate::controller_ui::track_focus(ui, &slider);
+        }
     }
-
     fn ui_game_settings(&mut self, ui: &mut egui::Ui) {
         let Some((id, mut draft)) = self.game_settings_draft.take() else {
             return;
@@ -2866,13 +2986,12 @@ impl PocketLauncher {
         let mut cancel_clicked = false;
         ui.heading(format!("Settings: {display_name}"));
         ui.add_space(8.0);
-        egui::Grid::new("game_settings_grid")
+        ui.separator();
+        ui.heading("Controls");
+        egui::Grid::new("game_settings_controls")
             .num_columns(2)
             .spacing(Vec2::new(12.0, 8.0))
             .show(ui, |ui| {
-                ui.heading("Controls");
-                ui.label("");
-                ui.end_row();
                 ui.label("D-pad dead zone");
                 crate::controller_ui::ComboBox::from_id_source("game_dpad_deadzone")
                     .selected_text(draft.dpad_deadzone.label())
@@ -2909,26 +3028,29 @@ impl PocketLauncher {
                     });
                     ui.end_row();
                 }
-                ui.heading("Graphics");
-                ui.label("");
-                ui.end_row();
-                ui.label("Frame rate limit");
-                crate::controller_ui::ComboBox::from_id_source("game_frame_rate_limit")
-                    .selected_text(draft.frame_rate_limit.label())
-                    .show_ui(ui, |ui| {
-                        for value in pocket_library::FrameRateLimit::ALL {
-                            crate::controller_ui::selectable_value(ui, &mut draft.frame_rate_limit, value, value.label());
-                        }
-                    });
-                ui.end_row();
-                ui.label("");
-                ui.vertical(|ui| {
-                    ui.set_max_width(380.0);
-                    ui.add(egui::Label::new("Maximum game FPS; may help frame-dependent animations. Unlimited adds no cap; display sync still applies. Restart the game to apply.").wrap(true))
-                        .on_hover_text("Caps GAPI, DirectDraw and OpenGL ES presentations, not video recording FPS. GDI-only drawing is not capped. A cap does not speed up a slow game.");
-                });
-                ui.end_row();
-                if !is_gizmondo {
+            });
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading("Graphics");
+        egui::Grid::new("game_settings_graphics")
+            .num_columns(2)
+            .spacing(Vec2::new(12.0, 8.0))
+            .show(ui, |ui| {
+                if is_gizmondo {
+                    ui.label("Screen");
+                    let portrait = draft.screen == ScreenPref::Qvga;
+                    crate::controller_ui::ComboBox::from_id_source("game_screen")
+                        .selected_text(if portrait { "QVGA portrait (240 × 320)" } else { "Gizmondo default (320 × 240)" })
+                        .show_ui(ui, |ui| {
+                            let mut choice = portrait;
+                            crate::controller_ui::selectable_value(ui, &mut choice, false, "Gizmondo default (320 × 240)");
+                            crate::controller_ui::selectable_value(ui, &mut choice, true, "QVGA portrait (240 × 320)");
+                            if choice != portrait {
+                                draft.screen = if choice { ScreenPref::Qvga } else { ScreenPref::Portrait };
+                            }
+                        });
+                    ui.end_row();
+                } else {
                     ui.label("Screen");
                     crate::controller_ui::ComboBox::from_id_source("game_screen")
                         .selected_text(draft.screen.label())
@@ -2949,6 +3071,13 @@ impl PocketLauncher {
                     ui.end_row();
                 }
 
+                ui.label("");
+                ui.vertical(|ui| {
+                    ui.set_max_width(380.0);
+                    ui.add(egui::Label::new("Screen size reported to the game. Choose the size the game was designed for; this does not rotate the picture. Restart the game to apply.").wrap(true));
+                });
+                ui.end_row();
+
                 // Presentation-only: the guest keeps rendering into
                 // whatever `Screen` says. This is the knob for a
                 // landscape game that shipped as a 240x320 portrait
@@ -2965,6 +3094,31 @@ impl PocketLauncher {
                     });
                 ui.end_row();
 
+                ui.label("");
+                ui.vertical(|ui| {
+                    ui.set_max_width(380.0);
+                    ui.add(egui::Label::new("Turns the picture without changing the screen size reported to the game. Use this if the picture is sideways. Touch and direction controls follow the rotation.").wrap(true));
+                });
+                ui.end_row();
+
+                ui.label("Frame rate limit");
+                let inherited_limit_label = format!("Emulator default ({})", self.library.config().frame_rate_limit.label());
+                crate::controller_ui::ComboBox::from_id_source("game_frame_rate_limit")
+                    .selected_text(draft.frame_rate_limit.map(|v| v.label().to_owned()).unwrap_or_else(|| inherited_limit_label.clone()))
+                    .show_ui(ui, |ui| {
+                        crate::controller_ui::selectable_value(ui, &mut draft.frame_rate_limit, None, inherited_limit_label.as_str());
+                        for value in pocket_library::FrameRateLimit::ALL {
+                            crate::controller_ui::selectable_value(ui, &mut draft.frame_rate_limit, Some(value), value.label());
+                        }
+                    });
+                ui.end_row();
+                ui.label("");
+                ui.vertical(|ui| {
+                    ui.set_max_width(380.0);
+                    ui.add(egui::Label::new("Maximum game FPS, or Unlimited. Emulator default inherits the global limit; an explicit value overrides it. Restart the game to apply.").wrap(true))
+                        .on_hover_text("Caps GAPI, DirectDraw and OpenGL ES presentations, not video recording FPS. GDI-only drawing is not capped. A cap does not speed up a slow game.");
+                });
+                ui.end_row();
                 ui.label("GPU rendering");
                 crate::controller_ui::ComboBox::from_id_source("game_gpu_renderer").selected_text(match draft.gpu_renderer { None => "Emulator default", Some(false) => "Software", Some(true) => "GPU" }).show_ui(ui, |ui| {
                     crate::controller_ui::selectable_value(ui, &mut draft.gpu_renderer, None, "Emulator default");
@@ -2973,38 +3127,69 @@ impl PocketLauncher {
                 });
                 ui.end_row();
 
-                ui.label("Anisotropic filtering (GPU only)");
-                ui.add_enabled_ui(draft.gpu_renderer.unwrap_or(self.library.config().gpu_renderer), |ui| {
-                    crate::controller_ui::ComboBox::from_id_source("game_anisotropy")
-                        .selected_text(match draft.anisotropic_filtering { None => "Emulator default", Some(2) => "2×", Some(4) => "4×", Some(8) => "8×", _ => "Off" })
-                        .show_ui(ui, |ui| {
-                            for (value, label) in [(None,"Emulator default"),(Some(0),"Off"),(Some(2),"2×"),(Some(4),"4×"),(Some(8),"8×")] {
-                                crate::controller_ui::selectable_value(ui, &mut draft.anisotropic_filtering, value, label);
-                            }
-                        });
-                }).response.on_hover_text("Sharper textures at oblique angles. Limited by the GPU driver. Applies on the next launch.");
-                ui.end_row();
+
 
                 if !is_gizmondo {
+                    ui.label("OpenGL ES surface format");
+                    crate::controller_ui::ComboBox::from_id_source("pocketpc_egl_surface_format")
+                        .selected_text(if draft.pocketpc_egl_rgba8888_only { "RGBA8888 only" } else { "Default (RGB565 + RGBA8888)" })
+                        .show_ui(ui, |ui| {
+                            crate::controller_ui::selectable_value(ui, &mut draft.pocketpc_egl_rgba8888_only, false, "Default (RGB565 + RGBA8888)");
+                            crate::controller_ui::selectable_value(ui, &mut draft.pocketpc_egl_rgba8888_only, true, "RGBA8888 only");
+                        });
+                    ui.end_row();
+                    ui.label("");
+                    ui.vertical(|ui| {
+                        ui.set_max_width(380.0);
+                        ui.add(egui::Label::new("Default lets the game choose 16-bit or 32-bit surfaces. Try RGBA8888 only if water or other effects show incorrect textures. Games that require 16-bit surfaces may not start. Applies to software and GPU rendering. Restart the game to apply.").wrap(true));
+                    });
+                    ui.end_row();
                     ui.label("GAPI display compatibility");
                     crate::controller_ui::ComboBox::from_id_source("pocketpc_gapi_layout")
-                        .selected_text(if draft.pocketpc_gapi_columns { "Columns (early portrait LCD)" } else { "Linear scanlines (default)" })
+                        .selected_text(if draft.pocketpc_gapi_columns { "Rotated LCD columns" } else { "Linear scanlines (default)" })
                         .show_ui(ui, |ui| {
                             crate::controller_ui::selectable_value(ui, &mut draft.pocketpc_gapi_columns, false, "Linear scanlines (default)");
-                            crate::controller_ui::selectable_value(ui, &mut draft.pocketpc_gapi_columns, true, "Columns (early portrait LCD)");
-                        }).response.on_hover_text("Compatibility setting: emulate the physical memory layout of an early PocketPC LCD. Use columns for software that assumes this layout. Applies on next launch.");
-                    ui.end_row();
-                    ui.label("");
-                    ui.small("Use Columns if a PocketPC game's image or text wraps around the screen or appears shifted. Restart the game after changing this compatibility setting.");
+                            crate::controller_ui::selectable_value(ui, &mut draft.pocketpc_gapi_columns, true, "Rotated LCD columns");
+                        }).response.on_hover_text("Changes the physical layout of direct framebuffer memory. Use columns for software designed for a rotated LCD. Applies on next launch.");
                     ui.end_row();
                 }
-                ui.heading("Sound");
-                ui.label("No per-game sound options yet.");
-                ui.end_row();
-                if !is_gizmondo {
-                    ui.heading("Device Identity");
-                    ui.label("");
+            });
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading("Sound");
+        ui.label("No per-game sound options yet.");
+        if !is_gizmondo {
+            ui.add_space(10.0);
+            ui.separator();
+            ui.heading("Misc");
+            egui::Grid::new("game_settings_misc")
+                .num_columns(2)
+                .spacing(Vec2::new(12.0, 8.0))
+                .show(ui, |ui| {
+                    ui.label("Executable heap");
+                    crate::controller_ui::ComboBox::from_id_source("game_executable_heap")
+                        .selected_text(match draft.executable_heap {
+                            None => "Use emulator setting",
+                            Some(true) => "Enabled",
+                            Some(false) => "Disabled",
+                        })
+                        .show_ui(ui, |ui| {
+                            crate::controller_ui::selectable_value(ui, &mut draft.executable_heap, None, "Use emulator setting");
+                            crate::controller_ui::selectable_value(ui, &mut draft.executable_heap, Some(true), "Enabled");
+                            crate::controller_ui::selectable_value(ui, &mut draft.executable_heap, Some(false), "Disabled");
+                        });
                     ui.end_row();
+                    ui.label("");
+                    ui.add(egui::Label::new(EXECUTABLE_HEAP_HELP).wrap(true));
+                    ui.end_row();
+                });
+            ui.add_space(10.0);
+            ui.separator();
+            ui.heading("Device Identity");
+            egui::Grid::new("game_settings_identity")
+                .num_columns(2)
+                .spacing(Vec2::new(12.0, 8.0))
+                .show(ui, |ui| {
                     ui.label("OEM model (readable text)");
                     crate::controller_ui::text_edit(ui, &mut draft.pocketpc_oem_info, "PocketHLE");
                     ui.end_row();
@@ -3015,7 +3200,7 @@ impl PocketLauncher {
                     crate::controller_ui::text_edit(ui, &mut draft.pocketpc_random_seed, "Empty = normal randomness");
                     ui.end_row();
                     ui.label("");
-                    ui.small("Use to reproduce a legacy registration request. Decimal value; overrides every srand seed for this game. Not a hardware identity field. Leave empty for normal randomness.");
+                    ui.add(egui::Label::new("Use to reproduce a legacy registration request. Decimal value; overrides every srand seed for this game. Not a hardware identity field. Leave empty for normal randomness.").wrap(true));
                     ui.end_row();
                     ui.label("Owner name (PocketPC)");
                     crate::controller_ui::text_edit(ui, &mut draft.pocketpc_owner_name, "Device default");
@@ -3029,8 +3214,8 @@ impl PocketLauncher {
                     ui.label("PocketPC ID (Platform ID — hexadecimal)");
                     crate::controller_ui::text_edit(ui, &mut draft.pocketpc_device_id, "Device default");
                     ui.end_row();
-                }
-            });
+                });
+        }
 
         // Satellite libraries are not a setting — they are a fact about
         // what got imported. Showing them here is how a user confirms
@@ -3076,9 +3261,6 @@ impl PocketLauncher {
             };
         } else if cancel_clicked {
             self.stylus_editor = None;
-            self.gamepad_capture = None;
-            self.binding_capture = None;
-            self.stylus_capture = None;
             self.screen = if self.running_game.is_some() {
                 Screen::Run
             } else {
@@ -3089,68 +3271,50 @@ impl PocketLauncher {
         }
     }
 
-    fn fit_console_window(&mut self, ui: &egui::Ui) {
-        if !self.console_fit_pending {
-            return;
-        }
-        let (inner, fullscreen, maximized) = ui.ctx().input(|input| {
-            let viewport = input.viewport();
-            (
-                viewport.inner_rect.map(|r| r.size()),
-                viewport.fullscreen.unwrap_or(false),
-                viewport.maximized.unwrap_or(false),
-            )
-        });
-        if fullscreen || maximized {
-            return;
-        }
-        if let Some(inner) = inner {
-            self.library_window_size.get_or_insert(inner);
-            let scale = if self.upscale_x2 { 2.0 } else { 1.0 };
-            let body = if self.running_is_gizmondo {
-                let width = (320.0 / 0.3920) * scale;
-                Vec2::new(width, width * 928.0 / 1648.0)
-            } else {
-                let Some(frame) = self.last_frame_snapshot.as_ref() else {
-                    return;
-                };
-                let screen = if self.game_rotation.is_quarter_turn() {
-                    Vec2::new(frame.height as f32, frame.width as f32)
-                } else {
-                    Vec2::new(frame.width as f32, frame.height as f32)
-                };
-                let body = crate::fullscreen_layout::pocket_pc_window_body(
-                    [screen.x as u32, screen.y as u32],
-                    if self.upscale_x2 { 2 } else { 1 },
-                    ui.ctx().pixels_per_point(),
-                );
-                Vec2::new(body[0], body[1])
-            };
-            // Keep only the measured top/status bars around the console.
-            // Measuring avoids fixed guesses about title bars or display DPI.
-            let chrome = inner - ui.available_size();
-            let target = body + chrome;
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
-                    target.x.ceil(),
-                    target.y.ceil(),
-                )));
-            self.console_fit_pending = false;
-        }
-    }
-
     fn set_fullscreen(&mut self, ctx: &egui::Context, enabled: bool) {
         self.release_all_keys();
         if let Some((x, y)) = self.pointer_down_at.take() {
             self.send_input(InputEvent::PointerUp { x, y });
         }
-        if enabled {
+        if enabled && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
             self.fullscreen_window_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(enabled));
     }
 
-    fn paint_guest_frame(&self, ui: &egui::Ui, rect: Rect) {
+    fn paint_stylus_pointer(&self, ui: &egui::Ui, rect: Rect) {
+        if self.running_is_gizmondo || !self.stylus_pointer.pointer {
+            return;
+        }
+        let (Some(frame), Some((x, y))) = (
+            self.last_frame_snapshot.as_ref(),
+            self.stylus_pointer.position(),
+        ) else {
+            return;
+        };
+        let (x, y) = (f32::from(x), f32::from(y));
+        let (w, h) = (frame.width as f32, frame.height as f32);
+        let (u, v) = match rotation_turns(self.game_rotation) {
+            1 => ((h - 1.0 - y) / h, x / w),
+            2 => ((w - 1.0 - x) / w, (h - 1.0 - y) / h),
+            3 => (y / h, (w - 1.0 - x) / w),
+            _ => (x / w, y / h),
+        };
+        let point = rect.min + Vec2::new(u * rect.width(), v * rect.height());
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        for (width, color) in [(4.0, Color32::BLACK), (2.0, Color32::WHITE)] {
+            painter.line_segment(
+                [point - Vec2::new(7.0, 0.0), point + Vec2::new(7.0, 0.0)],
+                egui::Stroke::new(width, color),
+            );
+            painter.line_segment(
+                [point - Vec2::new(0.0, 7.0), point + Vec2::new(0.0, 7.0)],
+                egui::Stroke::new(width, color),
+            );
+        }
+    }
+
+    fn paint_guest_frame(&mut self, ui: &egui::Ui, rect: Rect) {
         if !rect.intersect(ui.clip_rect()).is_positive() {
             let mut capture = self.screenshot.lock().unwrap_or_else(|e| e.into_inner());
             if capture.pending.take().is_some() {
@@ -3159,63 +3323,64 @@ impl PocketLauncher {
             }
             return;
         }
-        let fullscreen = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
-        let use_gpu = fullscreen || self.upscale_filter.needs_gpu();
         let uv = rotation_uv(self.game_rotation);
-        if use_gpu {
-            if let Some(renderer) = self.reconstruction.as_ref() {
-                let renderer = std::sync::Arc::clone(renderer);
-                let filter = self.upscale_filter.gpu_filter();
-                let capture = std::sync::Arc::clone(&self.screenshot);
-                let recording = self.recording.clone();
-                let video_size = self
-                    .last_frame_snapshot
-                    .as_ref()
-                    .map(|f| (f.width, f.height))
-                    .unwrap_or((1, 1));
-                let video_turns = rotation_turns(self.game_rotation);
-                let ctx = ui.ctx().clone();
-                let transform = [
-                    uv[0].x,
-                    uv[0].y,
-                    uv[1].x - uv[0].x,
-                    uv[1].y - uv[0].y,
-                    uv[2].x - uv[0].x,
-                    uv[2].y - uv[0].y,
-                ];
-                ui.painter().add(egui::PaintCallback {
-                    rect,
-                    callback: std::sync::Arc::new(eframe::egui_glow::CallbackFn::new(
-                        move |info, painter| {
-                            renderer.lock().unwrap_or_else(|e| e.into_inner()).paint(
-                                painter.gl(),
-                                transform,
-                                filter,
-                            );
-                            crate::screenshot::capture(
-                                painter.gl(),
-                                egui::PaintCallbackInfo {
-                                    viewport: info.viewport,
-                                    clip_rect: info.clip_rect,
-                                    pixels_per_point: info.pixels_per_point,
-                                    screen_size_px: info.screen_size_px,
-                                },
-                                &capture,
-                                &ctx,
-                            );
-                            crate::recording::capture(
-                                painter.gl(),
-                                info,
-                                &recording,
-                                video_size,
-                                video_turns,
-                            );
-                        },
-                    )),
-                });
-                self.paint_recording_indicator(ui, rect);
-                return;
-            }
+        if let Some(renderer) = self.reconstruction.as_ref() {
+            let renderer = std::sync::Arc::clone(renderer);
+            let frame_stats = self.frame_stats.clone();
+            let filter = self.upscale_filter.gpu_filter();
+            let capture = std::sync::Arc::clone(&self.screenshot);
+            let recording = self.recording.clone();
+            let video_size = self
+                .last_frame_snapshot
+                .as_ref()
+                .map(|f| (f.width, f.height))
+                .unwrap_or((1, 1));
+            let video_turns = rotation_turns(self.game_rotation);
+            let ctx = ui.ctx().clone();
+            let transform = [
+                uv[0].x,
+                uv[0].y,
+                uv[1].x - uv[0].x,
+                uv[1].y - uv[0].y,
+                uv[2].x - uv[0].x,
+                uv[2].y - uv[0].y,
+            ];
+            ui.painter().add(egui::PaintCallback {
+                rect,
+                callback: std::sync::Arc::new(eframe::egui_glow::CallbackFn::new(
+                    move |info, painter| {
+                        let mut renderer = renderer.lock().unwrap_or_else(|e| e.into_inner());
+                        renderer.paint(painter.gl(), transform, filter);
+                        if let Some(image_id) = renderer.drawn_image_id() {
+                            frame_stats.record_frame(image_id);
+                        }
+                        drop(renderer);
+                        crate::screenshot::capture(
+                            painter.gl(),
+                            egui::PaintCallbackInfo {
+                                viewport: info.viewport,
+                                clip_rect: info.clip_rect,
+                                pixels_per_point: info.pixels_per_point,
+                                screen_size_px: info.screen_size_px,
+                            },
+                            &capture,
+                            &ctx,
+                        );
+                        crate::recording::capture(
+                            painter.gl(),
+                            info,
+                            &recording,
+                            video_size,
+                            video_turns,
+                        );
+                    },
+                )),
+            });
+            self.paint_stylus_pointer(ui, rect);
+            self.paint_recording_indicator(ui, rect);
+            self.paint_rate_indicators(ui, rect);
+            self.ui_system_media(ui.ctx(), rect);
+            return;
         }
         if let Some(tex) = self.last_frame_texture.as_ref() {
             let mut mesh = Mesh::with_texture(tex.id());
@@ -3233,18 +3398,9 @@ impl PocketLauncher {
             }
             mesh.indices.extend_from_slice(&[0, 1, 2, 2, 1, 3]);
             ui.painter().add(egui::Shape::mesh(mesh));
-            if self
-                .screenshot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pending
-                .is_some()
-                || self
-                    .recording
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .active()
             {
+                let frame_stats = self.frame_stats.clone();
+                let image_id = self.uploaded_image_id;
                 let capture = std::sync::Arc::clone(&self.screenshot);
                 let recording = self.recording.clone();
                 let video_size = self
@@ -3258,6 +3414,9 @@ impl PocketLauncher {
                     rect,
                     callback: std::sync::Arc::new(eframe::egui_glow::CallbackFn::new(
                         move |info, painter| {
+                            if let Some(image_id) = image_id {
+                                frame_stats.record_frame(image_id);
+                            }
                             crate::screenshot::capture(
                                 painter.gl(),
                                 egui::PaintCallbackInfo {
@@ -3281,7 +3440,61 @@ impl PocketLauncher {
                 });
             }
         }
+        self.paint_stylus_pointer(ui, rect);
         self.paint_recording_indicator(ui, rect);
+        self.paint_rate_indicators(ui, rect);
+        self.ui_system_media(ui.ctx(), rect);
+    }
+
+    /// Host overlay: use the actual displayed image bounds, including rotation
+    /// and internal GLES resolution. Captures above keep the original image.
+    fn paint_rate_indicators(&mut self, ui: &egui::Ui, rect: Rect) {
+        let config = self.library.config();
+        if config.show_ips {
+            let Some(frame) = &self.last_frame_snapshot else {
+                return;
+            };
+            let now = Instant::now();
+            let interval = Duration::from_secs(1);
+            if self
+                .rate_badge
+                .as_ref()
+                .is_none_or(|(sampled_at, _)| now.duration_since(*sampled_at) >= interval)
+            {
+                let ips = frame.presentation_stats.ips().unwrap_or(0.0);
+                let fps = config.show_fps.then(|| self.frame_stats.current_fps());
+                let text = match fps {
+                    Some(fps) => format!("{fps:.0} FPS / {ips:.0} IPS"),
+                    None => format!("{ips:.0} IPS"),
+                };
+                self.rate_badge = Some((now, text));
+            }
+            if let Some((sampled_at, text)) = &self.rate_badge {
+                Self::paint_rate_badge(ui, rect, text.clone());
+                ui.ctx()
+                    .request_repaint_after(interval - now.duration_since(*sampled_at));
+            }
+        } else if config.show_fps {
+            Self::paint_rate_badge(
+                ui,
+                rect,
+                format!("{:.1} FPS", self.frame_stats.current_fps()),
+            );
+        }
+    }
+
+    fn paint_rate_badge(ui: &egui::Ui, rect: Rect, text: String) {
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        let galley = painter.layout_no_wrap(
+            text,
+            egui::FontId::proportional(13.0),
+            Color32::from_white_alpha(220),
+        );
+        let size = galley.size() + Vec2::new(10.0, 6.0);
+        let origin = rect.right_top() + Vec2::new(-size.x - 6.0, 6.0);
+        let badge = Rect::from_min_size(origin, size);
+        painter.rect_filled(badge, 3.0, Color32::from_black_alpha(115));
+        painter.galley(badge.min + Vec2::new(5.0, 3.0), galley, Color32::WHITE);
     }
 
     // Painted after the framebuffer capture callbacks: visible locally only.
@@ -3323,12 +3536,10 @@ impl PocketLauncher {
             return;
         };
         let guest_size = Vec2::new(frame.width as f32, frame.height as f32);
-        let native = if self.running_is_gizmondo {
-            [320, 240]
-        } else if self.game_rotation.is_quarter_turn() {
-            [frame.height, frame.width]
+        let native = if !self.running_is_gizmondo && self.game_rotation.is_quarter_turn() {
+            [frame.texture_height, frame.texture_width]
         } else {
-            [frame.width, frame.height]
+            [frame.texture_width, frame.texture_height]
         };
         let available = ui.available_rect_before_wrap();
         self.stylus_touch = [0.0; 4];
@@ -3337,14 +3548,10 @@ impl PocketLauncher {
             (available.width() * dpi).floor() as u32,
             (available.height() * dpi).floor() as u32,
         ];
-        let [left, top, width, height] = if cfg!(feature = "steam-deck") {
+        let fit = crate::fullscreen_layout::qvga_fullscreen_fit(physical, native);
+        let [left, top, width, height] = if fit.width > physical[0] || fit.height > physical[1] {
             crate::fullscreen_layout::aspect_fit(physical, native)
         } else {
-            let fit = if self.running_is_gizmondo {
-                crate::fullscreen_layout::integer_fit(physical, native)
-            } else {
-                crate::fullscreen_layout::integer_fit_capped(physical, native, 4)
-            };
             [fit.left, fit.top, fit.width, fit.height]
         };
         let rect = Rect::from_min_size(
@@ -3356,17 +3563,48 @@ impl PocketLauncher {
     }
 
     fn ui_run(&mut self, ui: &mut egui::Ui) {
-        if self.running_is_gizmondo {
-            self.fit_console_window(ui);
-            if ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false)) {
-                self.ui_gizmondo(ui);
-            } else {
-                ScrollArea::both().show(ui, |ui| self.ui_gizmondo(ui));
-            }
+        if self.running_is_windows_ce {
+            self.ui_ce_session(ui);
             return;
         }
-        self.fit_console_window(ui);
+        if self.running_is_gizmondo {
+            self.ui_gizmondo(ui);
+            return;
+        }
         self.ui_pocketpc(ui);
+    }
+
+    fn ui_ce_session(&mut self, ui: &mut egui::Ui) {
+        let bounds = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(bounds, 0.0, Color32::from_rgb(8, 13, 21));
+        let header = Rect::from_min_max(bounds.min, Pos2::new(bounds.right(), bounds.top() + 32.0));
+        ui.allocate_ui_at_rect(header, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Stop / Library").clicked() { self.return_to_library(ui.ctx()); }
+                ui.label(if self.ce_launch.profile_name.is_empty() { "Windows CE".into() }
+                    else { format!("Windows CE — {}", self.ce_launch.profile_name) });
+            });
+        });
+        let room = Rect::from_min_max(Pos2::new(bounds.left(), header.bottom()), bounds.max);
+        if let Some(frame) = self.last_frame_snapshot.as_ref() {
+            let guest = Vec2::new(frame.width as f32, frame.height as f32);
+            let native = if self.game_rotation.is_quarter_turn() { [frame.texture_height, frame.texture_width] }
+                else { [frame.texture_width, frame.texture_height] };
+            let dpi = ui.ctx().pixels_per_point();
+            let [left, top, width, height] = crate::fullscreen_layout::presentation_fit_capped(
+                [(room.width().max(1.0) * dpi).floor() as u32, (room.height().max(1.0) * dpi).floor() as u32], native, 4);
+            let origin = Pos2::new((room.left() * dpi).round() / dpi, (room.top() * dpi).round() / dpi);
+            let rect = Rect::from_min_size(origin + Vec2::new(left as f32, top as f32) / dpi,
+                Vec2::new(width as f32, height as f32) / dpi);
+            ui.allocate_ui_at_rect(room, |ui| {
+                ui.set_clip_rect(room.intersect(ui.clip_rect()));
+                self.paint_guest_frame(ui, rect);
+                self.handle_pointer_clipped(ui.ctx(), &rect, guest, room);
+            });
+        } else {
+            ui.allocate_ui_at_rect(room, |ui| { ui.centered_and_justified(|ui| { ui.label("Starting Windows CE…"); }); });
+        }
+        ui.allocate_rect(bounds, Sense::hover());
     }
 
     /// Host presentation only: fixed controls, native pixels and the existing inverse input transform.
@@ -3459,15 +3697,7 @@ impl PocketLauncher {
                     .on_hover_text("Rotate the game screen clockwise")
                     .clicked()
                 {
-                    self.release_all_keys();
-                    if let Some((x, y)) = self.pointer_down_at.take() {
-                        self.send_input(InputEvent::PointerUp { x, y });
-                    }
-                    let next = RotationPref::ALL
-                        [(usize::from(rotation_turns(self.game_rotation)) + 1) % 4];
-                    self.game_rotation = next;
-                    self.persist_rotation(next);
-                    self.console_fit_pending = true;
+                    self.cycle_rotation(ui.ctx());
                 }
             });
         });
@@ -3505,12 +3735,12 @@ impl PocketLauncher {
         if let Some(frame) = self.last_frame_snapshot.as_ref() {
             let guest = Vec2::new(frame.width as f32, frame.height as f32);
             let native = if self.game_rotation.is_quarter_turn() {
-                [frame.height, frame.width]
+                [frame.texture_height, frame.texture_width]
             } else {
-                [frame.width, frame.height]
+                [frame.texture_width, frame.texture_height]
             };
             let dpi = ui.ctx().pixels_per_point();
-            let fit = crate::fullscreen_layout::integer_fit_capped(
+            let [left, top, width, height] = crate::fullscreen_layout::presentation_fit_capped(
                 [
                     (room.width().max(1.0) * dpi).floor() as u32,
                     (room.height().max(1.0) * dpi).floor() as u32,
@@ -3524,8 +3754,8 @@ impl PocketLauncher {
                 (room.top() * dpi).round() / dpi,
             );
             let rect = Rect::from_min_size(
-                origin + Vec2::new(fit.left as f32, fit.top as f32) / dpi,
-                Vec2::new(fit.width as f32, fit.height as f32) / dpi,
+                origin + Vec2::new(left as f32, top as f32) / dpi,
+                Vec2::new(width as f32, height as f32) / dpi,
             );
             ui.allocate_ui_at_rect(room, |ui| {
                 ui.set_clip_rect(room.intersect(ui.clip_rect()));
@@ -3617,242 +3847,255 @@ impl PocketLauncher {
         }
     }
 
-    /// Gizmondo-specific Run view. The guest framebuffer is drawn into the
-    /// console LCD and every physical control is a real held button. Keyboard
-    /// shortcuts intentionally describe the *host* keyboard; the VK sent to
-    /// Windows CE follows the official Gizmondo Keys SDK sample.
+    /// Host-only Gizmondo controls; guest key codes and user bindings are unchanged.
     fn ui_gizmondo(&mut self, ui: &mut egui::Ui) {
-        if self.gizmondo_skin.is_none() {
-            if let Ok(image) = load_image_bytes(include_bytes!("../assets/gizmondo.png")) {
-                self.gizmondo_skin = Some(ui.ctx().load_texture(
-                    "gizmondo-skin",
-                    image,
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
-        }
-
-        // The supplied skin is 1648x928. Keep that ratio so all hitboxes and
-        // the LCD remain locked to the photographed controls while resizing.
-        let aspect = 1648.0 / 928.0;
         let fullscreen = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
-        let available = ui.available_size();
-        let w = if fullscreen {
-            available.x.min(available.y * aspect).max(1.0)
-        } else {
-            (320.0 / 0.3920) * if self.upscale_x2 { 2.0 } else { 1.0 }
-        };
-        let h = w / aspect;
-        let scale = w * 0.3920 / 320.0;
-        let body = if fullscreen {
-            let (canvas, _) = ui.allocate_exact_size(available, Sense::hover());
-            Rect::from_center_size(canvas.center(), Vec2::new(w, h))
-        } else {
-            ui.allocate_exact_size(Vec2::new(w, h), Sense::hover()).0
-        };
-        let rr = |x: f32, y: f32, rw: f32, rh: f32| {
-            Rect::from_min_size(
-                Pos2::new(body.left() + x * w, body.top() + y * h),
-                Vec2::new(rw * w, rh * h),
-            )
-        };
-
-        if let Some(skin) = self.gizmondo_skin.as_ref() {
-            ui.painter().image(
-                skin.id(),
-                body,
-                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        } else {
-            ui.painter()
-                .rect_filled(body, 24.0, Color32::from_rgb(24, 25, 27));
-        }
-
-        // Replace the static picture in the skin with the emulator's live
-        // 320x240 framebuffer. These coordinates are measured from the skin.
-        let lcd = rr(0.3016, 0.2252, 0.3920, 0.5280);
-        let screen = Rect::from_center_size(lcd.center(), Vec2::new(320.0, 240.0) * scale);
-        // Cover the skin's entire photographed LCD, including the small
-        // bands outside the exact 4:3 game rectangle. Otherwise its old
-        // picture shows through above/below the live framebuffer at ×2.
-        ui.painter().rect_filled(
-            lcd.expand(1.0 / ui.ctx().pixels_per_point()),
-            0.0,
-            Color32::BLACK,
+        let native = self
+            .last_frame_snapshot
+            .as_ref()
+            .map_or([320, 240], |f| [f.texture_width, f.texture_height]);
+        let guest = self
+            .last_frame_snapshot
+            .as_ref()
+            .map_or(Vec2::new(320., 240.), |f| {
+                Vec2::new(f.width as f32, f.height as f32)
+            });
+        let bounds = ui
+            .allocate_exact_size(ui.available_size(), Sense::hover())
+            .0;
+        let layout = crate::gizmondo_layout::calculate(
+            [bounds.width(), bounds.height()],
+            native,
+            ui.ctx().pixels_per_point(),
+            if fullscreen {
+                None
+            } else {
+                Some(if self.upscale_x2 { 2 } else { 1 })
+            },
         );
+        let rect = |r: crate::gizmondo_layout::BoxRect| {
+            Rect::from_min_size(bounds.min + Vec2::new(r.x, r.y), Vec2::new(r.w, r.h))
+        };
+        ui.painter()
+            .rect_filled(bounds, 0., Color32::from_rgb(8, 13, 21));
+        ui.painter().text(
+            bounds.min + Vec2::new(12., 12.),
+            egui::Align2::LEFT_CENTER,
+            "PocketHLE · Gizmondo",
+            egui::FontId::proportional(13.),
+            Color32::from_gray(220),
+        );
+        let screen = rect(layout.screen);
+        ui.painter().rect_filled(screen, 0., Color32::BLACK);
         if self.last_frame_texture.is_some() {
             self.paint_guest_frame(ui, screen);
-            let guest_size = self
-                .last_frame_snapshot
-                .as_ref()
-                .map(|frame| Vec2::new(frame.width as f32, frame.height as f32))
-                .unwrap_or(Vec2::new(320.0, 240.0));
-            self.handle_pointer(ui.ctx(), &screen, guest_size);
+            self.handle_pointer(ui.ctx(), &screen, guest);
         } else {
-            ui.painter().rect_filled(screen, 0.0, Color32::BLACK);
             ui.painter().text(
                 screen.center(),
                 egui::Align2::CENTER_CENTER,
                 "Starting…",
-                egui::FontId::proportional(18.0),
+                egui::FontId::proportional(16.),
                 Color32::from_gray(180),
             );
         }
-
-        // Five top "piano" buttons. Their host keys come from Settings;
-        // Piano 5 still sends guest VK_F11, as required by the official SDK.
-        for (rect, symbol, label, button) in [
-            (
-                rr(0.347, 0.020, 0.039, 0.102),
-                "⌂",
-                "Home / Piano 1",
-                GuestButton::GizPiano1,
-            ),
-            (
-                rr(0.410, 0.018, 0.039, 0.104),
-                "♪",
-                "Volume / Piano 2",
-                GuestButton::GizPiano2,
-            ),
-            (
-                rr(0.475, 0.015, 0.039, 0.108),
-                "☀",
-                "Brightness / Piano 3",
-                GuestButton::GizPiano3,
-            ),
-            (
-                rr(0.540, 0.017, 0.039, 0.106),
-                "!",
-                "Alert / Piano 4",
-                GuestButton::GizPiano4,
-            ),
-            (
-                rr(0.606, 0.020, 0.039, 0.102),
-                "⏻",
-                "Power / Piano 5",
-                GuestButton::GizPiano5,
-            ),
-        ] {
-            self.giz_button(ui, rect, symbol, label, button);
+        for (i, (caption, button)) in [
+            ("HOME", GuestButton::GizPiano1),
+            ("VOLUME", GuestButton::GizPiano2),
+            ("BRIGHTNESS", GuestButton::GizPiano3),
+            ("GEOFENCE", GuestButton::GizPiano4),
+            ("POWER", GuestButton::GizPiano5),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.giz_button(
+                ui,
+                rect(layout.functions[i]),
+                GizIcon::Function(i),
+                caption,
+                button,
+                false,
+            );
         }
-
-        self.giz_button(
-            ui,
-            rr(0.105, 0.010, 0.105, 0.145),
-            "L",
-            "Left shoulder",
-            GuestButton::Soft1,
+        if ui
+            .put(
+                rect(layout.functions[5]),
+                egui::Button::new("EXIT")
+                    .fill(Color32::from_rgb(169, 89, 45))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(207, 139, 88)))
+                    .rounding(8.0),
+            )
+            .on_hover_text("Return to library")
+            .clicked()
+        {
+            self.return_to_library(ui.ctx());
+        }
+        for (i, (label, button)) in [("L", GuestButton::Soft1), ("R", GuestButton::Soft2)]
+            .into_iter()
+            .enumerate()
+        {
+            self.giz_button(
+                ui,
+                rect(layout.shoulders[i]),
+                GizIcon::Text(label),
+                label,
+                button,
+                false,
+            );
+        }
+        for (i, (symbol, button)) in [
+            ("▲", GuestButton::DpadUp),
+            ("◀", GuestButton::DpadLeft),
+            ("▶", GuestButton::DpadRight),
+            ("▼", GuestButton::DpadDown),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.giz_button(
+                ui,
+                rect(layout.directions[i]),
+                GizIcon::Text(symbol),
+                "D-pad",
+                button,
+                false,
+            );
+        }
+        let pad = rect(layout.dpad);
+        ui.painter().circle_filled(
+            pad.center(),
+            pad.width() / 5.0,
+            Color32::from_rgb(20, 28, 40),
         );
-        self.giz_button(
-            ui,
-            rr(0.790, 0.010, 0.105, 0.145),
-            "R",
-            "Right shoulder",
-            GuestButton::Soft2,
+        ui.painter().circle_stroke(
+            pad.center(),
+            pad.width() / 5.0,
+            egui::Stroke::new(1.5, Color32::from_rgb(80, 96, 120)),
         );
-
-        self.giz_button(
-            ui,
-            rr(0.113, 0.335, 0.061, 0.105),
-            "▲",
-            "D-pad up",
-            GuestButton::DpadUp,
-        );
-        self.giz_button(
-            ui,
-            rr(0.075, 0.420, 0.061, 0.105),
-            "◀",
-            "D-pad left",
-            GuestButton::DpadLeft,
-        );
-        self.giz_button(
-            ui,
-            rr(0.151, 0.420, 0.061, 0.105),
-            "▶",
-            "D-pad right",
-            GuestButton::DpadRight,
-        );
-        self.giz_button(
-            ui,
-            rr(0.113, 0.505, 0.061, 0.105),
-            "▼",
-            "D-pad down",
-            GuestButton::DpadDown,
-        );
-
-        self.giz_button(
-            ui,
-            rr(0.827, 0.285, 0.060, 0.105),
-            "■",
-            "North / Stop",
-            GuestButton::ButtonA,
-        );
-        self.giz_button(
-            ui,
-            rr(0.775, 0.385, 0.060, 0.105),
-            "◀◀",
-            "West / Rewind",
-            GuestButton::ButtonC,
-        );
-        self.giz_button(
-            ui,
-            rr(0.875, 0.385, 0.060, 0.105),
-            "▶▶",
-            "East / Forward",
-            GuestButton::ButtonB,
-        );
-        self.giz_button(
-            ui,
-            rr(0.827, 0.500, 0.060, 0.105),
-            "▶",
-            "South / Play",
-            GuestButton::Action,
-        );
+        for (i, (caption, button)) in [
+            ("STOP", GuestButton::ButtonA),
+            ("REW", GuestButton::ButtonC),
+            ("FWD", GuestButton::ButtonB),
+            ("PLAY", GuestButton::Action),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.giz_button(
+                ui,
+                rect(layout.actions[i]),
+                GizIcon::Media(i),
+                caption,
+                button,
+                true,
+            );
+        }
     }
 
     fn giz_button(
         &mut self,
         ui: &mut egui::Ui,
         rect: Rect,
-        symbol: &str,
-        label: &str,
+        icon: GizIcon,
+        caption: &str,
         button: GuestButton,
+        round: bool,
     ) {
         let vk = button.vk();
-        let host = self
+        let hit = rect.intersect(ui.clip_rect());
+        let mut pressed = pointer_held_in(ui.ctx(), &hit);
+        if round {
+            let shape = crate::gizmondo_layout::BoxRect {
+                x: rect.left(),
+                y: rect.top(),
+                w: rect.width(),
+                h: rect.height(),
+            };
+            pressed &= ui.ctx().input(|i| {
+                i.pointer
+                    .press_origin()
+                    .is_some_and(|p| shape.contains([p.x, p.y], true))
+                    && i.pointer
+                        .interact_pos()
+                        .is_some_and(|p| shape.contains([p.x, p.y], true))
+            });
+        }
+        let was_pressed = self.held.is_held_by(InputSource::Pointer, vk);
+        if pressed && !was_pressed && self.held.press(InputSource::Pointer, vk) {
+            self.send_input(InputEvent::KeyDown { vk });
+        } else if was_pressed && !pressed && self.held.release(InputSource::Pointer, vk) {
+            self.send_input(InputEvent::KeyUp { vk });
+        }
+        let held = self.held.is_held(vk);
+        let fill = if held {
+            Color32::from_rgb(50, 136, 191)
+        } else {
+            Color32::from_rgb(48, 58, 71)
+        };
+        let outline = egui::Stroke::new(
+            1.5,
+            if held {
+                Color32::from_rgb(145, 214, 255)
+            } else {
+                Color32::from_rgb(80, 96, 120)
+            },
+        );
+        if round {
+            ui.painter()
+                .circle(rect.center(), rect.width() / 2., fill, outline);
+        } else {
+            ui.painter().rect(rect, 10., fill, outline);
+        }
+        match icon {
+            GizIcon::Text(symbol) => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    symbol,
+                    egui::FontId::proportional((rect.height() * 0.36).clamp(14., 34.)),
+                    Color32::WHITE,
+                );
+            }
+            _ => {
+                let mut label_size = (rect.width() * 0.16)
+                    .clamp(8., 12.)
+                    .min(((rect.width() - 8.) / (caption.len().max(1) as f32 * 0.65)).max(6.));
+                if matches!(icon, GizIcon::Function(_)) {
+                    label_size = (label_size * 2.0 / 3.0).max(6.0);
+                }
+                let center = rect.center() - Vec2::new(0., label_size * 0.60);
+                paint_giz_icon(
+                    ui.painter(),
+                    center,
+                    rect.width().min(rect.height()) * 0.22,
+                    icon,
+                );
+                ui.painter().text(
+                    Pos2::new(rect.center().x, rect.bottom() - 5.),
+                    egui::Align2::CENTER_BOTTOM,
+                    caption,
+                    egui::FontId::proportional(label_size),
+                    Color32::WHITE,
+                );
+            }
+        }
+        let keys = self
             .library
             .config()
             .keybindings
             .keys_for(button)
             .join(", ");
-        let was_pressed = self.held.is_held_by(InputSource::Pointer, vk);
-        let now_pressed = pointer_held_in(ui.ctx(), &rect);
-        if now_pressed && !was_pressed && self.held.press(InputSource::Pointer, vk) {
-            self.send_input(InputEvent::KeyDown { vk });
-        } else if was_pressed && !now_pressed && self.held.release(InputSource::Pointer, vk) {
-            self.send_input(InputEvent::KeyUp { vk });
-        }
-
-        // The skin already contains the physical button. On press we only
-        // repaint its dark legend in white, which gives the requested
-        // illuminated-button feedback without covering the artwork.
-        if self.held.is_held(vk) {
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                symbol,
-                egui::FontId::proportional((rect.height() * 0.38).max(12.0)),
-                Color32::WHITE,
-            );
-        }
-        let id = ui.make_persistent_id(("giz_button", vk));
-        ui.interact(rect, id, Sense::click_and_drag())
-            .on_hover_text(if host.is_empty() {
-                format!("{label} — keyboard: unbound")
-            } else {
-                format!("{label} — keyboard: {host}")
-            });
+        ui.interact(
+            rect,
+            ui.make_persistent_id(("giz_button", vk)),
+            Sense::click_and_drag(),
+        )
+        .on_hover_text(if keys.is_empty() {
+            format!("{caption} — keyboard: unbound")
+        } else {
+            format!("{caption} — keyboard: {keys}")
+        });
     }
 
     fn handle_pointer(&mut self, ctx: &egui::Context, rect: &Rect, size: Vec2) {
@@ -3876,6 +4119,7 @@ impl PocketLauncher {
                     // The guest cancels its emulated stroke on physical Down.
                     // Rearm a held stick after even a same-frame touch tap.
                     self.cancel_grid();
+                    self.stylus_pointer.cancel_click();
                     self.stylus_last = (0, 0);
                     InputEvent::PointerDown { x, y }
                 }
@@ -3906,6 +4150,34 @@ impl PocketLauncher {
         }
     }
 
+    fn stylus_button(&mut self, down: bool) {
+        if self.screen != Screen::Run
+            || self.running_is_gizmondo
+            || self
+                .last_frame_snapshot
+                .as_ref()
+                .is_some_and(|f| f.text_input)
+        {
+            return;
+        }
+        if self
+            .stylus_pointer
+            .button(down, self.stylus_clock.elapsed().as_millis() as u64)
+        {
+            self.send_input(InputEvent::StylusAim { x: 0, y: 0 });
+            self.stylus_last = (0, 0);
+            let mode = if self.stylus_pointer.pointer {
+                "Pointer"
+            } else {
+                "Stick"
+            };
+            self.control_notice = Some((
+                format!("Stylus mode: {mode}"),
+                Instant::now() + Duration::from_secs(3),
+            ));
+        }
+    }
+
     fn update_stylus_input(&mut self, ctx: &egui::Context) {
         let mut strengths = self.stylus_touch;
         let config = &self.library.config().stylus_stick;
@@ -3918,11 +4190,12 @@ impl PocketLauncher {
                 strengths[i] = 1.0;
             }
             for ((_, name), value) in &self.stylus_gamepad {
-                if config.controller[i].contains(name) {
+                if pocket_library::stylus::controller_direction(name) == Some(i) {
                     strengths[i] = strengths[i].max(*value);
                 }
             }
         }
+
         let active = self.screen == Screen::Run
             && !self.running_is_gizmondo
             && self.running_game.is_some()
@@ -3939,12 +4212,61 @@ impl PocketLauncher {
         // Touch temporarily owns the stylus, but does not release held
         // controller axes. SDL may not send another event for an unchanged
         // stick position when the finger lifts.
-        let vector =
-            if active && self.pointer_down_at.is_none() && !self.stylus_grid_router.active() {
-                config.velocity(strengths, rotation_turns(self.game_rotation))
-            } else {
-                (0, 0)
-            };
+        let vector = if active
+            && self.pointer_down_at.is_none()
+            && !self.stylus_grid_router.active()
+            && !self.center_tap.borrow().active()
+        {
+            self.last_frame_snapshot.as_ref().map_or((0, 0), |frame| {
+                config.velocity_for_size(
+                    strengths,
+                    rotation_turns(self.game_rotation),
+                    frame.width,
+                    frame.height,
+                )
+            })
+        } else {
+            (0, 0)
+        };
+        let now = Instant::now();
+        let dt = now.duration_since(self.stylus_tick).as_secs_f32();
+        self.stylus_tick = now;
+        if let Some(frame) = self.last_frame_snapshot.as_ref() {
+            self.stylus_pointer
+                .advance(vector, dt, (frame.width, frame.height));
+        }
+        if !active {
+            self.stylus_pointer.cancel_click();
+        }
+        if let Some((x, y)) = self
+            .stylus_pointer
+            .take_tap(self.stylus_clock.elapsed().as_millis() as u64)
+        {
+            if active
+                && self.pointer_down_at.is_none()
+                && !self.stylus_grid_router.active()
+                && !self.center_tap.borrow().active()
+            {
+                if self
+                    .center_tap
+                    .borrow_mut()
+                    .press_at(self.input_gesture_clock.elapsed().as_millis() as u64, x, y)
+                    .is_some()
+                {
+                    self.dispatch_input(InputEvent::StylusAim { x: 0, y: 0 });
+                    self.dispatch_input(InputEvent::PointerDown { x, y });
+                }
+            }
+        }
+        let animate = self.stylus_pointer.needs_tick(vector);
+        let vector = if self.stylus_pointer.pointer {
+            (0, 0)
+        } else {
+            vector
+        };
+        if active && animate {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
         self.recording
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3958,9 +4280,133 @@ impl PocketLauncher {
         }
     }
 
+    fn media_command(&self, command: SystemMediaCommand) {
+        if let Some(tx) = &self.input_tx {
+            let _ = tx.send(InputCommand::SystemMedia(command));
+        }
+    }
+
+    fn media_active(&self) -> bool {
+        self.system_media.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    fn ui_system_media(&self, ctx: &egui::Context, display: Rect) {
+        let media = self.system_media.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(media) = media else { return };
+        let has_progress = media.duration.is_finite() && media.duration > 0.0;
+        let height = if has_progress { 34.0 } else { 25.0 };
+        ctx.request_repaint_after(Duration::from_secs(1));
+        egui::Area::new(egui::Id::new("system_media_controls"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(display.left_bottom() - Vec2::new(0.0, height))
+            .constrain(false)
+            .show(ctx, |ui| {
+                ui.set_width(display.width());
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let panel = Rect::from_min_size(ui.cursor().min, Vec2::new(display.width(), height));
+                ui.painter().rect_filled(panel, 0.0, Color32::from_black_alpha(225));
+                if has_progress {
+                    ui.add(egui::ProgressBar::new((media.position() / media.duration) as f32)
+                        .desired_width(display.width()).desired_height(9.0));
+                }
+                ui.horizontal(|ui| {
+                    for (label, command, enabled) in [
+                        ("−10 s", SystemMediaCommand::Rewind, has_progress),
+                        (if media.paused { "Play" } else { "Pause" }, SystemMediaCommand::TogglePause, true),
+                        ("Stop", SystemMediaCommand::Stop, true),
+                        ("+10 s", SystemMediaCommand::Forward, has_progress),
+                    ] {
+                        if ui.add_enabled(enabled, egui::Button::new(label)
+                            .min_size(Vec2::new(display.width() / 4.0, 25.0))).clicked() {
+                            self.media_command(command);
+                        }
+                    }
+                });
+            });
+    }
+
+    fn cancel_center_tap(&self) {
+        let point = self.center_tap.borrow_mut().cancel();
+        if let Some((x, y)) = point {
+            self.dispatch_input(InputEvent::PointerUp { x, y });
+        }
+    }
+
     fn send_input(&self, ev: InputEvent) {
+        match ev {
+            InputEvent::KeyDown {
+                vk: pocket_library::keybindings::STYLUS_CLICK_COMMAND,
+            } => {
+                if !self.running_is_gizmondo && self.screen == Screen::Run {
+                    self.pending_binding_commands
+                        .borrow_mut()
+                        .push(pocket_library::keybindings::STYLUS_CLICK_COMMAND);
+                }
+                return;
+            }
+            InputEvent::KeyUp {
+                vk: pocket_library::keybindings::STYLUS_CLICK_COMMAND,
+            } => {
+                if !self.running_is_gizmondo && self.screen == Screen::Run {
+                    self.pending_binding_commands
+                        .borrow_mut()
+                        .push(pocket_library::keybindings::STYLUS_RELEASE_COMMAND);
+                }
+                return;
+            }
+            InputEvent::KeyDown {
+                vk:
+                    vk @ (pocket_library::keybindings::ROTATION_COMMAND
+                    | pocket_library::keybindings::SCREENSHOT_COMMAND),
+            } => {
+                if self.screen == Screen::Run {
+                    self.pending_binding_commands.borrow_mut().push(vk);
+                }
+                return;
+            }
+            InputEvent::KeyUp {
+                vk:
+                    pocket_library::keybindings::ROTATION_COMMAND
+                    | pocket_library::keybindings::SCREENSHOT_COMMAND,
+            } => return,
+            InputEvent::KeyDown {
+                vk: pocket_library::center_tap::COMMAND,
+            } => {
+                if self.running_is_gizmondo
+                    || self.screen != Screen::Run
+                    || self.pointer_down_at.is_some()
+                    || self.stylus_grid_router.active()
+                {
+                    return;
+                }
+                if let Some(frame) = self.last_frame_snapshot.as_ref() {
+                    let point = self.center_tap.borrow_mut().press(
+                        self.input_gesture_clock.elapsed().as_millis() as u64,
+                        frame.width,
+                        frame.height,
+                    );
+                    if let Some((x, y)) = point {
+                        self.dispatch_input(InputEvent::StylusAim { x: 0, y: 0 });
+                        self.dispatch_input(InputEvent::PointerDown { x, y });
+                    }
+                }
+                return;
+            }
+            InputEvent::KeyUp {
+                vk: pocket_library::center_tap::COMMAND,
+            } => return,
+            InputEvent::PointerDown { .. }
+            | InputEvent::PointerMove { .. }
+            | InputEvent::PointerUp { .. } => self.cancel_center_tap(),
+            _ => {}
+        }
+        self.dispatch_input(ev);
+    }
+
+    fn dispatch_input(&self, ev: InputEvent) {
         {
             let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
+            recording.set_gizmondo(self.running_is_gizmondo);
             recording.set_touch_steering_enabled(self.touch_steering_enabled());
             recording.observe(ev);
         }
@@ -3969,13 +4415,94 @@ impl PocketLauncher {
         }
     }
 
+    fn send_gesture_edges(&mut self, edges: Vec<(u16, bool)>) {
+        for (vk, down) in edges {
+            let vk = swapped_pocketpc_physical_vk(vk, self.running_swap_button_groups);
+            let vk = if self.running_is_gizmondo {
+                vk
+            } else {
+                rotate_direction_vk(vk, (4 - rotation_turns(self.game_rotation)) % 4)
+            };
+            if down {
+                if self.held.press(InputSource::Gesture, vk) {
+                    self.send_input(InputEvent::KeyDown { vk });
+                }
+            } else if self.held.release(InputSource::Gesture, vk) {
+                self.send_input(InputEvent::KeyUp { vk });
+            }
+        }
+    }
+    fn route_long_press(
+        &mut self,
+        controller: bool,
+        device: usize,
+        input: &str,
+        down: bool,
+    ) -> bool {
+        if self.screen != Screen::Run {
+            return false;
+        }
+        let config = self.library.config();
+        let reserved = if controller {
+            matches!(input, "Select" | "Start")
+                || config.gamepad_toggles_fullscreen(input)
+        } else {
+            pocket_library::keybindings::reserved_host_key(input)
+        };
+        if reserved {
+            return false;
+        }
+        let key = pocket_library::input_gestures::binding_key(
+            self.running_is_gizmondo,
+            controller,
+            input,
+        );
+        let long = config.long_press_bindings.get(&key).copied();
+        let custom = config.short_press_bindings.get(&key);
+        if long.is_none() && custom.is_none() {
+            return false;
+        }
+        let short = if let Some(custom) = custom {
+            custom.map(|b| b.vk())
+        } else if controller {
+            pocket_library::keybindings::steam_deck_guest_button(input, self.running_is_gizmondo)
+                .or_else(|| config.gamepad_bindings.get(input).copied())
+                .map(|b| b.vk())
+        } else {
+            pocket_library::keybindings::keyboard_button_for_profile(&config.keybindings, input, self.running_is_gizmondo).map(|b| b.vk())
+        };
+        let token = format!(
+            "{}:{}:{}",
+            if controller { "pad" } else { "key" },
+            device,
+            input
+        );
+        let edges = if let Some(long) = long {
+            self.input_gestures.edge(
+                token,
+                down,
+                self.input_gesture_clock.elapsed().as_millis() as u64,
+                short,
+                long.vk(),
+            )
+        } else {
+            self.input_gestures.immediate_edge(token, down, short)
+        };
+        self.send_gesture_edges(edges);
+        true
+    }
     fn release_all_keys(&mut self) {
+        self.cancel_center_tap();
+        self.input_gestures.clear();
         self.cancel_grid();
         self.grid_modifiers = [false; 4];
         if self.steering_axes != (0, 0) {
             self.send_input(InputEvent::TouchSteeringPosition { x: 0, y: 0 });
             self.steering_axes = (0, 0);
         }
+        self.stylus_pointer.cancel_click();
+        self.pending_binding_commands.borrow_mut().retain(|v|!matches!(*v,pocket_library::keybindings::STYLUS_CLICK_COMMAND|pocket_library::keybindings::STYLUS_RELEASE_COMMAND));
+        self.stylus_tick=Instant::now();
         self.stylus_keyboard.clear();
         self.stylus_gamepad.clear();
         self.stylus_touch = [0.0; 4];
@@ -3984,8 +4511,6 @@ impl PocketLauncher {
         }
         self.stylus_last = (0, 0);
         self.deck_view_press = None;
-        self.deck_fn_press.clear();
-        self.deck_piano_release = None;
         self.deck_menu_press = None;
         self.gamepad_held.clear();
         for vk in self.held.drain_all() {
@@ -3995,6 +4520,8 @@ impl PocketLauncher {
 
     fn update_gamepad_input(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if self.screen!=Screen::InputSettings || !focused {self.bindings_visual.clear_live();}
+        if !focused { self.menu_host_press.clear(); }
         if self.screen != Screen::Run
             || !focused
             || self.file_dialog.is_some()
@@ -4023,6 +4550,43 @@ impl PocketLauncher {
             && self.running_controls_mode == ControlsMode::Zones
     }
 
+    /// View/Menu host gestures must run before modal capture or UI navigation.
+    fn handle_menu_host_control(
+        &mut self,
+        ctx: &egui::Context,
+        device: usize,
+        control: &str,
+        down: bool,
+    ) {
+        if self.screen == Screen::InputSettings {
+            self.bindings_visual.live_input(device, control, down);
+        }
+        let key = (device, control.to_owned());
+        if down {
+            self.menu_host_press.entry(key).or_insert_with(Instant::now);
+        } else if let Some(at) = self.menu_host_press.remove(&key) {
+            if control == "Select" {
+                if at.elapsed() < Duration::from_millis(650) {
+                    let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                    self.set_fullscreen(ctx, !full);
+                } else {
+                    self.remove_game = None;
+                    self.add_data = None;
+                    self.data_game = None;
+                    self.deck_library_actions.clear();
+                    self.config_draft = None;
+                    self.bindings_visual = Default::default();
+                    self.screen = Screen::Library;
+                }
+            } else if at.elapsed() < Duration::from_millis(650) {
+                self.cycle_deck_upscale_filter(ctx, true);
+            } else if self.screen != Screen::InputSettings {
+                self.toggle_recording();
+            }
+        }
+        ctx.request_repaint();
+    }
+
     fn handle_gamepads(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.gamepad_rx.rx.try_recv() {
             match event {
@@ -4031,7 +4595,7 @@ impl PocketLauncher {
                     horizontal,
                     value,
                 } => {
-                    if self.file_dialog.is_some() || self.restore_archive.is_some() {
+                    if self.file_dialog.is_some() || self.restore_archive.is_some() || self.add_data.is_some() {
                         continue;
                     }
                     if Some(device) == self.gamepad_selected
@@ -4071,16 +4635,14 @@ impl PocketLauncher {
                     horizontal,
                     value,
                 } => {
-                    if self.file_dialog.is_some() || self.restore_archive.is_some() {
+                    if self.file_dialog.is_some() || self.restore_archive.is_some() || self.add_data.is_some() {
                         continue;
                     }
                     if Some(device) == self.gamepad_selected
                         && ctx.input(|i| i.viewport().focused.unwrap_or(true))
                     {
-                        if self.capture_grid_axis(ctx, true, horizontal, value) {
-                            continue;
-                        }
-                        self.route_grid_axis(true, horizontal, value);
+                        if self.capture_grid_axis(ctx, true, horizontal, value) { continue; }
+                        if self.running_is_gizmondo { self.route_grid_axis(true, horizontal, value); }
                     }
                     if self.screen == Screen::Run
                         && !self.running_is_gizmondo
@@ -4095,7 +4657,6 @@ impl PocketLauncher {
                             let key = (device, name.to_string());
                             let strength = ((strength - 0.18) / 0.82).clamp(0.0, 1.0);
                             if strength > 0.0
-                                && !self.grid_assigned(&HostInput::Controller(name.into()))
                             {
                                 self.stylus_gamepad.insert(key, strength);
                             } else {
@@ -4104,8 +4665,9 @@ impl PocketLauncher {
                         }
                     }
                 }
-                crate::gamepad::Event::Error(error) => self.gamepad_error = Some(error),
+                crate::gamepad::Event::Error(error) => {self.gamepad_error=Some(error);self.bindings_visual.clear_live();},
                 crate::gamepad::Event::Devices(devices) => {
+                    if !devices.iter().any(|(id,_)|Some(*id)==self.gamepad_selected) { self.stylus_pointer.cancel_click(); }
                     if self
                         .gamepad_selected
                         .is_some_and(|id| !devices.iter().any(|(d, _)| *d == id))
@@ -4122,8 +4684,11 @@ impl PocketLauncher {
                     self.deck_nav_repeat = None;
                     self.deck_menu_press = None;
                     self.deck_view_press = None;
-                    self.deck_fn_press.clear();
+                    let disconnected:Vec<_>=self.gamepad_devices.iter().filter(|(id,_)|!devices.iter().any(|(new,_)|new==id)).map(|(id,_)|*id).collect();
+                    for id in disconnected {let edges=self.input_gestures.cancel_prefix(&format!("pad:{id}:"));self.send_gesture_edges(edges);}
+                    self.menu_host_press.retain(|(id, _), _| devices.iter().any(|(device, _)| device == id));
                     self.gamepad_devices = devices;
+                    self.bindings_visual.retain_live_devices(&self.gamepad_devices);
                     self.stylus_gamepad.retain(|(id, _), _| {
                         self.gamepad_devices.iter().any(|(device, _)| device == id)
                     });
@@ -4154,7 +4719,56 @@ impl PocketLauncher {
                     control,
                     down,
                 } => {
-                    if (self.file_dialog.is_some() || self.restore_archive.is_some())
+                    if down && Some(device) == self.gamepad_selected {
+                        crate::controller_labels::activate(ctx, device);
+                    }
+                    // Host gestures precede binding capture and generic menu navigation.
+                    if self.screen != Screen::Run
+                        && Some(device) == self.gamepad_selected
+                        && ctx.input(|i| i.viewport().focused.unwrap_or(true))
+                        && matches!(control.as_str(), "Select" | "Start")
+                    {
+                        if let Some(editor)=self.stylus_editor.as_mut().filter(|e|e.waiting.is_some()) {
+                            if down { editor.reserved_input_attempt(); }
+                            continue;
+                        }
+                        if down && self.screen==Screen::InputSettings && self.bindings_visual.reserved_input_attempt() {
+                            self.control_notice=Some(("This input is reserved by PocketHLE.".into(),Instant::now()+Duration::from_secs(3)));
+                        }
+                        self.handle_menu_host_control(ctx, device, &control, down);
+                        continue;
+                    }
+                    if self.screen==Screen::InputSettings {
+                        let focused=ctx.input(|i|i.viewport().focused.unwrap_or(true));
+                        if Some(device)==self.gamepad_selected && focused {
+                            self.bindings_visual.live_input(device,&control,down);
+                            if self.input_controller {
+                                self.bindings_visual.controller_shortcut(device);
+                            }
+                            ctx.request_repaint();
+                            if !down {self.controller_ui.release(&control);continue;}
+                            continue;
+                        }
+                    }
+                    if self.screen == Screen::Run && !self.running_is_gizmondo && Some(device) == self.gamepad_selected
+                        && pocket_library::stylus::controller_reserved(&control, false) {
+                        if control == "RightThumb" && ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
+                            self.stylus_button(down);
+                        }
+                        continue;
+                    }
+                    if self.remove_game.is_some() && Some(device)==self.gamepad_selected
+                        && ctx.input(|i|i.viewport().focused.unwrap_or(true)) {
+                        if down && matches!(control.as_str(),"South"|"East") {self.deck_library_actions.push(control.clone());ctx.request_repaint();}
+                        continue;
+                    }
+                    if self.screen==Screen::Library && !self.library_busy && !self.pocketpc_import_options.is_empty() && self.rename_draft.is_none()
+                        && self.file_dialog.is_none() && Some(device)==self.gamepad_selected && ctx.input(|i|i.viewport().focused.unwrap_or(true)) {
+                        if down && matches!(control.as_str(),"South"|"East") {self.deck_library_actions.push(control.clone());ctx.request_repaint();}
+                        continue;
+                    }
+                    if Some(device)==self.gamepad_selected && ctx.input(|i|i.viewport().focused.unwrap_or(true)) && self.route_long_press(true,device,&control,down) {continue;}
+                    if (self.file_dialog.is_some() || self.restore_archive.is_some() || self.add_data.is_some())
                         && Some(device) == self.gamepad_selected
                         && ctx.input(|i| i.viewport().focused.unwrap_or(true))
                     {
@@ -4220,16 +4834,15 @@ impl PocketLauncher {
                                 if ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
                                     let elapsed = pressed_at.elapsed();
                                     if self.screen == Screen::Run
-                                        && !self.running_is_gizmondo
                                         && crate::deck_navigation::menu_action(elapsed, true)
                                             == Some(
                                                 crate::deck_navigation::MenuAction::ReturnToLibrary,
                                             )
                                     {
-                                        // PocketPC: left View/FN hold returns to the catalogue.
+                                        // Both device profiles: View/FN hold returns to the catalogue.
                                         self.return_to_library(ctx);
                                     } else {
-                                        // Short View tap and all Gizmondo gestures are unchanged.
+                                        // A short View tap toggles fullscreen.
                                         self.handle_deck_view(ctx, device, elapsed, true);
                                     }
                                 }
@@ -4260,45 +4873,6 @@ impl PocketLauncher {
                                 }
                             }
                         }
-                        if self.screen == Screen::Run && control == "Misc1" {
-                            if let Some(at) = self.deck_fn_press.remove(&key) {
-                                if ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
-                                    match crate::deck_navigation::right_fn_action(
-                                        at.elapsed(),
-                                        true,
-                                    ) {
-                                        Some(crate::deck_navigation::RightFnAction::NextFilter) => {
-                                            self.cycle_deck_upscale_filter(ctx, true)
-                                        }
-                                        Some(
-                                            crate::deck_navigation::RightFnAction::ToggleRecording,
-                                        ) => self.toggle_recording(),
-                                        None => {}
-                                    }
-                                }
-                            }
-                        }
-                        if self.screen == Screen::Run
-                            && control != "Misc1"
-                            && !self.running_is_gizmondo
-                            && pocket_library::keybindings::steam_deck_pocketpc_fn_exit_control(
-                                &control,
-                                self.running_is_gizmondo,
-                            )
-                        {
-                            if let Some(pressed_at) = self.deck_fn_press.remove(&key) {
-                                if ctx.input(|i| i.viewport().focused.unwrap_or(true))
-                                    && crate::deck_navigation::menu_action(
-                                        pressed_at.elapsed(),
-                                        true,
-                                    ) == Some(
-                                        crate::deck_navigation::MenuAction::ReturnToLibrary,
-                                    )
-                                {
-                                    self.return_to_library(ctx);
-                                }
-                            }
-                        }
                         if Some(device) == self.gamepad_selected
                             && self
                                 .deck_nav_repeat
@@ -4310,24 +4884,8 @@ impl PocketLauncher {
                         self.release_gamepad_control(&key);
                         continue;
                     }
-                    // Show reception before filtering: on Steam Deck/Proton,
-                    // detection alone cannot distinguish missing SDL reports
-                    // from a different device or an inactive egui window.
                     let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
                     let selected = Some(device) == self.gamepad_selected;
-                    let reason = if !selected {
-                        " (ignored: another controller is selected)"
-                    } else if !focused {
-                        " (ignored: window inactive)"
-                    } else {
-                        ""
-                    };
-                    self.gamepad_last_input = Some(format!(
-                        "{} [device {}]{}",
-                        crate::gamepad::label(&control),
-                        device,
-                        reason
-                    ));
                     if !selected || !focused {
                         continue;
                     }
@@ -4343,40 +4901,13 @@ impl PocketLauncher {
                         self.deck_nav_repeat = None;
                         continue;
                     }
-                    if self.screen == Screen::InputSettings {
-                        if let (Some(button), Some(draft)) =
-                            (self.gamepad_capture, self.config_draft.as_mut())
-                        {
-                            match button {
-                                ControllerCapture::Guest(button) => {
-                                    if draft.gamepad_fullscreen.as_deref() == Some(control.as_str())
-                                    {
-                                        draft.gamepad_fullscreen = None;
-                                    }
-                                    draft.gamepad_bindings.insert(control.clone(), button);
-                                }
-                                ControllerCapture::Stylus(direction) => {
-                                    for names in &mut draft.stylus_stick.controller {
-                                        names.retain(|n| n != &control);
-                                    }
-                                    draft.stylus_stick.controller[direction].push(control.clone());
-                                }
-                                ControllerCapture::Fullscreen => {
-                                    draft.gamepad_bindings.remove(&control);
-                                    draft.gamepad_fullscreen = Some(control.clone());
-                                }
-                            }
-                            self.gamepad_capture = None;
-                            continue;
-                        }
-                    }
                     if self.colors_startup_prompt.is_some() {
                         self.deck_library_actions.push(control);
                         continue;
                     }
                     if self.screen == Screen::Library
                         && self.library_tab == crate::deck_navigation::LibraryTab::Recordings
-                        && matches!(control.as_str(), "East" | "RightThumb")
+                        && control == "East"
                     {
                         self.deck_library_actions.push(control.clone());
                         continue;
@@ -4424,11 +4955,7 @@ impl PocketLauncher {
                         && crate::deck_navigation::tab_direction(&control).is_some())
                         || matches!(control.as_str(), "Select" | "LeftTrigger")
                         || (self.screen == Screen::Run
-                            && (matches!(control.as_str(), "Start" | "Misc1")
-                                || pocket_library::keybindings::steam_deck_pocketpc_fn_exit_control(
-                                    &control,
-                                    self.running_is_gizmondo,
-                                )
+                            && (matches!(control.as_str(), "Start" | "Mode")
                                 || pocket_library::keybindings::steam_deck_guest_button(
                                     &control,
                                     self.running_is_gizmondo,
@@ -4447,25 +4974,8 @@ impl PocketLauncher {
                             self.deck_library_actions.push(control);
                             continue;
                         }
-                        if self.screen == Screen::Run && control == "Misc1" {
-                            self.deck_fn_press.entry(key).or_insert_with(Instant::now);
-                            continue;
-                        }
                         if self.screen == Screen::Run && control == "Start" {
                             self.deck_menu_press.get_or_insert((device, Instant::now()));
-                            continue;
-                        }
-                        // Steam (Guide) and Quick Access (...) (Misc1) can be
-                        // delivered separately from View/Menu by some SDL profiles.
-                        // Capture them only for PocketPC; Gizmondo stays untouched.
-                        if self.screen == Screen::Run
-                            && !self.running_is_gizmondo
-                            && pocket_library::keybindings::steam_deck_pocketpc_fn_exit_control(
-                                &control,
-                                self.running_is_gizmondo,
-                            )
-                        {
-                            self.deck_fn_press.entry(key).or_insert_with(Instant::now);
                             continue;
                         }
                         if control == "Select" {
@@ -4476,9 +4986,6 @@ impl PocketLauncher {
                             if let Some(parent) = self.game_menu_parent.take() {
                                 self.config_draft = None;
                                 self.game_settings_draft = None;
-                                self.gamepad_capture = None;
-                                self.binding_capture = None;
-                                self.stylus_capture = None;
                                 self.rename_draft = None;
                                 self.information_game = None;
                                 self.screen = Screen::Library;
@@ -4508,12 +5015,10 @@ impl PocketLauncher {
                             }
                             continue;
                         }
+                        if self.screen == Screen::About && control == "East" {self.close_about();continue;}
                         if self.screen != Screen::Run && control == "East" {
                             self.config_draft = None;
                             self.game_settings_draft = None;
-                            self.gamepad_capture = None;
-                            self.binding_capture = None;
-                            self.stylus_capture = None;
                             self.rename_draft = None;
                             self.information_game = None;
                             self.screen = if self.running_game.is_some() {
@@ -4543,10 +5048,6 @@ impl PocketLauncher {
                                     self.deck_library_actions.clear();
                                     self.deck_nav_repeat = None;
                                 }
-                                "Start" => {
-                                    self.config_draft = Some(self.settings_draft());
-                                    self.screen = Screen::Settings;
-                                }
                                 "South" | "North" => {
                                     self.deck_library_actions.push(control.clone())
                                 }
@@ -4569,20 +5070,6 @@ impl PocketLauncher {
                         &control,
                         self.running_is_gizmondo,
                     );
-                    if deck_button.is_none()
-                        && !self.running_is_gizmondo
-                        && self.library.config().stylus_stick.enabled
-                        && self
-                            .library
-                            .config()
-                            .stylus_stick
-                            .controller
-                            .iter()
-                            .any(|names| names.contains(&control))
-                    {
-                        self.stylus_gamepad.insert(key, 1.0);
-                        continue;
-                    }
                     let Some(button) = deck_button.or_else(|| {
                         self.library
                             .config()
@@ -4622,7 +5109,7 @@ impl PocketLauncher {
     fn handle_deck_view(
         &mut self,
         ctx: &egui::Context,
-        device: usize,
+        _device: usize,
         elapsed: Duration,
         released: bool,
     ) {
@@ -4631,39 +5118,21 @@ impl PocketLauncher {
                 let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
                 self.set_fullscreen(ctx, !fullscreen);
             }
-            Some(crate::deck_navigation::ViewAction::SecondaryKey)
-                if self.screen == Screen::Run && self.running_is_gizmondo =>
-            {
-                self.pulse_deck_piano(device, GuestButton::GizPiano3);
-            }
-            _ => {}
+            Some(crate::deck_navigation::ViewAction::ReturnToLibrary) => self.return_to_library(ctx),
+            None => {}
         }
-    }
-
-    fn pulse_deck_piano(&mut self, device: usize, button: GuestButton) {
-        // Keep the press visible across frontend/guest polling slices. An
-        // immediate down/up pair can otherwise disappear before the game polls.
-        if let Some((previous_device, _)) = self.deck_piano_release.take() {
-            self.release_gamepad_control(&(previous_device, "DeckHostPulse".into()));
-        }
-        let vk = button.vk();
-        self.gamepad_held
-            .insert((device, "DeckHostPulse".into()), vk);
-        if self.held.press(InputSource::Gamepad, vk) {
-            self.send_input(InputEvent::KeyDown { vk });
-        }
-        self.deck_piano_release = Some((device, Instant::now() + Duration::from_millis(80)));
     }
 
     fn cycle_deck_upscale_filter(&mut self, ctx: &egui::Context, forward: bool) {
         self.upscale_filter = self.upscale_filter.stepped(forward);
         self.library.config_mut().upscale_filter = self.upscale_filter.id().into();
+        if let Some(draft)=self.config_draft.as_mut() {draft.upscale_filter=self.upscale_filter.id().into();}
         self.status = match self.library.save() {
             Ok(()) => format!("Upscaling filter: {}", self.upscale_filter.label()),
             Err(error) => format!("Could not save filter: {error}"),
         };
-        self.deck_filter_notice = Some((
-            self.upscale_filter.label().to_owned(),
+        self.control_notice = Some((
+            format!("Filter: {}", self.upscale_filter.label()),
             Instant::now() + Duration::from_secs(3),
         ));
         if let Some(frame) = self.last_frame_snapshot.clone() {
@@ -4671,7 +5140,90 @@ impl PocketLauncher {
         }
     }
 
+    fn cycle_rotation(&mut self, ctx: &egui::Context) {
+        if self.last_frame_snapshot.is_none() {
+            return;
+        }
+        self.release_all_keys();
+        if let Some((x, y)) = self.pointer_down_at.take() {
+            self.send_input(InputEvent::PointerUp { x, y });
+        }
+        let next = RotationPref::ALL[(usize::from(rotation_turns(self.game_rotation)) + 1) % 4];
+        self.game_rotation = next;
+        self.persist_rotation(next);
+        ctx.request_repaint();
+    }
+
+    /// Run reserved host keys before any editor, grid or guest key consumer.
+    fn handle_host_keys(&mut self, ctx: &egui::Context) {
+        let keys = crate::host_shortcuts::take(ctx);
+        let mut fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        for key in keys {
+            if let Some(editor) = self.stylus_editor.as_mut().filter(|e| e.waiting.is_some()) {
+                editor.reserved_input_attempt();
+                continue;
+            }
+            if self.screen == Screen::InputSettings && self.bindings_visual.reserved_input_attempt()
+            {
+                self.control_notice = Some((
+                    "This input is reserved by PocketHLE.".into(),
+                    Instant::now() + Duration::from_secs(3),
+                ));
+            }
+            match key {
+                egui::Key::F7 => self.cycle_rotation(ctx),
+                egui::Key::F8 => {
+                    self.remove_game = None;
+                    self.add_data = None;
+                    self.data_game = None;
+                    self.deck_library_actions.clear();
+                    self.bindings_visual.clear_live();
+                    self.config_draft = None;
+                    self.game_settings_draft = None;
+                    self.file_dialog = None;
+                    self.stylus_editor = None;
+                    self.information_game = None;
+                    self.rename_draft = None;
+                    self.game_menu = None;
+                    if self.running_game.is_some() || self.game_viewport_active {
+                        self.return_to_library(ctx);
+                    } else {
+                        self.pending_run = None;
+                        self.release_all_keys();
+                        self.screen = Screen::Library;
+                        ctx.request_repaint();
+                    }
+                }
+                egui::Key::F9 => {
+                    self.cycle_deck_upscale_filter(ctx, true);
+                }
+                egui::Key::F10
+                    if self.screen != Screen::InputSettings
+                        && self.last_frame_snapshot.is_some() =>
+                {
+                    self.capture_screenshot()
+                }
+                egui::Key::F11 if self.screen != Screen::InputSettings => self.toggle_recording(),
+                egui::Key::F12 => {
+                    fullscreen = !fullscreen;
+                    self.set_fullscreen(ctx, fullscreen);
+                }
+                _ => {}
+            }
+        }
+    }
+    fn keyboard_profile_vk(&self, key: &str) -> Option<u16> {
+        pocket_library::keybindings::keyboard_button_for_profile(
+            &self.library.config().keybindings,
+            key,
+            self.running_is_gizmondo,
+        )
+        .map(|b| b.vk())
+    }
+
     fn handle_physical_keyboard(&mut self, ctx: &egui::Context) {
+        if self.screen==Screen::InputSettings {return;}
+
         if self.stylus_editor_keyboard(ctx) {
             return;
         }
@@ -4734,18 +5286,6 @@ impl PocketLauncher {
             else {
                 continue;
             };
-            if key == egui::Key::F10 {
-                if pressed && !repeat && self.last_frame_snapshot.is_some() {
-                    self.capture_screenshot();
-                }
-                continue;
-            }
-            if key == egui::Key::F11 {
-                if pressed && !repeat {
-                    self.toggle_recording();
-                }
-                continue;
-            }
             if key == egui::Key::F6
                 && self.screen == Screen::Run
                 && self.library.config().gps_fixed_enabled
@@ -4763,13 +5303,6 @@ impl PocketLauncher {
                 }
                 continue;
             }
-            if key == egui::Key::F12 {
-                if pressed && !repeat {
-                    let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-                    self.set_fullscreen(ctx, !fullscreen);
-                }
-                continue;
-            }
             if key == egui::Key::Escape
                 && self.screen == Screen::Run
                 && ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
@@ -4779,23 +5312,21 @@ impl PocketLauncher {
                 }
                 continue;
             }
+            if self.screen == Screen::About && key == egui::Key::Escape && pressed && !repeat {self.close_about();continue;}
             if self.screen != Screen::Run {
                 continue;
             }
+            if !text_input && self.route_long_press(false,0,key.name(),pressed) {continue;}
             if !text_input && self.route_grid(HostInput::Keyboard(key.name().into()), pressed) {
                 continue;
             }
             let steering_direction = self.touch_steering_enabled()
-                && self
-                    .library
-                    .config()
-                    .keybindings
-                    .vk_for_key(key.name())
+                && self.keyboard_profile_vk(key.name())
                     .is_some_and(|vk| matches!(vk, 0x25..=0x28));
             if !self.running_is_gizmondo
                 && !text_input
                 && !steering_direction
-                && self.library.config().stylus_stick.enabled
+
                 && self
                     .library
                     .config()
@@ -4817,7 +5348,7 @@ impl PocketLauncher {
             }
             // Both PocketPC and Gizmondo use the same configurable host-key map.
             // PocketPC directions follow the displayed image; action bindings follow the per-game swap.
-            let vk = self.library.config().keybindings.vk_for_key(key.name());
+            let vk = self.keyboard_profile_vk(key.name());
             let Some(vk) = vk else {
                 continue;
             };
@@ -4903,9 +5434,31 @@ impl PocketLauncher {
         match outcome {
             Outcome::Cancelled(_) => {
                 self.library_busy = false;
+                self.data_game = None;
                 self.status = "File selection cancelled.".into();
             }
+            Outcome::Selected(Purpose::AddData, path) => {
+                if let Some(id) = self.data_game.take() {
+                    if pocket_library::add_data::is_zip(&path.to_string_lossy()) {
+                        self.add_data = Some(DataPrompt::Zip { id, path });
+                    } else {
+                        self.prepare_data(id, path, false);
+                    }
+                }
+            }
             Outcome::Selected(Purpose::Import, path) => self.import_selected_file(path),
+            Outcome::Selected(Purpose::CeExecutable, path) => {
+                self.ce_launch.executable = path.to_string_lossy().into_owned();
+                self.library_busy = false;
+            }
+            Outcome::Selected(Purpose::CeImage, path) => {
+                self.ce_launch.image_root = path.to_string_lossy().into_owned();
+                self.library_busy = false;
+            }
+            Outcome::Selected(Purpose::CeData, path) => {
+                self.ce_launch.data_dir = path.to_string_lossy().into_owned();
+                self.library_busy = false;
+            }
             Outcome::Selected(Purpose::RestoreBackup, path) => {
                 self.restore_archive = Some(path);
                 self.status = "Choose a restore mode.".into();
@@ -4960,9 +5513,11 @@ impl PocketLauncher {
             let tx = self.events_tx.clone();
             self.status = "Validating and restoring backup…".into();
             std::thread::spawn(move || {
-                let result = pocket_library::backup::restore(&root, &archive, mode)
-                    .map(|()| "Library restored.".into())
-                    .map_err(|e| format!("{e:#}"));
+                let result = crate::with_suspended_library_log(&root, || {
+                    pocket_library::backup::restore(&root, &archive, mode)
+                })
+                .map(|()| "Library restored.".into())
+                .map_err(|e| format!("{e:#}"));
                 let _ = tx.send(UiEvent::BackupFinished(result));
             });
         }
@@ -4983,11 +5538,12 @@ impl PocketLauncher {
     }
 
     fn import_selected_file(&mut self, path: std::path::PathBuf) {
+        let profile = self.library.profile();
         let library_root = self.library.root().to_path_buf();
         let tx = self.events_tx.clone();
         std::thread::spawn(move || {
-            let result = (|| -> Result<Vec<GameEntry>, String> {
-                let mut lib = Library::open(&library_root).map_err(|e| e.to_string())?;
+            let result = (|| -> Result<Option<ImportedGames>, String> {
+                let mut lib = Library::open_with_profile(&library_root, profile).map_err(|e| e.to_string())?;
                 let parent = path
                     .parent()
                     .map(|p| p.to_path_buf())
@@ -5001,23 +5557,47 @@ impl PocketLauncher {
                 {
                     tx.send(UiEvent::ImportPrepared(pending))
                         .map_err(|e| e.to_string())?;
-                    return Ok(Vec::new());
+                    return Ok(None);
                 }
-                lib.apply_prepared_import(pending, false)
-                    .map_err(|e| e.to_string())
+                let entries = lib
+                    .apply_prepared_import(pending, false)
+                    .map_err(|e| e.to_string())?;
+                Ok(Some(ImportedGames::analyze(entries, &lib, &[])))
             })();
-            if !matches!(&result, Ok(entries) if entries.is_empty()) {
+            if let Some(result) = result.transpose() {
                 let _ = tx.send(UiEvent::ImportFinished(result));
             }
         });
         self.status = "Importing...".to_string();
     }
 
+    pub fn request_startup_window(&mut self, fullscreen: bool) {
+        self.startup_window = Some(fullscreen);
+    }
+
     pub fn launch_from_command_line(&mut self, game: &GameEntry, filter: Option<usize>) {
+        if let Some(ce) = &game.settings.windows_ce {
+            self.ce_launch = crate::ce_launch::CeLaunch {
+                profile_name: ce.profile_name.clone(),
+                executable: game.executable.to_string_lossy().into_owned(),
+                image_root: ce.image_root.as_ref().map(|p|p.to_string_lossy().into_owned()).unwrap_or_default(),
+                data_dir: ce.data_dir.as_ref().map(|p|p.to_string_lossy().into_owned()).unwrap_or_default(),
+                app_prefix: ce.app_prefix.clone(),
+                command_line: ce.command_line.clone(),
+                screen: game.settings.screen,
+                classic_windows: ce.classic_windows,
+            };
+            if !self.ce_launch.profile_name.is_empty() {
+                if let Err(error) = self.ce_profiles.remember(self.library.root(), &mut self.ce_launch)
+                    .and_then(|()| self.ce_launch.save(self.library.root())) {
+                    log::warn!("Cannot save CE launch profile: {error:#}");
+                }
+            }
+        }
         if let Some(filter) = filter.and_then(|i| UpscaleFilter::ALL.get(i)).copied() {
             self.upscale_filter = filter;
         }
-        self.selected_game = Some(game.id.clone());
+        self.selected_game = game.settings.windows_ce.is_none().then(||game.id.clone());
         // Preserve the normal launch path, including required startup prompts.
         self.spawn_run(game);
     }
@@ -5112,8 +5692,8 @@ impl PocketLauncher {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                if cfg!(feature = "steam-deck") {
-                    ui.label("A: Start • B: Back • X: Unlock Turf Wars + Tag Editor • D-pad / stick: language");
+                if !self.gamepad_devices.is_empty() {
+                    ui.label(crate::controller_labels::text(ctx, "{South}: Start • {East}: Back • {West}: Unlock Turf Wars + Tag Editor • D-pad / stick: language"));
                 }
                 if languages.len() > 1 {
                 ui.label("Language");
@@ -5236,18 +5816,28 @@ impl PocketLauncher {
             return;
         }
         self.last_frame_texture = None;
+        self.uploaded_image_id = None;
         self.last_frame_snapshot = None;
         self.last_frame_status = None;
         self.frame_stats.reset();
+        self.rate_badge = None;
+        if let Some(renderer) = self.reconstruction.as_ref() {
+            renderer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .begin_session(self.upscale_filter.gpu_filter());
+        }
         // Start turned the way this game was saved: a portrait-rendered
         // landscape title is unplayable until it is turned, and the user
         // should not have to re-pick that on every launch.
         self.game_rotation = game.settings.rotation;
         self.gamepad_rx.set_deadzone(game.settings.dpad_deadzone);
         self.screen = Screen::Run;
+        self.game_viewport_active = true;
         self.running_game = Some(game.display_name.clone());
-        self.running_game_id = Some(game.id.clone());
+        self.running_game_id = game.settings.windows_ce.is_none().then(||game.id.clone());
         self.running_is_gizmondo = is_gizmondo_game(game, self.library.root());
+        self.running_is_windows_ce = game.settings.windows_ce.is_some();
         self.running_swap_button_groups =
             !self.running_is_gizmondo && game.settings.pocketpc_swap_button_groups;
         self.running_controls_mode = if self.running_is_gizmondo {
@@ -5255,9 +5845,10 @@ impl PocketLauncher {
         } else {
             game.settings.controls_mode()
         };
+        self.stylus_pointer=Default::default();
+        self.stylus_tick=Instant::now();
         self.running_stylus_grid = game.settings.pocketpc_stylus_grid.clone();
-        self.console_fit_pending = true;
-        let (frame_tx, frame_rx) = mpsc::channel();
+        let (frame_tx, frame_rx) = crate::latest_frame::channel();
         let (input_tx, input_rx) = mpsc::channel();
         let (dependency_notice_tx, dependency_notice_rx) = mpsc::channel();
         self.dependency_notice_rx = Some(dependency_notice_rx);
@@ -5267,6 +5858,9 @@ impl PocketLauncher {
         self.gps_notice = None;
         self.frame_rx = Some(frame_rx);
         self.input_tx = Some(input_tx);
+        self.system_media = SystemMediaView::default();
+        self.media_keys_down = [false; 2];
+        let system_media = self.system_media.clone();
         if !self.running_is_gizmondo {
             self.send_input(InputEvent::KeyboardRotation {
                 turns: rotation_turns(self.game_rotation),
@@ -5278,7 +5872,7 @@ impl PocketLauncher {
         let game = game.clone();
         let tx = self.events_tx.clone();
         let runner = self.runner.clone();
-        std::thread::spawn(move || {
+        self.run_thread = Some(std::thread::spawn(move || {
             let outcome = runner.run_game(
                 library_root,
                 game,
@@ -5286,9 +5880,10 @@ impl PocketLauncher {
                 Some(input_rx),
                 Some(gps_notice_tx),
                 Some(dependency_notice_tx),
+                system_media,
             );
             let _ = tx.send(UiEvent::RunFinished(outcome));
-        });
+        }));
         self.status = "Starting emulator...".to_string();
     }
 }
@@ -5336,8 +5931,26 @@ fn rotated_pointer_to_game(
     )
 }
 
+impl PocketLauncher {
+    fn finish_shared_gpu_worker(&mut self) {
+        self.runner.stop_shared_worker(
+            &mut self.shared_gpu_context,
+            &mut self.input_tx,
+            &mut self.frame_rx,
+            &mut self.run_thread,
+        );
+    }
+}
+impl Drop for PocketLauncher {
+    fn drop(&mut self) {
+        self.finish_shared_gpu_worker();
+    }
+}
+
 impl eframe::App for PocketLauncher {
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        self.cancel_center_tap();
+        self.finish_shared_gpu_worker();
         self.recording
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -5350,6 +5963,35 @@ impl eframe::App for PocketLauncher {
         }
     }
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if self.screen == Screen::InputSettings || (self.screen == Screen::Run && !ctx.wants_keyboard_input()) {
+            crate::host_shortcuts::normalize_number_row(raw);
+        }
+        if self.screen == Screen::Run {
+            let active = self.media_active();
+            raw.events.retain(|event| {
+                let egui::Event::Key { key, pressed, .. } = event else {
+                    return true;
+                };
+                let (index, command) = match key {
+                    egui::Key::Enter => (0, SystemMediaCommand::TogglePause),
+                    egui::Key::Escape => (1, SystemMediaCommand::Stop),
+                    _ => return true,
+                };
+                let captured = self.media_keys_down[index];
+                if *pressed && active {
+                    self.media_keys_down[index] = true;
+                    return false;
+                }
+                if !*pressed && captured {
+                    self.media_keys_down[index] = false;
+                    if active {
+                        self.media_command(command);
+                    }
+                    return false;
+                }
+                true
+            });
+        }
         crate::desktop_pointer::finish_missing_releases(ctx, raw);
         self.controller_ui.prepare_input(
             ctx,
@@ -5360,6 +6002,81 @@ impl eframe::App for PocketLauncher {
         );
     }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let released = self.center_tap.borrow_mut().release_due(self.input_gesture_clock.elapsed().as_millis() as u64);
+        if let Some((x,y)) = released { self.dispatch_input(InputEvent::PointerUp {x,y}); }
+        let commands=std::mem::take(&mut *self.pending_binding_commands.borrow_mut());
+        for command in commands {
+            if matches!(command,pocket_library::keybindings::STYLUS_CLICK_COMMAND|pocket_library::keybindings::STYLUS_RELEASE_COMMAND)
+                && !ctx.input(|i|i.viewport().focused.unwrap_or(true)) {self.stylus_pointer.cancel_click();continue;}
+            match command {
+                pocket_library::keybindings::STYLUS_CLICK_COMMAND => self.stylus_button(true),
+                pocket_library::keybindings::STYLUS_RELEASE_COMMAND => self.stylus_button(false),
+                pocket_library::keybindings::ROTATION_COMMAND => self.cycle_rotation(ctx),
+                pocket_library::keybindings::SCREENSHOT_COMMAND if self.last_frame_snapshot.is_some() => self.capture_screenshot(),
+                _ => {}
+            }
+        }
+        self.handle_host_keys(ctx);
+        if self.screen == Screen::InputSettings {
+            self.bindings_visual.keyboard_shortcut(ctx, self.input_controller);
+        }
+        // Input-editor keystrokes are visual tests; the assistant and open popups retain events.
+        if self.screen==Screen::InputSettings && !self.bindings_visual.quick_active()
+            && !ctx.memory(|memory|memory.any_popup_open()) {
+            ctx.input_mut(|input|input.events.retain(|event|!matches!(event,egui::Event::Key{..}|egui::Event::Text(_))));
+        }
+
+        if self.screen==Screen::Run && ctx.input(|i|i.viewport().focused.unwrap_or(true)) {
+            let edges=self.input_gestures.tick(self.input_gesture_clock.elapsed().as_millis() as u64);self.send_gesture_edges(edges);
+            if self.input_gestures.active() {ctx.request_repaint_after(Duration::from_millis(10));}
+        }
+        // Early-return dialogs retain ordinary host repaint behavior. Only a
+        // complete Run update enables image-driven redraws.
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::new("pockethle.frame_driven_ui"), false);
+        });
+        // Observe the launcher before input/events can start a game. Freeze this
+        // state throughout the session, including a queued game-to-game launch.
+        let observed = LibraryViewport::capture(ctx);
+        if self.screen == Screen::Library
+            && self.running_game.is_none()
+            && self.library_restore_pending.is_none()
+        {
+            self.library_viewport = observed;
+        } else if self.library_viewport.size.is_none() {
+            self.library_viewport.size = observed.size;
+            self.library_viewport.position = observed.position;
+        }
+        // Apply startup mode after native restoration, then size a normal window
+        // using a fixed physical target capped to the actual monitor, never a game.
+        if let Some(fullscreen) = self.startup_window {
+            let target = LibraryViewport { fullscreen, maximized: false, size: None, position: None };
+            if target.restore(ctx) {
+                if fullscreen {
+                    self.startup_window = None;
+                } else {
+                    let geometry = ctx.input(|input| {
+                        let viewport = input.viewport();
+                        let monitor = viewport.monitor_size?;
+                        let borders = viewport.inner_rect.zip(viewport.outer_rect)
+                            .map_or(Vec2::ZERO, |(inner, outer)| outer.size() - inner.size());
+                        crate::launch_args::startup_window_size([monitor.x, monitor.y], [borders.x, borders.y], input.pixels_per_point)
+                    });
+                    if let Some(size) = geometry {
+                        let size = Vec2::from(size);
+                        let minimum = Vec2::new(640.0, 420.0) / ctx.pixels_per_point();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(minimum.min(size)));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                        self.fullscreen_window_size = Some(size);
+                        self.library_viewport = LibraryViewport { size: Some(size), ..target };
+                        self.startup_window = None;
+                    } else {
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    }
+                }
+            }
+        }
+
         crate::controller_ui::begin_frame(ctx);
         if self.screen != Screen::Library
             || self.library_tab != crate::deck_navigation::LibraryTab::Recordings
@@ -5367,9 +6084,36 @@ impl eframe::App for PocketLauncher {
             self.recordings_gallery.close_player();
         }
         self.drain_events(ctx);
+        if let Some(renderer) = self.reconstruction.as_ref() {
+            if renderer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .needs_session_cleanup()
+            {
+                let renderer = renderer.clone();
+                ctx.layer_painter(egui::LayerId::background())
+                    .add(egui::PaintCallback {
+                        rect: ctx.screen_rect(),
+                        callback: std::sync::Arc::new(eframe::egui_glow::CallbackFn::new(
+                            move |_, _| {
+                                renderer
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .collect_session_resources();
+                            },
+                        )),
+                    });
+            }
+        }
         if self.file_dialog.is_some() {
             self.update_gamepad_input(ctx);
             self.ui_file_dialog(ctx);
+            return;
+        }
+        if self.add_data.is_some() {
+            self.update_gamepad_input(ctx);
+            self.ui_add_data(ctx);
+            self.controller_ui.show(ctx);
             return;
         }
         if self.restore_archive.is_some() {
@@ -5459,56 +6203,16 @@ impl eframe::App for PocketLauncher {
             };
         }
         self.update_gamepad_input(ctx);
-        if let Some((device, release_at)) = self.deck_piano_release {
-            if Instant::now() >= release_at {
-                self.deck_piano_release = None;
-                self.release_gamepad_control(&(device, "DeckHostPulse".into()));
-            }
-        }
         if self.screen == Screen::Run {
-            if let Some((device, pressed_at)) = self.deck_view_press {
-                if !self.running_is_gizmondo {
-                    // In PocketPC, View/FN long-hold has the same EXIT timing as
-                    // Menu/FN. Do not consume View at its old secondary-key threshold.
-                    if crate::deck_navigation::menu_action(pressed_at.elapsed(), false)
-                        == Some(crate::deck_navigation::MenuAction::ReturnToLibrary)
-                    {
-                        self.deck_view_press = None;
-                        self.return_to_library(ctx);
-                    }
-                } else if crate::deck_navigation::view_action(pressed_at.elapsed(), false).is_some()
+            if let Some((_, pressed_at)) = self.deck_view_press {
+                if crate::deck_navigation::menu_action(pressed_at.elapsed(), false)
+                    == Some(crate::deck_navigation::MenuAction::ReturnToLibrary)
                 {
-                    // Gizmondo View brightness remains unchanged.
                     self.deck_view_press = None;
-                    self.handle_deck_view(ctx, device, pressed_at.elapsed(), false);
+                    self.return_to_library(ctx);
                 }
             }
-            if !self.running_is_gizmondo
-                && self.deck_fn_press.iter().any(|((_, control), pressed_at)| {
-                    control != "Misc1"
-                        && crate::deck_navigation::menu_action(pressed_at.elapsed(), false)
-                            == Some(crate::deck_navigation::MenuAction::ReturnToLibrary)
-                })
-            {
-                self.deck_fn_press.clear();
-                self.return_to_library(ctx);
-            }
-            let right_fn: Vec<_> = self
-                .deck_fn_press
-                .iter()
-                .filter(|((_, control), at)| {
-                    control == "Misc1"
-                        && crate::deck_navigation::right_fn_action(at.elapsed(), false)
-                            == Some(crate::deck_navigation::RightFnAction::ToggleRecording)
-                })
-                .map(|(key, _)| key.clone())
-                .collect();
-            let mut toggle_right_recording = !right_fn.is_empty();
-            if !right_fn.is_empty() {
-                for key in right_fn {
-                    self.deck_fn_press.remove(&key);
-                }
-            }
+            let mut toggle_right_recording = false;
             if let Some((_, pressed_at)) = self.deck_menu_press {
                 if crate::deck_navigation::right_fn_action(pressed_at.elapsed(), false)
                     == Some(crate::deck_navigation::RightFnAction::ToggleRecording)
@@ -5526,6 +6230,7 @@ impl eframe::App for PocketLauncher {
             || self.colors_startup_prompt.is_some()
             || self.library_busy
             || self.rename_draft.is_some()
+            || self.remove_game.is_some()
             || self.demo_import.is_some()
             || self.pending_import.is_some()
         {
@@ -5560,12 +6265,37 @@ impl eframe::App for PocketLauncher {
             ctx.request_repaint_after(Duration::from_millis(100));
             return;
         }
+        if let Some(prompt)=self.remove_game.as_ref() {
+            self.deck_nav_repeat=None;
+            self.controller_ui.stop_repeat();
+            let actions=std::mem::take(&mut self.deck_library_actions);
+            if let Some(confirm)=prompt.show(ctx,&actions) {
+                let prompt=self.remove_game.take().unwrap();
+                if confirm && self.running_game.is_some() {
+                    self.status="Stop the running game before removing a library entry.".into();
+                } else if confirm {
+                    match self.library.remove(&prompt.id) {
+                        Ok(())=> {
+                            self.analysis_cache.remove(&prompt.id);
+                            if self.selected_game.as_deref()==Some(&prompt.id) {self.selected_game=None;}
+                            self.status=format!("Removed {}",prompt.name);
+                        }
+                        Err(error)=>self.status=format!("Remove failed: {error}"),
+                    }
+                }
+            }
+            return;
+        }
+        if self.ui_pocketpc_import_options(ctx) {
+            return;
+        }
         if self.ui_release_update(ctx) {
             self.controller_ui.show(ctx);
             return;
         }
         self.handle_physical_keyboard(ctx);
         self.update_stylus_input(ctx);
+        if !self.pending_binding_commands.borrow().is_empty() {ctx.request_repaint();}
         self.drain_events(ctx);
         if let Some(result) = self
             .screenshot
@@ -5590,16 +6320,19 @@ impl eframe::App for PocketLauncher {
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         if fullscreen != self.display_fullscreen {
             self.display_fullscreen = fullscreen;
-            if !fullscreen {
-                if let Some(size) = self.fullscreen_window_size.take() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                    self.console_fit_pending = false;
-                } else {
-                    self.console_fit_pending = true;
-                }
+            if !fullscreen && self.library_restore_pending.is_none() && self.startup_window.is_none() {
+                let size = self.fullscreen_window_size.take()
+                    .or(self.library_viewport.size)
+                    .unwrap_or(Vec2::new(1280.0, 800.0));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             }
             if let Some(frame) = self.last_frame_snapshot.clone() {
                 self.refresh_frame_texture(ctx, &frame);
+            }
+        }
+        if let Some(saved) = self.library_restore_pending {
+            if saved.restore(ctx) {
+                self.library_restore_pending = None;
             }
         }
         let console_only = fullscreen && self.screen == Screen::Run;
@@ -5614,8 +6347,7 @@ impl eframe::App for PocketLauncher {
             });
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let show_fps = self.library.config().show_fps && self.screen == Screen::Run;
-                    let reserve = if show_fps { 130.0 } else { 45.0 };
+                    let reserve = 45.0;
                     ui.add_sized(
                         Vec2::new(
                             (ui.available_width() - reserve).max(0.0),
@@ -5628,30 +6360,6 @@ impl eframe::App for PocketLauncher {
                     )
                     .on_hover_text(&self.status);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if show_fps {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{:.1} {}",
-                                    self.frame_stats.current_fps(),
-                                    if self
-                                        .frame_stats
-                                        .presentation_stats
-                                        .as_ref()
-                                        .and_then(|stats| stats.fps())
-                                        .is_some()
-                                    {
-                                        "FPS"
-                                    } else {
-                                        "IPS"
-                                    }
-                                ))
-                                .small()
-                                .color(Color32::from_rgb(116, 205, 176)),
-                            )
-                            .on_hover_text(
-                                "Game frames per second. The frame rate may drop in static menus.",
-                            );
-                        }
                         ui.label(
                             RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                                 .small()
@@ -5659,6 +6367,7 @@ impl eframe::App for PocketLauncher {
                         );
                     });
                 });
+                ui.add(egui::Label::new(RichText::new(crate::controller_labels::text(ctx,crate::toolbar_ui::NAV_HINT)).size(12.0).color(Color32::from_gray(153))).wrap(true));
             });
         }
         let central = egui::CentralPanel::default();
@@ -5673,7 +6382,7 @@ impl eframe::App for PocketLauncher {
             if self.controller_ui.keyboard_open() {
                 ui.set_enabled(false);
             }
-            if self.library_busy {
+            if self.library_busy && self.screen != Screen::About {
                 ui.spinner();
                 ui.label(&self.status);
                 return;
@@ -5683,6 +6392,12 @@ impl eframe::App for PocketLauncher {
                 return;
             }
             match self.screen {
+                Screen::About => self.ui_about(ui),
+                Screen::WindowsCe => {
+                    crate::controller_ui::page_scope(ui,"windows_ce",|ui| {
+                        ScrollArea::vertical().show(ui,|ui| self.ui_windows_ce(ui));
+                    });
+                }
                 Screen::Library => {
                     ui.add_enabled_ui(
                         self.information_game.is_none() && self.rename_draft.is_none(),
@@ -5726,20 +6441,18 @@ impl eframe::App for PocketLauncher {
         if self.screen == Screen::Library {
             self.ui_game_information(ctx);
         }
-        if self.screen == Screen::Run {
-            if let Some((label, expires)) = self.deck_filter_notice.clone() {
-                if Instant::now() < expires {
-                    egui::Area::new(egui::Id::new("deck_filter_notice"))
-                        .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-12.0, 12.0))
-                        .interactable(false)
-                        .show(ctx, |ui| {
-                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                ui.label(format!("Filter: {label}"));
-                            });
+        if let Some((label, expires)) = self.control_notice.clone() {
+            if Instant::now() < expires {
+                egui::Area::new(egui::Id::new("control_notice"))
+                    .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-12.0, 12.0))
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(label);
                         });
-                } else {
-                    self.deck_filter_notice = None;
-                }
+                    });
+            } else {
+                self.control_notice = None;
             }
         }
         if let Some((message, expires)) = self.gps_notice.clone() {
@@ -5770,25 +6483,152 @@ impl eframe::App for PocketLauncher {
         if self.screen != Screen::Run {
             self.controller_ui.show(ctx);
         }
-        // While a game is running we want to drain the live frame
-        // channel as fast as the runner produces frames; the original
-        // 250 ms cadence capped the launcher at 4 fps, which is most
-        // of what users perceived as "lag" in JumpyBall on the
-        // desktop. ~16 ms (60 fps) matches the runner's per-slice
-        // hook and keeps idle-frame redraws cheap because egui only
-        // actually re-uploads textures when something changed.
-        let repaint_after = if matches!(self.screen, Screen::Run) || self.frame_rx.is_some() {
+        // Image arrival wakes the native event loop. Keep a bounded fallback
+        // for hover/controller processing when a game stops publishing images.
+        let frame_driven = self.screen == Screen::Run && self.frame_rx.is_some();
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::new("pockethle.frame_driven_ui"), frame_driven);
+        });
+        let repaint_after = if frame_driven {
+            // Images notify immediately. Keep input/hover/controller processing
+            // alive even if the guest stops producing images; no FPS cap here.
+            Duration::from_millis(100)
+        } else if matches!(self.screen, Screen::Run) || self.frame_rx.is_some() {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(250)
         };
         ctx.request_repaint_after(repaint_after);
+        if self.center_tap.borrow().active() { ctx.request_repaint_after(Duration::from_millis(pocket_library::center_tap::DURATION_MS)); }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn library_restore_pass(
+        saved: LibraryViewport,
+        fullscreen: bool,
+        maximized: bool,
+    ) -> (bool, Vec<egui::ViewportCommand>) {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        viewport.fullscreen = Some(fullscreen);
+        viewport.maximized = Some(maximized);
+        viewport.inner_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0)));
+        let mut done = false;
+        let output = ctx.run(input, |ctx| {
+            done = saved.restore(ctx);
+        });
+        (
+            done,
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .clone(),
+        )
+    }
+
+    #[test]
+    fn library_windowed_restore_waits_for_fullscreen_exit_before_geometry() {
+        let saved = LibraryViewport {
+            fullscreen: false,
+            maximized: false,
+            size: Some(Vec2::new(960.0, 600.0)),
+            position: Some(Pos2::new(70.0, 40.0)),
+        };
+        let (done, commands) = library_restore_pass(saved, true, false);
+        assert!(!done);
+        assert_eq!(commands, vec![egui::ViewportCommand::Fullscreen(false)]);
+        // Only the next native acknowledgement allows restoring size/position.
+        let (done, commands) = library_restore_pass(saved, false, false);
+        assert!(done);
+        assert_eq!(
+            commands,
+            vec![
+                egui::ViewportCommand::OuterPosition(Pos2::new(70.0, 40.0)),
+                egui::ViewportCommand::InnerSize(Vec2::new(960.0, 600.0))
+            ]
+        );
+    }
+
+    #[test]
+    fn library_that_started_fullscreen_stays_fullscreen_without_resizing() {
+        let saved = LibraryViewport {
+            fullscreen: true,
+            maximized: false,
+            size: Some(Vec2::new(1920.0, 1080.0)),
+            position: Some(Pos2::ZERO),
+        };
+        let (done, commands) = library_restore_pass(saved, false, false);
+        assert!(!done);
+        assert_eq!(commands, vec![egui::ViewportCommand::Fullscreen(true)]);
+        let (done, commands) = library_restore_pass(saved, true, false);
+        assert!(done);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn library_maximized_restore_does_not_apply_game_or_monitor_size() {
+        let saved = LibraryViewport {
+            fullscreen: false,
+            maximized: true,
+            size: Some(Vec2::new(1920.0, 1040.0)),
+            position: Some(Pos2::ZERO),
+        };
+        let (done, commands) = library_restore_pass(saved, true, false);
+        assert!(!done);
+        assert_eq!(commands, vec![egui::ViewportCommand::Fullscreen(false)]);
+        let (done, commands) = library_restore_pass(saved, false, false);
+        assert!(!done);
+        assert_eq!(commands, vec![egui::ViewportCommand::Maximized(true)]);
+        let (done, commands) = library_restore_pass(saved, false, true);
+        assert!(done);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn library_unmaximized_restore_waits_before_applying_saved_geometry() {
+        let saved = LibraryViewport {
+            fullscreen: false,
+            maximized: false,
+            size: Some(Vec2::new(960.0, 600.0)),
+            position: None,
+        };
+        let (done, commands) = library_restore_pass(saved, false, true);
+        assert!(!done);
+        assert_eq!(commands, vec![egui::ViewportCommand::Maximized(false)]);
+        let (done, commands) = library_restore_pass(saved, false, false);
+        assert!(done);
+        assert_eq!(
+            commands,
+            vec![egui::ViewportCommand::InnerSize(Vec2::new(960.0, 600.0))]
+        );
+    }
+
+    #[test]
+    fn displayed_fps_excludes_dropped_frames_repaints_and_capture_redraws() {
+        let stats = FrameStats::default();
+        // A producer can submit 400 images; only every seventh reaches paint.
+        for image_id in 1..=400 {
+            if image_id % 7 == 0 {
+                for _ in 0..10 {
+                    stats.record_frame(image_id);
+                }
+            }
+        }
+        assert_eq!(stats.state.lock().unwrap().1.completed(), 57);
+        let capture_clone = stats.clone();
+        capture_clone.record_frame(399);
+        assert_eq!(stats.state.lock().unwrap().1.completed(), 57);
+        let mut fresh_session = stats.clone();
+        fresh_session.reset();
+        assert_eq!(fresh_session.current_fps(), 0.0);
+        assert_eq!(fresh_session.state.lock().unwrap().1.completed(), 0);
+        stats.record_frame(401); // A previous session callback cannot affect the reset meter.
+        assert_eq!(fresh_session.state.lock().unwrap().1.completed(), 0);
+    }
 
     #[test]
     fn physical_swap_matches_classic_slots_and_leaves_other_keys_unchanged() {
@@ -5821,14 +6661,8 @@ mod tests {
             }
             assert_eq!(current, filter);
         }
-        assert_eq!(
-            UpscaleFilter::Nearest.stepped(true),
-            UpscaleFilter::Reconstruction
-        );
-        assert_eq!(
-            UpscaleFilter::Reconstruction.stepped(false),
-            UpscaleFilter::Nearest
-        );
+        assert_eq!(UpscaleFilter::Nearest.stepped(true), UpscaleFilter::None);
+        assert_eq!(UpscaleFilter::None.stepped(false), UpscaleFilter::Nearest);
     }
 
     #[test]
@@ -6011,5 +6845,98 @@ mod tests {
         let (x, y) =
             rotated_pointer_to_game(Vec2::new(0.0, 0.0), display, game, RotationPref::None);
         assert_eq!((x, y), (0, 0));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GizIcon {
+    Text(&'static str),
+    Function(usize),
+    Media(usize),
+}
+fn paint_giz_icon(p: &egui::Painter, c: Pos2, r: f32, icon: GizIcon) {
+    let color = Color32::WHITE;
+    let stroke = egui::Stroke::new((r * 0.12).max(1.2), color);
+    let line = |a: Vec2, b: Vec2| {
+        p.line_segment([c + a * r, c + b * r], stroke);
+    };
+    let polygon = |points: &[Vec2]| {
+        p.add(egui::Shape::convex_polygon(
+            points.iter().map(|v| c + *v * r).collect(),
+            color,
+            egui::Stroke::new(0., color),
+        ));
+    };
+    let arc = |origin: Vec2, radius: f32, start: f32, end: f32| {
+        let points = (0..=20)
+            .map(|i| {
+                let a = start + (end - start) * i as f32 / 20.;
+                c + (origin + Vec2::new(a.cos(), a.sin()) * radius) * r
+            })
+            .collect();
+        p.add(egui::Shape::line(points, stroke));
+    };
+    let pi = std::f32::consts::PI;
+    match icon {
+        GizIcon::Function(0) => {
+            line(Vec2::new(-1., 0.), Vec2::new(0., -0.9));
+            line(Vec2::new(0., -0.9), Vec2::new(1., 0.));
+            line(Vec2::new(-0.65, -0.2), Vec2::new(-0.65, 0.8));
+            line(Vec2::new(0.65, -0.2), Vec2::new(0.65, 0.8));
+            line(Vec2::new(-0.65, 0.8), Vec2::new(0.65, 0.8));
+        }
+        GizIcon::Function(1) => {
+            polygon(&[
+                Vec2::new(-0.9, -0.3),
+                Vec2::new(-0.5, -0.3),
+                Vec2::new(0., -0.8),
+                Vec2::new(0., 0.8),
+                Vec2::new(-0.5, 0.3),
+                Vec2::new(-0.9, 0.3),
+            ]);
+            arc(Vec2::new(-0.1, 0.), 0.65, -0.75, 0.75);
+            arc(Vec2::new(-0.1, 0.), 1.05, -0.75, 0.75);
+        }
+        GizIcon::Function(2) => {
+            p.circle_stroke(c, r * 0.45, stroke);
+            for i in 0..8 {
+                let a = i as f32 * pi / 4.;
+                let v = Vec2::new(a.cos(), a.sin());
+                line(v * 0.7, v);
+            }
+        }
+        GizIcon::Function(3) => {
+            line(Vec2::new(0., -0.25), Vec2::new(0., 0.85));
+            line(Vec2::new(-0.4, 0.85), Vec2::new(0.4, 0.85));
+            p.circle_filled(c + Vec2::new(0., -0.35) * r, r * 0.12, color);
+            for radius in [0.5, 0.9] {
+                arc(Vec2::new(0., -0.35), radius, -0.7, 0.7);
+                arc(Vec2::new(0., -0.35), radius, pi - 0.7, pi + 0.7);
+            }
+        }
+        GizIcon::Function(_) => {
+            arc(Vec2::ZERO, 0.85, -pi / 2. + 0.5, 3. * pi / 2. - 0.5);
+            line(Vec2::new(0., -1.), Vec2::new(0., 0.1));
+        }
+        GizIcon::Media(0) => {
+            p.rect_filled(Rect::from_center_size(c, Vec2::splat(r * 1.25)), 1., color);
+        }
+        GizIcon::Media(n) => {
+            let count = if n == 3 { 1 } else { 2 };
+            for i in 0..count {
+                let x = if count == 1 {
+                    -0.25
+                } else {
+                    -0.55 + i as f32 * 0.85
+                };
+                let sign = if n == 1 { -1. } else { 1. };
+                polygon(&[
+                    Vec2::new(sign * (x - 0.35), -0.65),
+                    Vec2::new(sign * (x + 0.55), 0.),
+                    Vec2::new(sign * (x - 0.35), 0.65),
+                ]);
+            }
+        }
+        GizIcon::Text(_) => {}
     }
 }

@@ -34,6 +34,8 @@ pub enum ControlClass {
     Progress,
     Tab,
     Toolbar,
+    Rebar,
+    StatusBar,
     ScrollBar,
 }
 
@@ -59,6 +61,12 @@ impl ControlClass {
             Some(Self::TrackBar)
         } else if name.eq_ignore_ascii_case("ToolbarWindow32") {
             Some(Self::Toolbar)
+        } else if name.eq_ignore_ascii_case("ReBarWindow32") {
+            Some(Self::Rebar)
+        } else if name.eq_ignore_ascii_case("msctls_statusbar32")
+            || name.eq_ignore_ascii_case("msctls_statusbar")
+        {
+            Some(Self::StatusBar)
         } else if name.eq_ignore_ascii_case("SCROLLBAR") {
             Some(Self::ScrollBar)
         } else if name.eq_ignore_ascii_case("SysTabControl32") {
@@ -125,7 +133,9 @@ pub struct DialogPanel {
     /// Shell-managed fullscreen captions share the PocketPC navigation strip.
     /// None retains ordinary popup/dialog caption metrics.
     pub caption_height: Option<i32>,
-    /// Is the OK box currently held down?
+    pub caption_command: Option<u32>,
+    pub caption_help: bool,
+    /// Is the caption button currently held down?
     pub ok_pressed: bool,
 }
 
@@ -141,6 +151,7 @@ impl DialogPanel {
     /// to be wide enough for two glyphs plus a pixel of padding either
     /// side. The `?` box beside it is square.
     const BOX_H: i32 = 11;
+    const NAVIGATION_BOX: i32 = 20;
     const OK_BOX: i32 = 2 * font::GLYPH_W + 4;
     const HELP_BOX: i32 = Self::BOX_H;
     /// Gap between the two boxes.
@@ -153,10 +164,32 @@ impl DialogPanel {
     /// The OK label is drawn in the caption blue, as on a device.
     const OK_FG: u16 = 0x0010;
 
+    pub const WS_EX_CAPTIONOKBTN: u32 = 0x8000_0000;
+
+    pub fn set_caption_styles(&mut self, style: u32, extended: u32) {
+        const WS_SYSMENU: u32 = 0x0008_0000;
+        self.caption_command = if extended & Self::WS_EX_CAPTIONOKBTN != 0 {
+            Some(IDOK)
+        } else if style & WS_SYSMENU != 0 {
+            Some(IDCANCEL)
+        } else {
+            None
+        };
+        const DS_CONTEXTHELP: u32 = 0x0000_2000;
+        const WS_EX_CONTEXTHELP: u32 = 0x0000_0400;
+        self.caption_help = style & DS_CONTEXTHELP != 0 || extended & WS_EX_CONTEXTHELP != 0;
+    }
+
     /// Height the caption takes off the top of the window, or 0.
     pub fn caption_h(&self) -> i32 {
         if self.caption.is_some() {
-            self.caption_height.unwrap_or(Self::CAPTION_H).max(0)
+            match self.caption_height {
+                Some(navigation) if navigation > 0 => {
+                    (navigation - self.y - i32::from(self.border)).max(0)
+                }
+                Some(_) => 0,
+                None => Self::CAPTION_H,
+            }
         } else {
             0
         }
@@ -177,28 +210,51 @@ impl DialogPanel {
     /// why an app like Solitaire applies its Options as they are
     /// toggled rather than on the way out.
     pub fn ok_box(&self) -> Option<(i32, i32, i32, i32)> {
+        self.caption_command?;
+        self.caption_button_rect()
+    }
+
+    fn caption_button_rect(&self) -> Option<(i32, i32, i32, i32)> {
         self.caption.as_ref()?;
-        if self.caption_h() < Self::BOX_H {
+        let (top, height, width, box_height) = if let Some(height) = self.caption_height {
+            (0, height, Self::NAVIGATION_BOX, Self::NAVIGATION_BOX)
+        } else {
+            (
+                self.y + i32::from(self.border),
+                Self::CAPTION_H,
+                Self::OK_BOX,
+                Self::BOX_H,
+            )
+        };
+        if height < box_height {
             return None;
         }
-        let inset = i32::from(self.border);
-        let pad = (self.caption_h() - Self::BOX_H) / 2;
+        let pad = (height - box_height) / 2;
         Some((
-            self.x + self.w - inset - pad - Self::OK_BOX,
-            self.y + inset + pad,
-            Self::OK_BOX,
-            Self::BOX_H,
+            self.x + self.w - i32::from(self.border) - pad - width,
+            top + pad,
+            width,
+            box_height,
         ))
     }
 
-    /// Screen rectangle of the `?` box, immediately left of the OK one.
-    ///
-    /// Pocket PC puts context help here. We draw it because the caption
-    /// looks wrong without it, but it is inert: there is no help file to
-    /// show, and tapping it must not be mistaken for the OK box.
+    /// Screen rectangle of the help box, immediately left of the OK box.
     pub fn help_box(&self) -> Option<(i32, i32, i32, i32)> {
-        let (bx, by, _, bh) = self.ok_box()?;
-        Some((bx - Self::BOX_GAP - Self::HELP_BOX, by, Self::HELP_BOX, bh))
+        if !self.caption_help {
+            return None;
+        }
+        let (bx, by, bw, bh) = self.caption_button_rect()?;
+        let width = if self.uses_navigation_bar() {
+            Self::NAVIGATION_BOX
+        } else {
+            Self::HELP_BOX
+        };
+        let right = if self.caption_command.is_some() {
+            bx - Self::BOX_GAP
+        } else {
+            bx + bw
+        };
+        Some((right - width, by, width, bh))
     }
 
     /// Is `(x, y)`, in screen coordinates, inside the OK box?
@@ -214,7 +270,7 @@ impl DialogPanel {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
 
-    fn render(&self, surf: &mut Surface<'_>) {
+    pub(crate) fn render(&self, surf: &mut Surface<'_>) {
         if !self.visible || self.w <= 0 || self.h <= 0 {
             return;
         }
@@ -222,7 +278,13 @@ impl DialogPanel {
         if self.border {
             stroke(surf, self.x, self.y, self.w, self.h, ChildWindow::TEXT);
         }
-        self.render_caption(surf);
+        if !self.uses_navigation_bar() {
+            self.render_caption(surf);
+        }
+    }
+
+    pub fn uses_navigation_bar(&self) -> bool {
+        self.caption_height.is_some()
     }
 
     /// Paint the caption bar and its OK box.
@@ -245,16 +307,26 @@ impl DialogPanel {
         // Stop the title before the boxes rather than under them.
         let right = self
             .help_box()
+            .or_else(|| self.ok_box())
             .map(|(bx, ..)| bx - 2)
             .unwrap_or(cx + cw)
             .min(cx + cw);
         draw_clipped(surf, cx + 3, ty, title, Self::CAPTION_FG, right);
 
+        self.render_caption_buttons(surf);
+    }
+
+    pub(crate) fn render_caption_buttons(&self, surf: &mut Surface<'_>) {
         if let Some((bx, by, bw, bh)) = self.help_box() {
             self.render_caption_box(surf, (bx, by, bw, bh), "?", false);
         }
         if let Some((bx, by, bw, bh)) = self.ok_box() {
-            self.render_caption_box(surf, (bx, by, bw, bh), "OK", self.ok_pressed);
+            let label = if self.caption_command == Some(IDCANCEL) {
+                "X"
+            } else {
+                "OK"
+            };
+            self.render_caption_box(surf, (bx, by, bw, bh), label, self.ok_pressed);
         }
     }
 
@@ -278,10 +350,31 @@ impl DialogPanel {
         };
         draw_edge(surf, bx, by, bw, bh, tl, br);
         let nudge = i32::from(pressed);
+        if self.uses_navigation_bar() {
+            let font = crate::gdi::Font::new(-14);
+            let label = crate::text::layout(Some(&font), &label.encode_utf16().collect::<Vec<_>>());
+            label.draw(
+                surf,
+                bx + (bw - label.width) / 2 + nudge,
+                by + (bh - label.height) / 2 + nudge,
+                Self::OK_FG,
+                [bx + 1, by + 1, bx + bw - 1, by + bh - 1],
+            );
+            return;
+        }
         let tx = bx + (bw - font::str_width(label)).max(0) / 2 + nudge;
         let ty = by + (bh - font::GLYPH_H) / 2 + nudge;
         draw_clipped(surf, tx, ty, label, Self::OK_FG, bx + bw - 1);
     }
+}
+
+/// Column metadata for a report-mode list view.
+#[derive(Debug, Clone)]
+pub struct ListColumn {
+    pub title: String,
+    pub width: i32,
+    pub format: u32,
+    pub subitem: u32,
 }
 
 /// One built-in control owned by the HLE rather than by the guest.
@@ -320,6 +413,9 @@ pub struct ChildWindow {
     pub checked: bool,
     pub list_items: Vec<(String, u32)>,
     pub list_images: Vec<i32>,
+    pub list_states: Vec<u32>,
+    pub list_text_callbacks: Vec<bool>,
+    pub list_image_callbacks: Vec<bool>,
     pub list_image_lists: [u32; 3],
     pub list_image_sizes: [(u32, u32); 3],
     /// Cached selected-font cell height, shared by row layout and hit testing.
@@ -331,7 +427,8 @@ pub struct ChildWindow {
     pub list_text_color: u32,
     pub image: u32,
     pub list_selected: Option<usize>,
-    pub list_column_count: u32,
+    pub list_report_columns: Vec<ListColumn>,
+    pub list_subitems: Vec<std::collections::BTreeMap<u32, String>>,
     pub font: u32,
     pub choice_open: bool,
     pub choice_row_height: i32,
@@ -345,6 +442,7 @@ pub struct ChildWindow {
     pub track_tick_freq: u32,
     pub track_ticks: Vec<i32>,
     pub toolbar: ToolbarState,
+    pub status_bar: crate::StatusBar,
     pub tab: TabState,
 }
 
@@ -404,6 +502,9 @@ pub struct ToolbarState {
     pub bitmaps: Vec<(u32, u32)>,
     pub native_paint: bool,
     pub pressed: Option<usize>,
+    pub strings: Vec<Vec<u16>>,
+    pub tooltips: Vec<Vec<u16>>,
+    pub owned_bitmaps: std::collections::HashSet<u32>,
 }
 impl Default for ToolbarState {
     fn default() -> Self {
@@ -414,8 +515,24 @@ impl Default for ToolbarState {
             bitmaps: Vec::new(),
             native_paint: false,
             pressed: None,
+            strings: Vec::new(),
+            tooltips: Vec::new(),
+            owned_bitmaps: Default::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RebarBand {
+    pub info: [u32; 19],
+    pub text: Vec<u16>,
+    pub rect: [i32; 4],
+}
+#[derive(Debug, Default)]
+pub struct RebarState {
+    pub bands: Vec<RebarBand>,
+    pub notification: u32,
+    pub command_bands: bool,
 }
 const LIST_VIEW_ROW_HEIGHT: i32 = 14;
 
@@ -545,6 +662,62 @@ impl ChildWindow {
     pub fn list_columns(&self) -> usize {
         (self.w.max(1) / self.list_spacing.0.max(4)).max(1) as usize
     }
+    pub fn list_header_height(&self) -> i32 {
+        if self.style & 3 == 1 && self.style & 0x4000 == 0 && !self.list_report_columns.is_empty() {
+            self.list_row_height()
+        } else {
+            0
+        }
+    }
+    pub fn list_text(&self, row: usize, column: u32) -> &str {
+        if column == 0 {
+            return self.list_items.get(row).map_or("", |item| item.0.as_str());
+        }
+        self.list_subitems
+            .get(row)
+            .and_then(|cells| cells.get(&column))
+            .map_or("", String::as_str)
+    }
+    pub fn list_item_state(&self, index: usize) -> u32 {
+        (self.list_states.get(index).copied().unwrap_or(0) & !3)
+            | if self.list_selected == Some(index) {
+                3
+            } else {
+                0
+            }
+    }
+    pub fn set_list_item_state(&mut self, index: usize, state: u32, mask: u32) -> bool {
+        if index >= self.list_items.len() {
+            return false;
+        }
+        self.list_states.resize(self.list_items.len(), 0);
+        self.list_states[index] = (self.list_states[index] & !mask) | (state & mask);
+        if mask & 2 != 0 {
+            if state & 2 != 0 {
+                self.list_selected = Some(index);
+            } else if self.list_selected == Some(index) {
+                self.list_selected = None;
+            }
+        }
+        true
+    }
+    pub fn set_list_text(&mut self, row: usize, column: u32, text: String) -> bool {
+        let Some(item) = self.list_items.get_mut(row) else {
+            return false;
+        };
+        if column == 0 {
+            item.0 = text;
+        } else {
+            self.list_subitems
+                .resize_with(self.list_items.len(), Default::default);
+            if text.is_empty() {
+                self.list_subitems[row].remove(&column);
+            } else {
+                self.list_subitems[row].insert(column, text);
+            }
+        }
+        true
+    }
     pub fn list_item_position(&self, index: usize) -> (i32, i32) {
         self.list_positions
             .get(index)
@@ -560,8 +733,9 @@ impl ChildWindow {
                 } else {
                     (
                         0,
-                        (index as i64 * i64::from(self.list_row_height())).min(i64::from(i32::MAX))
-                            as i32,
+                        (index as i64 * i64::from(self.list_row_height())
+                            + i64::from(self.list_header_height()))
+                        .min(i64::from(i32::MAX)) as i32,
                     )
                 }
             })
@@ -589,8 +763,9 @@ impl ChildWindow {
         } else {
             self.list_row_height()
         };
-        if top < self.list_scroll_y {
-            self.list_scroll_y = top;
+        let header = self.list_header_height();
+        if top.saturating_sub(header) < self.list_scroll_y {
+            self.list_scroll_y = top.saturating_sub(header);
         } else if top.saturating_add(height) > self.list_scroll_y.saturating_add(self.h) {
             self.list_scroll_y = top.saturating_add(height).saturating_sub(self.h).max(0);
         }
@@ -631,7 +806,7 @@ impl ChildWindow {
                 self.list_images
                     .get(index)
                     .and_then(|i| usize::try_from(*i).ok())
-                    .and_then(|i| l.images.get(i))
+                    .and_then(|i| l.image(i, self.list_item_state(index)))
             }) {
                 image.draw(
                     surf,
@@ -716,9 +891,11 @@ impl ChildWindow {
             let mut item = self.clone();
             item.list_items = self.list_items.get(index).cloned().into_iter().collect();
             item.list_images = self.list_images.get(index).copied().into_iter().collect();
+            item.list_states = self.list_states.get(index).copied().into_iter().collect();
+            item.list_subitems = self.list_subitems.get(index).cloned().into_iter().collect();
+            item.style |= 0x4000; // The header belongs to the full control paint.
             item.list_selected = (self.list_selected == Some(index)).then_some(0);
-            let y =
-                index as i64 * i64::from(self.list_row_height()) - i64::from(self.list_scroll_y);
+            let y = i64::from(self.list_item_position(index).1) - i64::from(self.list_scroll_y);
             item.y = self
                 .y
                 .saturating_add(y.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
@@ -726,18 +903,19 @@ impl ChildWindow {
                 .list_row_height()
                 .min(self.h.saturating_sub(item.y - self.y));
             item.list_scroll_y = 0;
-            if item.y >= self.y && item.h > 0 {
+            if item.y >= self.y.saturating_add(self.list_header_height()) && item.h > 0 {
                 item.render_list(surf, Some(gdi));
             }
         }
     }
 
     pub fn list_item_at(&self, y: i32) -> Option<usize> {
-        if y < 0 || y >= self.h {
+        let header = self.list_header_height();
+        if y < header || y >= self.h {
             return None;
         }
-        let index =
-            (i64::from(y) + i64::from(self.list_scroll_y)) / i64::from(self.list_row_height());
+        let index = (i64::from(y - header) + i64::from(self.list_scroll_y))
+            / i64::from(self.list_row_height());
         usize::try_from(index)
             .ok()
             .filter(|i| *i < self.list_items.len())
@@ -758,17 +936,22 @@ impl ChildWindow {
             return;
         }
         let row_height = self.list_row_height();
+        let header = self.list_header_height();
+        let body_top = self.y.saturating_add(header);
+        let right = self.x.saturating_add(self.w);
+        let bottom_edge = self.y.saturating_add(self.h);
+        let report = self.style & 3 == 1 && !self.list_report_columns.is_empty();
         let (handle, iw, ih) = self.list_image_list();
         let first = (self.list_scroll_y.max(0) / row_height) as usize;
         for (index, (text, _)) in self.list_items.iter().enumerate().skip(first) {
-            let y = i64::from(self.y) + index as i64 * i64::from(row_height)
+            let y = i64::from(body_top) + index as i64 * i64::from(row_height)
                 - i64::from(self.list_scroll_y);
             if y >= i64::from(self.y) + i64::from(self.h) {
                 break;
             }
             let y = y as i32;
-            let top = y.max(self.y);
-            let bottom = (y + row_height).min(self.y + self.h);
+            let top = y.max(body_top);
+            let bottom = y.saturating_add(row_height).min(bottom_edge);
             let selected = self.list_selected == Some(index);
             if selected {
                 surf.fill_rect(self.x, top, self.w, bottom - top, 0x001f);
@@ -777,7 +960,7 @@ impl ChildWindow {
                 self.list_images
                     .get(index)
                     .and_then(|i| usize::try_from(*i).ok())
-                    .and_then(|i| l.images.get(i))
+                    .and_then(|i| l.image(i, self.list_item_state(index)))
             }) {
                 image.draw(
                     surf,
@@ -785,11 +968,42 @@ impl ChildWindow {
                     y + (row_height - ih as i32) / 2,
                     iw,
                     ih,
-                    [self.x, self.y, self.x + self.w, self.y + self.h],
+                    [self.x, body_top, right, bottom_edge],
                 );
             }
-            let ty = y + (row_height - crate::text::layout(face, &[]).height) / 2;
-            if ty >= self.y && ty + crate::text::layout(face, &[]).height <= self.y + self.h {
+            let font_height = crate::text::layout(face, &[]).height;
+            let ty = y + (row_height - font_height) / 2;
+            if ty >= body_top && ty.saturating_add(font_height) <= bottom_edge {
+                if report {
+                    let mut left = self.x;
+                    for column in &self.list_report_columns {
+                        let end = left.saturating_add(column.width).min(right);
+                        let inset = if column.subitem == 0 && iw > 0 {
+                            iw as i32 + 5
+                        } else {
+                            2
+                        };
+                        let cell = self.list_text(index, column.subitem);
+                        let start = left.saturating_add(inset);
+                        let x = list_aligned_x(face, cell, start, end - 2, column.format);
+                        if start < end {
+                            draw_clipped_font(
+                                surf,
+                                x,
+                                ty,
+                                cell,
+                                if selected { Self::WINDOW } else { Self::TEXT },
+                                end - 1,
+                                face,
+                            );
+                        }
+                        left = end;
+                        if left >= right {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 draw_clipped_font(
                     surf,
                     self.x + 2 + if iw > 0 { iw as i32 + 3 } else { 0 },
@@ -799,6 +1013,34 @@ impl ChildWindow {
                     self.x + self.w - 1,
                     face,
                 );
+            }
+        }
+        self.render_list_header(surf, face);
+    }
+
+    /// Paint the header separately from the list item's custom draw stages.
+    pub fn render_list_header(&self, surf: &mut Surface<'_>, face: Option<&crate::gdi::Font>) {
+        let header = self.list_header_height().min(self.h);
+        if header <= 0 {
+            return;
+        }
+        surf.fill_rect(self.x, self.y, self.w, header, Self::FACE);
+        let font_height = crate::text::layout(face, &[]).height;
+        let right = self.x.saturating_add(self.w);
+        let mut left = self.x;
+        for column in &self.list_report_columns {
+            let end = left.saturating_add(column.width).min(right);
+            if end > left {
+                surf.fill_rect(end - 1, self.y, 1, header, Self::SHADOW);
+                if font_height <= header {
+                    let y = self.y + (header - font_height) / 2;
+                    let x = list_aligned_x(face, &column.title, left + 2, end - 2, column.format);
+                    draw_clipped_font(surf, x, y, &column.title, Self::TEXT, end - 1, face);
+                }
+            }
+            left = end;
+            if left >= right {
+                break;
             }
         }
     }
@@ -978,6 +1220,14 @@ impl ChildWindow {
                     (Self::LIGHT, Self::SHADOW)
                 };
                 draw_edge(surf, x, self.y, width, self.toolbar.button_size.1, tl, br);
+                if b[1] == 0xf060 {
+                    crate::windowing::draw_frame_control(
+                        surf,
+                        [x, self.y, x + width, self.y + self.toolbar.button_size.1],
+                        1,
+                        if pressed { 0x200 } else { 0 },
+                    );
+                }
                 let mut index = b[0];
                 for &(handle, count) in &self.toolbar.bitmaps {
                     if index >= count {
@@ -1396,6 +1646,14 @@ impl ChildWindow {
         match self.class {
             ControlClass::Tab => self.render_tabs(surf),
             ControlClass::Toolbar => self.render_toolbar(surf, gdi),
+            ControlClass::Rebar => surf.fill_rect(self.x, self.y, self.w, self.h, Self::FACE),
+            ControlClass::StatusBar => self.status_bar.render_at(
+                surf,
+                (self.x, self.y, self.w, self.h),
+                face.as_ref(),
+                self.background_color
+                    .map(crate::framebuffer::colorref_to_rgb565),
+            ),
             ControlClass::ScrollBar => self.render_scrollbar(surf),
             ControlClass::TrackBar => self.render_track(surf, focused),
             ControlClass::Progress => self.render_progress(surf),
@@ -1693,6 +1951,24 @@ impl ChildWindow {
     }
 }
 
+fn list_aligned_x(
+    face: Option<&crate::gdi::Font>,
+    text: &str,
+    left: i32,
+    right: i32,
+    format: u32,
+) -> i32 {
+    if format & 3 == 0 {
+        return left;
+    }
+    let text = text.encode_utf16().collect::<Vec<_>>();
+    let spare = right
+        .saturating_sub(left)
+        .saturating_sub(crate::text::layout(face, &text).width)
+        .max(0);
+    left.saturating_add(if format & 3 == 2 { spare / 2 } else { spare })
+}
+
 /// Draw `text` but stop before `right`, so a caption never bleeds out
 /// of its control.
 fn draw_clipped_font(
@@ -1802,6 +2078,9 @@ pub struct FileDialog {
     pub directory: String,
     pub entries: Vec<(String, bool)>,
     pub filters: Vec<String>,
+    pub filter_choices: Vec<(String, Vec<String>)>,
+    pub filter_combo: u32,
+    pub image_list: u32,
     pub extension: String,
     pub flags: u32,
     pub save: bool,
@@ -1815,8 +2094,17 @@ pub struct FileDialog {
 /// Every built-in control the guest has created, plus the focus.
 #[derive(Debug, Clone)]
 pub struct Controls {
+    /// CE Control Panel's double-tap timeout, shared with GetDoubleClickTime.
+    pub double_click_time_ms: u64,
     /// Latest consumed stylus position in screen coordinates.
     pub cursor_position: (i32, i32),
+    /// Guest cursor selected by SetCursor. Zero means no selected cursor.
+    pub cursor_handle: u32,
+    /// Default IMM contexts with their IME open.
+    pub ime_open_contexts: std::collections::HashSet<u32>,
+    /// ShowCursor display counters keyed by stable guest thread ID. Guest devices
+    /// expose a stylus, not a mouse, so an untouched counter starts at -1.
+    pub cursor_display_counts: std::collections::HashMap<u32, i32>,
     /// Screen point of the last message retrieved by each guest thread.
     pub message_positions: std::collections::HashMap<usize, (i32, i32)>,
     /// Explicit guest SetCapture ownership, separate from host button presses.
@@ -1843,12 +2131,18 @@ pub struct Controls {
     /// here: releasing outside the button cancels the click instead of
     /// notifying the parent.
     capture: u32,
+    /// A single stylus can double-click a list item across two release edges.
+    last_list_click: Option<(u32, usize, i32, i32, std::time::Instant)>,
 }
 
 impl Default for Controls {
     fn default() -> Self {
         Self {
+            double_click_time_ms: 500,
             cursor_position: (0, 0),
+            cursor_handle: 0,
+            ime_open_contexts: Default::default(),
+            cursor_display_counts: Default::default(),
             message_positions: Default::default(),
             pointer_capture: Default::default(),
             recognized_holds: Default::default(),
@@ -1864,6 +2158,7 @@ impl Default for Controls {
             direct_surface_hwnd: 0,
             next_hwnd: Self::HWND_BASE,
             capture: 0,
+            last_list_click: None,
         }
     }
 }
@@ -1922,6 +2217,9 @@ impl Controls {
             checked: false,
             list_items: Vec::new(),
             list_images: Vec::new(),
+            list_states: Vec::new(),
+            list_text_callbacks: Vec::new(),
+            list_image_callbacks: Vec::new(),
             list_image_lists: [0; 3],
             list_image_sizes: [(0, 0); 3],
             list_font_height: 0,
@@ -1932,7 +2230,8 @@ impl Controls {
             list_text_color: 0,
             image: 0,
             list_selected: None,
-            list_column_count: 0,
+            list_report_columns: Vec::new(),
+            list_subitems: Vec::new(),
             font: crate::gdi::STOCK_SYSTEM_FONT,
             choice_open: false,
             choice_row_height: 16,
@@ -1950,6 +2249,11 @@ impl Controls {
             track_tick_freq: 1,
             track_ticks: Vec::new(),
             toolbar: ToolbarState::default(),
+            status_bar: crate::StatusBar {
+                parent,
+                height: h,
+                ..Default::default()
+            },
             tab: TabState::default(),
         });
         hwnd
@@ -2084,7 +2388,15 @@ impl Controls {
     pub fn screen_rect(&self, hwnd: u32) -> Option<(i32, i32, i32, i32)> {
         let child = self.get(hwnd)?;
         let (ox, oy) = self.parent_origin(child.parent);
-        Some((child.x + ox, child.y + oy, child.w, child.h))
+        // Explorer uses GetWindowRect to set its address band's cyMinChild.
+        // The combobox creation height includes the drop-down list; its
+        // window rectangle reports only the closed field on Windows CE.
+        let height = if child.class == ControlClass::ComboBox {
+            child.choice_closed_height()
+        } else {
+            child.h
+        };
+        Some((child.x + ox, child.y + oy, child.w, height))
     }
 
     pub fn get(&self, hwnd: u32) -> Option<&ChildWindow> {
@@ -2136,8 +2448,24 @@ impl Controls {
         self.children.is_empty() && self.panels.is_empty()
     }
 
+    /// Conservative paint preflight: hidden controls and a direct GAPI panel
+    /// have no pixels to replay, but visible children/popups still do.
+    pub fn has_visible_content(&self) -> bool {
+        self.children.iter().any(|c| self.is_showing(c))
+            || self.panels.iter().any(|p| {
+                p.visible
+                    && p.w > 0
+                    && p.h > 0
+                    && !self.inherited_hidden.contains(&p.hwnd)
+                    && (self.direct_surface_hwnd == 0 || self.direct_surface_hwnd != p.hwnd)
+            })
+    }
+
     /// Drop a control and anything that referred to it.
     pub fn destroy(&mut self, hwnd: u32) {
+        if self.last_list_click.is_some_and(|click| click.0 == hwnd) {
+            self.last_list_click = None;
+        }
         self.recognized_holds
             .retain(|(_, owner, _, _)| *owner != hwnd);
         self.pointer_capture.retain(|_, owner| *owner != hwnd);
@@ -2280,7 +2608,18 @@ impl Controls {
 
     /// Stylus down. Takes the focus, and arms a push button.
     pub fn pointer_down(&mut self, x: i32, y: i32) -> Option<ControlAction> {
-        let hwnd = self.hit_test(x, y)?;
+        let hit = self.hit_test(x, y);
+        let same_item = self.last_list_click.is_some_and(|(owner, index, _, _, _)| {
+            hit == Some(owner)
+                && self.get(owner).is_some_and(|c| {
+                    let (ox, oy) = self.parent_origin(c.parent);
+                    c.enabled && c.list_item_at_point(x - ox - c.x, y - oy - c.y) == Some(index)
+                })
+        });
+        if !same_item {
+            self.last_list_click = None;
+        }
+        let hwnd = hit?;
         let origin = self
             .get(hwnd)
             .map(|c| self.parent_origin(c.parent))
@@ -2373,6 +2712,9 @@ impl Controls {
                 child.list_item_at_point(x - origin.0 - child.x, y - origin.1 - child.y)
             {
                 child.list_selected = Some(index);
+                self.capture = hwnd;
+                self.focus = hwnd;
+                return Some(ControlAction::Consumed);
             }
         }
         if child.class == ControlClass::Static {
@@ -2399,21 +2741,44 @@ impl Controls {
     /// Stylus up. A button only notifies its parent when the release
     /// lands back inside the rectangle the press started in.
     pub fn pointer_up(&mut self, x: i32, y: i32) -> Option<ControlAction> {
-        if let Some(hwnd) = self.hit_test(x, y) {
-            if let Some(c) = self
-                .get(hwnd)
-                .filter(|c| c.class == ControlClass::ListView && c.enabled)
-            {
-                if let Some(index) = c.list_selected {
-                    return Some(ControlAction::Notify {
-                        parent: c.parent,
-                        id: c.id,
-                        hwnd,
-                        code: (-2i32) as u32,
-                        index: index as i32,
-                    });
+        let hwnd = self.capture;
+        if let Some(c) = self.get(hwnd).filter(|c| c.class == ControlClass::ListView) {
+            let (ox, oy) = self.parent_origin(c.parent);
+            let row = c.list_item_at_point(x - ox - c.x, y - oy - c.y);
+            let click = match row {
+                Some(index) if c.enabled && c.list_selected == Some(index) => {
+                    Some((index, c.parent, c.id))
                 }
-            }
+                _ => None,
+            };
+            let previous = self.last_list_click.take();
+            let action = if let Some((index, parent, id)) = click {
+                let now = std::time::Instant::now();
+                // Portable Explorer opens folders on NM_DBLCLK, while NM_CLICK
+                // only selects. Frontends supply raw down/up edges to both.
+                let double = previous.is_some_and(|(owner, row, px, py, at)| {
+                    owner == hwnd
+                        && row == index
+                        && x.abs_diff(px) <= 4
+                        && y.abs_diff(py) <= 4
+                        && now.duration_since(at)
+                            <= std::time::Duration::from_millis(self.double_click_time_ms)
+                });
+                if !double {
+                    self.last_list_click = Some((hwnd, index, x, y, now));
+                }
+                ControlAction::Notify {
+                    parent,
+                    id,
+                    hwnd,
+                    code: (if double { -3i32 } else { -2i32 }) as u32,
+                    index: index as i32,
+                }
+            } else {
+                ControlAction::Consumed
+            };
+            self.capture = 0;
+            return Some(action);
         }
         let captured = self.capture;
         if captured == 0 {
@@ -2490,6 +2855,7 @@ impl Controls {
         if let Some(panel) = self.panel_mut(parent) {
             if panel.ok_box_contains(x, y) {
                 panel.ok_pressed = true;
+                self.last_list_click = None;
                 return Some(ControlAction::Consumed);
             }
         }
@@ -2497,26 +2863,25 @@ impl Controls {
             Some(hwnd) if self.get(hwnd).map(|c| c.parent) == Some(parent) => {
                 self.pointer_down(x, y)
             }
-            _ => Some(ControlAction::Consumed),
+            _ => {
+                self.last_list_click = None;
+                Some(ControlAction::Consumed)
+            }
         }
     }
 
     /// [`Self::pointer_up`] restricted to the children of `parent`.
     pub fn pointer_up_in(&mut self, parent: u32, x: i32, y: i32) -> Option<ControlAction> {
-        // Releasing the caption's OK box is the dialog's accept: report
-        // it as `IDOK` from the panel itself, which is what the shell
-        // sends on a device.
+        // Dispatch the command selected by the caption style.
         if let Some(panel) = self.panel_mut(parent) {
             if panel.ok_pressed {
                 panel.ok_pressed = false;
-                let hit = panel.ok_box_contains(x, y);
+                let command = panel
+                    .caption_command
+                    .filter(|_| panel.ok_box_contains(x, y));
                 let hwnd = panel.hwnd;
-                return Some(if hit {
-                    ControlAction::Clicked {
-                        parent,
-                        id: IDOK,
-                        hwnd,
-                    }
+                return Some(if let Some(id) = command {
+                    ControlAction::Clicked { parent, id, hwnd }
                 } else {
                     ControlAction::Consumed
                 });
@@ -2547,6 +2912,7 @@ impl Controls {
 
     /// [`Self::key_down`] restricted to the children of `parent`.
     pub fn key_down_in(&mut self, parent: u32, vk: u16) -> Option<ControlAction> {
+        self.last_list_click = None;
         // Dialog-manager keys apply even when WM_INITDIALOG left no child
         // focused. Never borrow a default button from the window underneath.
         if vk == 0x1B {
@@ -2579,6 +2945,12 @@ impl Controls {
             return Some(ControlAction::Consumed);
         }
         if vk == 0x0D {
+            if self
+                .get(self.focus)
+                .is_some_and(|c| c.parent == parent && c.class == ControlClass::ListView)
+            {
+                return self.key_down(vk);
+            }
             let focused = self.get(self.focus).filter(|c| {
                 c.parent == parent
                     && self.is_showing(c)
@@ -2625,6 +2997,7 @@ impl Controls {
         const VK_RETURN: u16 = 0x0D;
         const VK_SPACE: u16 = 0x20;
 
+        self.last_list_click = None;
         let focus = self.focus;
         if !self.get(focus).is_some_and(|c| self.is_showing(c)) {
             return None;
@@ -2702,6 +3075,15 @@ impl Controls {
                     hwnd: child.hwnd,
                     code: 1,
                     index: next as i32,
+                })
+            }
+            ControlClass::ListView if vk == 0x0d => {
+                child.list_selected.map(|index| ControlAction::Notify {
+                    parent: child.parent,
+                    id: child.id,
+                    hwnd: child.hwnd,
+                    code: (-4i32) as u32,
+                    index: index as i32,
                 })
             }
             ControlClass::ListView if matches!(vk, 0x25..=0x28) => {
@@ -2835,6 +3217,45 @@ impl Controls {
             self.render_children_of(surf, |parent| parent == panel.hwnd, gdi, layer);
             self.render_open_choices(surf, |parent| parent == panel.hwnd, gdi);
         }
+    }
+
+    /// Classic CE top-level windows are composited separately in native z order.
+    pub fn render_owner_with_images(
+        &self,
+        owner: u32,
+        surface: &mut Surface<'_>,
+        gdi: &crate::gdi::GdiState,
+        mut layer: impl FnMut(u32, &mut Surface<'_>),
+    ) {
+        self.render_children_of(surface, |parent| parent == owner, Some(gdi), &mut layer);
+        self.render_open_choices(surface, |parent| parent == owner, Some(gdi));
+    }
+
+    pub fn render_owner_tree_with_images(
+        &self,
+        owner: u32,
+        surface: &mut Surface<'_>,
+        gdi: &crate::gdi::GdiState,
+        mut layer: impl FnMut(u32, &mut Surface<'_>),
+    ) {
+        fn tree(
+            controls: &Controls,
+            owner: u32,
+            surface: &mut Surface<'_>,
+            gdi: &crate::gdi::GdiState,
+            layer: &mut impl FnMut(u32, &mut Surface<'_>),
+            depth: usize,
+        ) {
+            if depth > 64 {
+                return;
+            }
+            controls.render_children_of(surface, |p| p == owner, Some(gdi), &mut |h, s| {
+                layer(h, s);
+                tree(controls, h, s, gdi, layer, depth + 1);
+            });
+            controls.render_open_choices(surface, |p| p == owner, Some(gdi));
+        }
+        tree(self, owner, surface, gdi, &mut layer, 0);
     }
 
     fn render_open_choices(
@@ -3193,6 +3614,8 @@ mod tests {
             caption: None,
             ok_pressed: false,
             caption_height: None,
+            caption_command: Some(1),
+            caption_help: false,
         });
         button(&mut controls, 2, 10, 10);
         let mut bitmap = Bitmap::new(100, 80);
@@ -3219,6 +3642,8 @@ mod tests {
             caption: None,
             ok_pressed: false,
             caption_height: None,
+            caption_command: Some(1),
+            caption_help: false,
         });
         controls.render(&mut Surface::Bitmap(&mut bitmap));
         assert_ne!(pixel(&bitmap, 90, 70), 0xf800); // another dialog remains above
@@ -3642,6 +4067,95 @@ mod tests {
     }
 
     #[test]
+    fn report_header_and_blank_area_do_not_activate_selected_row() {
+        let mut controls = Controls::default();
+        let hwnd = controls.create(
+            PARENT,
+            ControlClass::ListView,
+            100,
+            String::new(),
+            WS_VISIBLE | 1,
+            0,
+            0,
+            100,
+            60,
+        );
+        let c = controls.get_mut(hwnd).unwrap();
+        c.list_items.push(("disc.iso".into(), 0));
+        c.list_report_columns.push(ListColumn {
+            title: "Name".into(),
+            width: 100,
+            format: 0,
+            subitem: 0,
+        });
+        let header = c.list_header_height();
+        controls.pointer_down(12, header + 1);
+        assert!(matches!(
+            controls.pointer_up(12, header + 1),
+            Some(ControlAction::Notify { index: 0, .. })
+        ));
+        controls.pointer_down(12, 1);
+        assert_eq!(controls.pointer_up(12, 1), Some(ControlAction::Consumed));
+        controls.pointer_down(12, header + 1);
+        assert_eq!(controls.pointer_up(12, 59), Some(ControlAction::Consumed));
+    }
+
+    #[test]
+    fn list_activation_requires_two_matching_clicks_or_enter() {
+        let mut controls = Controls::default();
+        let list = controls.create(
+            PARENT,
+            ControlClass::ListView,
+            7,
+            String::new(),
+            WS_VISIBLE | 1,
+            0,
+            0,
+            120,
+            100,
+        );
+        controls.get_mut(list).unwrap().list_items =
+            vec![("Folder".into(), 11), ("File".into(), 22)];
+        button(&mut controls, 8, 160, 0);
+        let tap = |controls: &mut Controls, x, y| {
+            controls.pointer_down(x, y);
+            controls.pointer_up(x, y)
+        };
+        let notification = |index, code| {
+            Some(ControlAction::Notify {
+                parent: PARENT,
+                id: 7,
+                hwnd: list,
+                index,
+                code: code as u32,
+            })
+        };
+        assert_eq!(tap(&mut controls, 10, 8), notification(0, -2i32));
+        assert_eq!(tap(&mut controls, 10, 8), notification(0, -3i32));
+        assert_eq!(tap(&mut controls, 10, 8), notification(0, -2i32));
+        tap(&mut controls, 170, 8);
+        assert_eq!(tap(&mut controls, 10, 8), notification(0, -2i32));
+        let second_y = controls.get(list).unwrap().list_row_height() + 8;
+        assert_eq!(tap(&mut controls, 10, second_y), notification(1, -2i32));
+        assert_eq!(tap(&mut controls, 10, second_y), notification(1, -3i32));
+        assert_eq!(tap(&mut controls, 10, second_y), notification(1, -2i32));
+        tap(&mut controls, 350, 140);
+        assert_eq!(tap(&mut controls, 10, second_y), notification(1, -2i32));
+        controls.last_list_click.as_mut().unwrap().4 =
+            std::time::Instant::now() - std::time::Duration::from_millis(600);
+        assert_eq!(tap(&mut controls, 10, second_y), notification(1, -2i32));
+        assert_eq!(tap(&mut controls, 16, second_y), notification(1, -2i32));
+        assert_eq!(controls.key_down(13), notification(1, -4i32));
+        assert_eq!(controls.key_down_in(PARENT, 13), notification(1, -4i32));
+        assert_eq!(tap(&mut controls, 16, second_y), notification(1, -2i32));
+        controls.pointer_down(10, 8);
+        assert_eq!(controls.pointer_up(10, 90), Some(ControlAction::Consumed));
+        assert_eq!(tap(&mut controls, 10, 8), notification(0, -2i32));
+        controls.destroy(list);
+        assert!(controls.last_list_click.is_none());
+    }
+
+    #[test]
     fn list_view_tap_selects_the_row_actually_drawn_at_that_position() {
         let mut controls = Controls::default();
         let hwnd = controls.create(
@@ -3806,6 +4320,8 @@ mod tests {
             caption: Some("Options".into()),
             ok_pressed: false,
             caption_height: None,
+            caption_command: Some(1),
+            caption_help: true,
         }
     }
 
@@ -3875,6 +4391,31 @@ mod tests {
         assert!(!titled.ok_box_contains(bx - 4, by + bh / 2));
         assert!(bare.ok_box().is_none());
         assert!(!bare.ok_box_contains(bx + bw / 2, by + bh / 2));
+    }
+
+    #[test]
+    fn caption_styles_choose_close_done_and_context_help() {
+        let hwnd = 0xDEAD_0002;
+        let mut panel = captioned_panel(hwnd);
+        panel.set_caption_styles(0, 0);
+        assert!(panel.ok_box().is_none());
+        assert!(panel.help_box().is_none());
+
+        panel.set_caption_styles(0x0008_0000, 0);
+        assert!(panel.help_box().is_none());
+        let (x, y, _, _) = panel.ok_box().unwrap();
+        let mut controls = Controls::default();
+        controls.add_panel(panel);
+        controls.pointer_down_in(hwnd, x, y);
+        assert!(matches!(
+            controls.pointer_up_in(hwnd, x, y),
+            Some(ControlAction::Clicked { id: IDCANCEL, .. })
+        ));
+
+        let panel = controls.panel_mut(hwnd).unwrap();
+        panel.set_caption_styles(0, DialogPanel::WS_EX_CAPTIONOKBTN | 0x400);
+        assert_eq!(panel.caption_command, Some(IDOK));
+        assert!(panel.help_box().is_some());
     }
 
     #[test]
@@ -4007,6 +4548,8 @@ mod tests {
             caption: None,
             ok_pressed: false,
             caption_height: None,
+            caption_command: Some(1),
+            caption_help: false,
         });
         ctrls.create(
             STRIP,
@@ -4030,6 +4573,8 @@ mod tests {
             caption: Some("Options".into()),
             ok_pressed: false,
             caption_height: None,
+            caption_command: Some(1),
+            caption_help: false,
         });
         ctrls.render(&mut surf);
 

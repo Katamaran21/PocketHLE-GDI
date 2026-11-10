@@ -1166,7 +1166,7 @@ static uc_err uc_gen_tb(struct uc_struct *uc, uint64_t addr, uc_tb *out_tb)
     // Unicorn: Our hack here.
     pc = addr;
 
-    hash = tb_jmp_cache_hash_bits(env->uc, pc, env->uc->pockethle_jump_bits);
+    hash = tb_jmp_cache_hash_func(env->uc, pc);
     tb = cpu->tb_jmp_cache[hash];
 
     cflags &= ~CF_CLUSTER_MASK;
@@ -1421,7 +1421,12 @@ static inline void tb_remove_from_jmp_list(TranslationBlock *orig, int n_orig)
     int n;
 
     /* mark the LSB of jmp_dest[] so that no further jumps can be inserted */
+#if defined(_MSC_VER) && defined(_WIN64)
+    ptr = (uintptr_t)InterlockedOr64(
+        (volatile LONG64 *)&orig->jmp_dest[n_orig], 1) | (uintptr_t)1;
+#else
     ptr = atomic_or_fetch(&orig->jmp_dest[n_orig], 1);
+#endif
     dest = (TranslationBlock *)(ptr & ~1);
     if (dest == NULL) {
         return;
@@ -1469,7 +1474,9 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
 
     TB_FOR_EACH_JMP(dest, tb, n) {
         tb_reset_jump(tb, n);
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && defined(_WIN64)
+        InterlockedAnd64((volatile LONG64 *)&tb->jmp_dest[n], 1);
+#elif defined(_MSC_VER)
         atomic_and((long *)&tb->jmp_dest[n], (uintptr_t)NULL | 1);
 #else
         atomic_and(&tb->jmp_dest[n], (uintptr_t)NULL | 1);
@@ -1523,7 +1530,7 @@ static void do_tb_phys_invalidate(TCGContext *tcg_ctx, TranslationBlock *tb, boo
     }
 
     /* remove the TB from the hash list */
-    h = tb_jmp_cache_hash_bits(uc, tb->pc, uc->pockethle_jump_bits);
+    h = tb_jmp_cache_hash_func(uc, tb->pc);
     if (cpu->tb_jmp_cache[h] == tb) {
         cpu->tb_jmp_cache[h] = NULL;
     }
@@ -2161,9 +2168,8 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 
 static void tb_jmp_cache_clear_page(CPUState *cpu, target_ulong page_addr)
 {
-    unsigned bits = cpu->uc->pockethle_jump_bits;
-    unsigned page_size = 1u << (bits / 2);
-    unsigned int i, i0 = tb_jmp_cache_hash_bits(cpu->uc, page_addr, bits) & ~((unsigned)page_size - 1);
+    unsigned page_size = TB_JMP_PAGE_SIZE;
+    unsigned int i, i0 = tb_jmp_cache_hash_func(cpu->uc, page_addr) & ~((unsigned)page_size - 1);
 
     for (i = 0; i < page_size; i++) {
         cpu->tb_jmp_cache[i0 + i] = NULL;

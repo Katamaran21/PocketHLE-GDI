@@ -26,6 +26,15 @@ pub mod aygshell;
 mod backlight_tests;
 mod bluetooth;
 mod camera;
+mod ce_crypto;
+mod ce_database;
+mod ce_fonts;
+#[cfg(all(test, feature = "unicorn-tests"))]
+mod ce_native_tests;
+mod ce_notify;
+mod ce_phonebook;
+mod ce_services;
+mod ce_shortcut;
 pub mod commctrl;
 mod copilot;
 pub mod coredll;
@@ -36,6 +45,10 @@ mod dc_state;
 pub mod ddraw;
 mod dialog_keys;
 mod directshow;
+pub use directshow::{
+    system_media_command, system_media_status, SystemMediaCommand, SystemMediaInput,
+    SystemMediaStatus,
+};
 pub mod dlgtemplate;
 pub mod game_dlls;
 pub mod gles;
@@ -231,6 +244,7 @@ pub struct WinCeDispatcher {
     /// removing the dispatcher round-trip entirely. Populated
     /// alongside `by_name` via [`Self::register_constant`].
     by_name_constant: HashMap<(String, String), u32>,
+    system_ordinals: HashMap<String, HashMap<u16, String>>,
     /// Per-thunk lookup cache populated lazily on the first dispatch
     /// for that thunk. The hot path (which can fire ~10k times a
     /// second during a JumpyBall frame) used to recompute the
@@ -258,11 +272,6 @@ impl Default for WinCeDispatcher {
 }
 
 impl WinCeDispatcher {
-    /// Bind the selected message-pump implementation before mapping the guest.
-    pub fn set_responsive_message_pump(&mut self, enabled: bool) {
-        coredll::configure_message_pump(self, enabled);
-    }
-
     pub fn new() -> Self {
         gles::reset_for_session();
         Self::capability_registry()
@@ -273,6 +282,7 @@ impl WinCeDispatcher {
         let mut d = Self {
             by_name: HashMap::new(),
             by_name_constant: HashMap::new(),
+            system_ordinals: HashMap::new(),
             by_thunk_va: HashMap::new(),
             halt_on_unimplemented: false,
             trace_sink: None,
@@ -286,6 +296,13 @@ impl WinCeDispatcher {
         bluetooth::register(&mut d);
         vibration::register(&mut d);
         wininet::register(&mut d);
+        ce_phonebook::register(&mut d);
+        ce_shortcut::register(&mut d);
+        ce_fonts::register(&mut d);
+        ce_crypto::register(&mut d);
+        ce_database::register(&mut d);
+        ce_notify::register(&mut d);
+        ce_services::register(&mut d);
         ws2::register(&mut d);
         legacy_services::register(&mut d);
         ddraw::register(&mut d);
@@ -324,6 +341,39 @@ impl WinCeDispatcher {
         self.dependency_reported.clear();
     }
 
+    /// CE image exports replace legacy ordinal aliases for that DLL. Unknown
+    /// ordinals remain unknown; they must not acquire a different CE ABI.
+    pub fn set_system_ordinals(&mut self, tables: HashMap<String, HashMap<u16, String>>) {
+        self.by_name.retain(|(dll, name), _| {
+            !tables.contains_key(dll) || !(name.starts_with("ord:") || name.starts_with('#'))
+        });
+        self.by_name_constant.retain(|(dll, name), _| {
+            !tables.contains_key(dll) || !(name.starts_with("ord:") || name.starts_with('#'))
+        });
+        self.system_ordinals = tables;
+        self.by_thunk_va.clear();
+    }
+
+    fn profile_import_name(&self, thunk: &Thunk) -> String {
+        let ordinal = match &thunk.binding {
+            ImportBinding::Ordinal(ordinal) => Some(*ordinal),
+            ImportBinding::Name(name) => name
+                .strip_prefix("ord:")
+                .or_else(|| name.strip_prefix('#'))
+                .and_then(|n| n.parse().ok()),
+        };
+        if let (Some(ordinal), Some(table)) = (
+            ordinal,
+            self.system_ordinals.get(&thunk.dll.to_ascii_lowercase()),
+        ) {
+            return table
+                .get(&ordinal)
+                .cloned()
+                .unwrap_or_else(|| format!("ord:{ordinal}"));
+        }
+        import_name(thunk).into_owned()
+    }
+
     /// Query the same registered handlers and ordinal resolution as dispatch.
     /// Blanket ignored-library fallbacks are deliberately not implementations.
     pub fn supports_import(&self, dll: &str, binding: &ImportBinding) -> bool {
@@ -347,7 +397,7 @@ impl WinCeDispatcher {
             },
         };
         self.by_name
-            .contains_key(&(dll.to_ascii_lowercase(), import_name(&thunk).into_owned()))
+            .contains_key(&(dll.to_ascii_lowercase(), self.profile_import_name(&thunk)))
     }
 
     pub fn register_handler(&mut self, dll: &str, name: &str, handler: Handler) {
@@ -420,7 +470,7 @@ impl WinCeDispatcher {
         // The HashMap key is `(String, String)`, so we still have to
         // build owned strings for the lookup itself — but we only do
         // it once per unique thunk_va, not once per call.
-        let key = (dll_key, import_name(thunk).into_owned());
+        let key = (dll_key, self.profile_import_name(thunk));
         let resolved = self
             .by_name
             .get(&key)
@@ -473,7 +523,7 @@ impl Dispatcher for WinCeDispatcher {
         // in release builds. An explicit table sidesteps that.
         let dll_key = thunk.dll.to_ascii_lowercase();
         self.by_name_constant
-            .get(&(dll_key, import_name(thunk).into_owned()))
+            .get(&(dll_key, self.profile_import_name(thunk)))
             .copied()
         // Ignored libraries deliberately stay out of this. Answering
         // here would let the loader patch the IAT with a native
@@ -491,9 +541,10 @@ impl Dispatcher for WinCeDispatcher {
             .filter(|(registered_dll, _)| registered_dll == &dll_key)
             .map(|(_, name)| name.clone())
             .collect();
-        if dll_key == "coredll.dll"
-            || dll_key == "ws2.dll"
-            || pocket_gles::ordinals::is_gles_dll(&dll_key)
+        if !self.system_ordinals.contains_key(&dll_key)
+            && (dll_key == "coredll.dll"
+                || dll_key == "ws2.dll"
+                || pocket_gles::ordinals::is_gles_dll(&dll_key))
         {
             for ordinal in 0..=4095u16 {
                 if ordinals::lookup(&dll_key, ordinal).is_some() {
@@ -509,6 +560,13 @@ impl Dispatcher for WinCeDispatcher {
         // guest silently taking a "driver too old" fallback path.
         if pocket_gles::ordinals::is_gles_dll(&dll_key) {
             names.extend(pocket_gles::ordinals::names_for(&dll_key));
+        }
+        if let Some(table) = self.system_ordinals.get(&dll_key) {
+            for (&ordinal, name) in table {
+                names.push(name.clone());
+                names.push(format!("ord:{ordinal}"));
+                names.push(format!("#{ordinal}"));
+            }
         }
         names.sort();
         names.dedup();
@@ -564,6 +622,7 @@ impl Dispatcher for WinCeDispatcher {
                 .as_ref()
                 .map(|sink| sink.enabled())
                 .unwrap_or(false);
+        let calling_thread = kernel.current_thread;
 
         // Capture args before the handler may mutate them. Skip the
         // four register reads entirely when nothing is going to log
@@ -596,6 +655,21 @@ impl Dispatcher for WinCeDispatcher {
                 log::trace!("call {}", thunk.label());
             }
             let mut ctx = CallCtx { cpu, thunk, kernel };
+            if gles::needs_thread_switch(ctx.kernel.current_thread)
+                && ["libgles_cm.dll", "libgles_cl.dll", "libegl.dll"]
+                    .iter()
+                    .any(|dll| thunk.dll.eq_ignore_ascii_case(dll))
+            {
+                if thunk
+                    .friendly_name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("gl"))
+                {
+                    gles::enter_gl_thread(ctx.kernel.current_thread);
+                } else {
+                    gles::enter_thread(ctx.kernel.current_thread);
+                }
+            }
             match handler(&mut ctx) {
                 Ok(o) => Ok(o),
                 Err(e) => {
@@ -672,7 +746,7 @@ impl Dispatcher for WinCeDispatcher {
                 Err(_) => (0, "error"),
             };
             let line = format!(
-                "{{\"dll\":\"{dll}\",\"name\":\"{n}\",\"args\":[{a0},{a1},{a2},{a3}],\"ret\":{ret},\"status\":\"{st}\",\"caller\":{caller}}}\n",
+                "{{\"dll\":\"{dll}\",\"name\":\"{n}\",\"args\":[{a0},{a1},{a2},{a3}],\"ret\":{ret},\"status\":\"{st}\",\"caller\":{caller},\"thread\":{calling_thread}}}\n",
                 dll = dll_key,
                 n = name,
                 a0 = args[0],

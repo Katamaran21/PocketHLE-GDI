@@ -29,6 +29,7 @@ pub struct DirectDrawTiming {
     pub epoch: std::time::Instant,
     pub last_present: Option<std::time::Instant>,
     /// Optional user ceiling, separate from the modeled LCD/vblank clock.
+    /// None = native LCD timing; Some(0) = unlimited; other values = FPS cap.
     pub frame_rate_limit: Option<u32>,
     pub pending: std::collections::HashMap<(usize, u32, u32), std::time::Instant>,
     pub recent_blank: std::collections::HashMap<usize, std::time::Instant>,
@@ -69,7 +70,7 @@ impl DirectDrawTiming {
     pub fn frame_limit_deadline(&self, now: std::time::Instant) -> std::time::Instant {
         let fps = self
             .frame_rate_limit
-            .filter(|fps| matches!(fps, 10 | 15 | 20 | 30 | 45 | 60));
+            .filter(|fps| matches!(fps, 10 | 15 | 20 | 30 | 45 | 60 | 120));
         match (fps, self.last_present) {
             (Some(fps), Some(last)) => {
                 let nanos = 1_000_000_000u64.div_ceil(u64::from(fps));
@@ -79,6 +80,14 @@ impl DirectDrawTiming {
         }
     }
     pub fn present_deadline(&self, now: std::time::Instant) -> std::time::Instant {
+        if self.frame_rate_limit == Some(0) {
+            return now; // Unlimited bypasses implicit pacing, not explicit vblank waits.
+        }
+        if self.frame_rate_limit == Some(120) {
+            // An explicit high-rate cap overrides implicit 60 Hz presentation
+            // pacing, while blank_deadline/in_blank retain the modeled LCD.
+            return self.frame_limit_deadline(now);
+        }
         self.last_present
             .map_or(now, |last| (last + Self::PERIOD).max(now))
             .max(self.frame_limit_deadline(now))
@@ -93,7 +102,10 @@ impl DirectDrawTiming {
 /// Only completed, explicit display boundaries are FPS. Without one, callers
 /// retain their changed-image rate (IPS), rather than guessing GDI frames.
 #[derive(Debug, Clone, Default)]
-pub struct PresentationStats(std::sync::Arc<std::sync::Mutex<PresentationRate>>);
+pub struct PresentationStats {
+    presents: std::sync::Arc<std::sync::Mutex<PresentationRate>>,
+    changes: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>>,
+}
 
 #[derive(Debug, Default)]
 struct PresentationRate {
@@ -105,12 +117,23 @@ struct PresentationRate {
 }
 
 impl PresentationStats {
+    /// CE desktop composition measures changes to the combined image while
+    /// keeping explicit presentation timing with the active application.
+    pub fn with_image_updates_from(&self, images: &Self) -> Self {
+        Self {
+            presents: self.presents.clone(),
+            changes: images.changes.clone(),
+        }
+    }
+
     pub fn record_present(&self) {
         self.record_at(std::time::Instant::now());
     }
 
     fn record_at(&self, now: std::time::Instant) {
-        let Ok(mut rate) = self.0.lock() else { return };
+        let Ok(mut rate) = self.presents.lock() else {
+            return;
+        };
         rate.completed = rate.completed.wrapping_add(1);
         if rate.last.is_some_and(|last| {
             now.saturating_duration_since(last) >= std::time::Duration::from_secs(1)
@@ -138,7 +161,7 @@ impl PresentationStats {
     }
 
     fn fps_at(&self, now: std::time::Instant) -> Option<f32> {
-        let rate = self.0.lock().ok()?;
+        let rate = self.presents.lock().ok()?;
         let last = rate.last?;
         Some(
             if now.saturating_duration_since(last) >= std::time::Duration::from_secs(1) {
@@ -149,33 +172,91 @@ impl PresentationStats {
         )
     }
 
+    pub fn record_image_update(&self) {
+        self.record_image_at(std::time::Instant::now());
+    }
+
+    fn record_image_at(&self, now: std::time::Instant) {
+        let Ok(mut changes) = self.changes.lock() else {
+            return;
+        };
+        while changes.front().is_some_and(|last| {
+            now.saturating_duration_since(*last) >= std::time::Duration::from_secs(1)
+        }) {
+            changes.pop_front();
+        }
+        changes.push_back(now);
+    }
+
+    pub fn ips(&self) -> Option<f32> {
+        self.ips_at(std::time::Instant::now())
+    }
+
+    fn ips_at(&self, now: std::time::Instant) -> Option<f32> {
+        let changes = self.changes.lock().ok()?;
+        changes.back()?;
+        Some(
+            changes
+                .iter()
+                .rev()
+                .take_while(|last| {
+                    now.saturating_duration_since(**last) < std::time::Duration::from_secs(1)
+                })
+                .count() as f32,
+        )
+    }
+
     pub fn completed(&self) -> u64 {
-        self.0.lock().map_or(0, |rate| rate.completed)
+        self.presents.lock().map_or(0, |rate| rate.completed)
     }
 
     pub fn reset(&self) {
-        if let Ok(mut rate) = self.0.lock() {
+        if let Ok(mut rate) = self.presents.lock() {
             *rate = PresentationRate::default();
+        }
+        if let Ok(mut changes) = self.changes.lock() {
+            changes.clear();
         }
     }
 }
 
-/// A simple RGB565 framebuffer.
+/// Optional host presentation image; never mapped into guest address space.
 #[derive(Debug, Clone)]
-pub struct Framebuffer {
+struct RenderPresentation {
+    rgba: bool,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+/// Presentation metadata contains no pixels and never triggers a GPU readback.
+#[derive(Debug, Clone)]
+pub struct FramebufferMetadata {
     pub width: u32,
     pub height: u32,
     pub bpp: u32,
-    /// Row-major RGB565 little-endian pixels. Length is
-    /// `width * height * (bpp/8)`.
-    pub pixels: Vec<u8>,
-    /// Incremented every time the framebuffer is mutated. Hosts use
-    /// it to decide whether they need to re-upload the surface.
     pub frame_counter: u64,
     pub presentation_stats: PresentationStats,
     pub directdraw: DirectDrawTiming,
-    /// Host presentation only; RGB565 guest pixels remain unchanged.
+}
+/// An eager RGB565 image. Pixel storage is separate from presentation metadata.
+#[derive(Debug, Clone)]
+pub struct Framebuffer {
+    metadata: FramebufferMetadata,
+    pub pixels: Vec<u8>,
     backlight_level: u32,
+    render_presentation: Option<RenderPresentation>,
+}
+impl std::ops::Deref for Framebuffer {
+    type Target = FramebufferMetadata;
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+impl std::ops::DerefMut for Framebuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.metadata
+    }
 }
 
 impl Default for Framebuffer {
@@ -187,14 +268,17 @@ impl Default for Framebuffer {
 impl Framebuffer {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
-            width,
-            height,
-            bpp: FB_BPP,
+            metadata: FramebufferMetadata {
+                width,
+                height,
+                bpp: FB_BPP,
+                frame_counter: 0,
+                presentation_stats: PresentationStats::default(),
+                directdraw: DirectDrawTiming::default(),
+            },
             pixels: vec![0u8; (width * height * 2) as usize],
-            frame_counter: 0,
-            presentation_stats: PresentationStats::default(),
-            directdraw: DirectDrawTiming::default(),
             backlight_level: 11,
+            render_presentation: None,
         }
     }
 
@@ -257,7 +341,104 @@ impl Framebuffer {
     }
 
     pub fn mark_dirty(&mut self) {
+        self.render_presentation = None;
         self.frame_counter = self.frame_counter.wrapping_add(1);
+    }
+
+    pub fn clear_render_presentation(&mut self) {
+        self.render_presentation = None;
+    }
+
+    /// Reuse the large host buffer across EGL presentations.
+    pub fn take_render_pixels(&mut self) -> Vec<u8> {
+        self.render_presentation
+            .take()
+            .map_or_else(Vec::new, |image| image.pixels)
+    }
+
+    pub fn set_render_presentation(&mut self, width: u32, height: u32, pixels: Vec<u8>) {
+        self.set_render_image(width, height, pixels, false);
+    }
+
+    /// Host-only RGBA, already quantized to the display precision; never guest mapped.
+    pub fn set_render_presentation_rgba(&mut self, width: u32, height: u32, pixels: Vec<u8>) {
+        self.set_render_image(width, height, pixels, true);
+    }
+
+    fn set_render_image(&mut self, width: u32, height: u32, pixels: Vec<u8>, rgba: bool) {
+        let valid = width > 0
+            && height > 0
+            && self.width > 0
+            && self.height > 0
+            && width % self.width == 0
+            && height % self.height == 0
+            && width / self.width >= 2
+            && width / self.width == height / self.height
+            && (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|n| n.checked_mul(if rgba { 4 } else { 2 }))
+                == Some(pixels.len());
+        self.render_presentation = valid.then_some(RenderPresentation {
+            rgba,
+            width,
+            height,
+            pixels,
+        });
+    }
+
+    /// Physical source image size, independent of guest/touch/display geometry.
+    pub fn presentation_size(&self) -> (u32, u32) {
+        self.render_presentation
+            .as_ref()
+            .map_or((self.width, self.height), |image| {
+                (image.width, image.height)
+            })
+    }
+
+    /// Native pixels when no alternate image or brightness conversion is needed.
+    pub fn presentation_rgb565(&self) -> Option<&[u8]> {
+        (self.backlight_level == 11)
+            .then(|| self.presentation_rgb565_unadjusted())
+            .flatten()
+    }
+
+    /// Packed little-endian logical pixels for a host that applies backlight
+    /// itself. Alternate high-density images keep their established path.
+    pub fn presentation_rgb565_unadjusted(&self) -> Option<&[u8]> {
+        let bytes = (self.width as usize)
+            .checked_mul(self.height as usize)?
+            .checked_mul(2)?;
+        (self.render_presentation.is_none() && self.bpp == 16 && bytes == self.pixels.len())
+            .then_some(self.pixels.as_slice())
+    }
+
+    pub fn snapshot_presentation_rgba8888_into(&self, out: &mut Vec<u8>) {
+        let Some(image) = self.render_presentation.as_ref() else {
+            return self.snapshot_rgba8888_into(out);
+        };
+        if image.rgba {
+            out.clear();
+            out.extend_from_slice(&image.pixels);
+            if self.backlight_level != 11 {
+                for pixel in out.chunks_exact_mut(4) {
+                    pixel[0] = self.backlight_channel(pixel[0]);
+                    pixel[1] = self.backlight_channel(pixel[1]);
+                    pixel[2] = self.backlight_channel(pixel[2]);
+                }
+            }
+            return;
+        }
+        out.resize(image.width as usize * image.height as usize * 4, 0);
+        for (source, dest) in image.pixels.chunks_exact(2).zip(out.chunks_exact_mut(4)) {
+            let color = rgb565_to_rgba8888(u16::from_le_bytes([source[0], source[1]]));
+            let [red, green, blue, alpha] = color.to_le_bytes();
+            dest.copy_from_slice(&[
+                self.backlight_channel(red),
+                self.backlight_channel(green),
+                self.backlight_channel(blue),
+                alpha,
+            ]);
+        }
     }
 
     pub fn is_all_black(&self) -> bool {
@@ -306,8 +487,8 @@ impl Framebuffer {
         // the previous per-byte loop showed up high in the perf
         // profile when games like Derby do many `FillRect` calls per
         // frame to clear the background.
-        let words: &mut [u16] = bytemuck::cast_slice_mut(&mut self.pixels);
         let stride = self.width as usize;
+        let words: &mut [u16] = bytemuck::cast_slice_mut(&mut self.pixels);
         let row_len = (cx1 - cx0) as usize;
         let color_le = color.to_le();
         for row in cy0..cy1 {
@@ -452,7 +633,7 @@ impl Framebuffer {
 /// memory: `[R, G, B, A]`. Inlined hot path: this runs once per
 /// framebuffer pixel during every host display update.
 #[inline(always)]
-fn rgb565_to_rgba8888(p: u16) -> u32 {
+pub fn rgb565_to_rgba8888(p: u16) -> u32 {
     let r5 = ((p >> 11) & 0x1f) as u32;
     let g6 = ((p >> 5) & 0x3f) as u32;
     let b5 = (p & 0x1f) as u32;
@@ -491,6 +672,99 @@ fn clip_rect(x: i32, y: i32, w: i32, h: i32, max_w: u32, max_h: u32) -> (u32, u3
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_rgb565_keeps_backlight_metadata_and_preserves_neutral_only_legacy_view() {
+        let mut fb = Framebuffer::new(3, 1);
+        fb.pixels.copy_from_slice(&[0, 248, 224, 7, 31, 0]);
+        assert_eq!(fb.presentation_rgb565(), Some(&fb.pixels[..]));
+        fb.set_backlight_level(21);
+        assert!(fb.presentation_rgb565().is_none());
+        assert_eq!(
+            fb.presentation_rgb565_unadjusted(),
+            Some(&[0, 248, 224, 7, 31, 0][..])
+        );
+        fb.set_render_presentation(6, 2, vec![0; 24]);
+        assert!(fb.presentation_rgb565_unadjusted().is_none());
+    }
+    #[test]
+    fn rgba_presentation_matches_rgb565_for_every_color_and_backlight() {
+        let mut old = Framebuffer::new(128, 128);
+        let mut new = old.clone();
+        let pixels: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        old.set_render_presentation(256, 256, pixels);
+        let mut expected = Vec::new();
+        old.snapshot_presentation_rgba8888_into(&mut expected);
+        new.set_render_presentation_rgba(256, 256, expected.clone());
+        let mut actual = Vec::new();
+        for level in 1..=31 {
+            old.set_backlight_level(level);
+            new.set_backlight_level(level);
+            old.snapshot_presentation_rgba8888_into(&mut expected);
+            new.snapshot_presentation_rgba8888_into(&mut actual);
+            assert_eq!(actual, expected, "backlight {level}");
+            assert_eq!(new.pixels, old.pixels);
+        }
+        new.mark_dirty();
+        assert_eq!(new.presentation_size(), (128, 128));
+        new.set_render_presentation_rgba(256, 256, vec![0; 256 * 256 * 2]);
+        assert_eq!(new.presentation_size(), (128, 128));
+        new.set_render_presentation_rgba(256, 384, vec![0; 256 * 384 * 4]);
+        assert_eq!(new.presentation_size(), (128, 128));
+    }
+
+    #[test]
+    fn render_presentation_is_host_only_and_invalidated_by_guest_writes() {
+        let mut fb = Framebuffer::new(2, 1);
+        fb.pixels.copy_from_slice(&[0, 0, 255, 255]);
+        let native = fb.snapshot_rgba8888();
+        let image = [0x00, 0xf8, 0xe0, 0x07, 0x1f, 0, 0xff, 0xff].repeat(2);
+        fb.set_render_presentation(4, 2, image);
+        assert_eq!(
+            (fb.width, fb.height, fb.byte_size(), fb.stride_bytes()),
+            (2, 1, 4, 4)
+        );
+        assert_eq!(fb.snapshot_rgba8888(), native);
+        assert_eq!(fb.presentation_size(), (4, 2));
+        let mut high = Vec::new();
+        fb.snapshot_presentation_rgba8888_into(&mut high);
+        assert_eq!(high.len(), 4 * 2 * 4);
+        assert_eq!(&high[..4], &[255, 0, 0, 255]);
+        fb.set_backlight_level(1);
+        fb.snapshot_presentation_rgba8888_into(&mut high);
+        assert!(high[0] < 255);
+        assert_eq!(fb.presentation_size(), (4, 2));
+        fb.mark_dirty();
+        assert_eq!(fb.presentation_size(), (2, 1));
+        fb.snapshot_presentation_rgba8888_into(&mut high);
+        assert_eq!(high, fb.snapshot_rgba8888());
+        fb.set_render_presentation(3, 2, vec![0; 12]);
+        assert_eq!(fb.presentation_size(), (2, 1));
+    }
+
+    #[test]
+    fn host_presentation_accepts_every_uniform_render_scale() {
+        for (w, h) in [(320, 240), (240, 320), (640, 480)] {
+            let mut fb = Framebuffer::new(w, h);
+            let guest = fb.pixels.clone();
+            for scale in [2, 3, 4] {
+                let (rw, rh) = (w * scale, h * scale);
+                fb.set_render_presentation(rw, rh, vec![0; (rw * rh * 2) as usize]);
+                assert_eq!(fb.presentation_size(), (rw, rh));
+                assert_eq!((fb.width, fb.height), (w, h));
+                assert_eq!(fb.pixels, guest);
+                let mut pixels = Vec::new();
+                fb.snapshot_presentation_rgba8888_into(&mut pixels);
+                assert_eq!(pixels.len(), (rw * rh * 4) as usize);
+                fb.mark_dirty();
+                assert_eq!(fb.presentation_size(), (w, h));
+            }
+            for (rw, rh, len) in [(w * 3, h * 2, w * h * 12), (w * 4, h * 4, 2), (0, h, 0)] {
+                fb.set_render_presentation(rw, rh, vec![0; len as usize]);
+                assert_eq!(fb.presentation_size(), (w, h));
+            }
+        }
+    }
+
     #[test]
     fn backlight_changes_host_snapshots_without_modifying_guest_pixels() {
         let mut fb = super::Framebuffer::new(1, 1);
@@ -662,7 +936,7 @@ mod display_timing_tests {
         let mut clock = DirectDrawTiming::default();
         let start = clock.epoch;
         let blank = clock.blank_deadline(start, true);
-        for fps in [10, 15, 20, 30, 45, 60] {
+        for fps in [10, 15, 20, 30, 45, 60, 120] {
             clock.frame_rate_limit = Some(fps);
             clock.last_present = None;
             assert_eq!(clock.present_deadline(start), start);
@@ -676,9 +950,14 @@ mod display_timing_tests {
             clock.last_present = Some(late);
             assert_eq!(clock.present_deadline(late), late + period);
         }
-        // Unlimited/invalid values add no extra cap; existing LCD pacing remains.
+        clock.frame_rate_limit = Some(0);
         clock.last_present = Some(start);
-        for value in [None, Some(0), Some(17), Some(u32::MAX)] {
+        assert_eq!(clock.present_deadline(start), start);
+        assert_eq!(clock.frame_limit_deadline(start), start);
+        assert_eq!(clock.blank_deadline(start, true), blank);
+        // Unconfigured/invalid values keep the native LCD pacing.
+        clock.last_present = Some(start);
+        for value in [None, Some(17), Some(u32::MAX)] {
             clock.frame_rate_limit = value;
             assert_eq!(clock.frame_limit_deadline(start), start);
             assert_eq!(
@@ -693,6 +972,28 @@ mod display_timing_tests {
 mod presentation_stats_tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn published_image_rate_is_independent_of_completed_presents() {
+        let stats = PresentationStats::default();
+        let start = Instant::now();
+        for frame in 0..=60 {
+            let now = start + Duration::from_nanos(frame * 1_000_000_000 / 60);
+            stats.record_at(now);
+            if frame % 2 == 0 {
+                stats.record_image_at(now);
+            }
+        }
+        let end = start + Duration::from_secs(1);
+        assert_eq!(stats.fps_at(end), Some(60.0));
+        assert_eq!(stats.ips_at(end), Some(30.0));
+        assert_eq!(stats.ips_at(end + Duration::from_secs(1)), Some(0.0));
+        stats.record_image_at(end + Duration::from_secs(2));
+        assert_eq!(stats.ips_at(end + Duration::from_secs(2)), Some(1.0));
+        assert_eq!(stats.completed(), 61);
+        stats.reset();
+        assert_eq!(stats.ips(), None);
+    }
 
     #[test]
     fn completed_presentations_do_not_dirty_pixels_and_survive_snapshot_clones() {
@@ -731,3 +1032,7 @@ mod presentation_stats_tests {
         );
     }
 }
+
+/// Checked GPU/CPU authority facade, not yet installed in KernelState.
+pub mod deferred;
+pub mod gapi_memory;

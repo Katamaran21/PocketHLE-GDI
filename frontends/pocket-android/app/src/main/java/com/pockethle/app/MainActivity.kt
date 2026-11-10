@@ -4,19 +4,21 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.text.method.LinkMovementMethod
+import android.text.util.Linkify
 import android.view.Menu
 import android.view.MenuItem
 import android.view.View
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import com.google.android.material.snackbar.Snackbar
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -29,10 +31,92 @@ import org.json.JSONObject
  * RecyclerView of game cards, a "+" floating action button to import a
  * new `.CAB`, and per-card overflow menu (Run / Settings / Remove).
  */
-class MainActivity : AppCompatActivity() {
+class MainActivity : HostKeyActivity() {
+
+    private lateinit var addDataModel: AddDataModel
+    private var dataDialog: AddDataDialog? = null
+    private val addDataPicker = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        val id = pendingDataGameId
+        pendingDataGameId = null
+        if (uri != null && id != null) addDataModel.select(uri, id)
+    }
+
+    private var pendingDataGameId: String? = null
+
+    private fun pickData(entry: GameEntry) {
+        if (!libraryBusy && addDataModel.step.value == AddDataModel.Step.Idle) {
+            pendingDataGameId = entry.id
+            addDataPicker.launch(arrayOf("*/*"))
+        }
+    }
+
+    private fun showDataStep(step: AddDataModel.Step) {
+        dataDialog?.dismiss()
+        dataDialog = null
+        if (step == AddDataModel.Step.Idle) {
+            refreshLibrary()
+            showReleaseUpdate()
+            return
+        }
+        val dialog = AddDataDialog(this, ::handleHostKeyEvent)
+        dataDialog = dialog
+        dialog.setCanceledOnTouchOutside(false)
+        when (step) {
+            AddDataModel.Step.Busy -> {
+                dialog.setTitle("Add/Replace Data")
+                dialog.setMessage("Please wait…")
+                dialog.setCancelable(false)
+                dialog.controllerCancel = false
+            }
+            is AddDataModel.Step.Zip -> {
+                dialog.setTitle("Add/Replace Data — ZIP archive")
+                dialog.setMessage("Extract the ZIP contents into the game folder, or copy the ZIP file unchanged?")
+                dialog.setButton(android.content.DialogInterface.BUTTON_POSITIVE, "Extract contents") { _, _ -> addDataModel.chooseZip(true) }
+                dialog.setButton(android.content.DialogInterface.BUTTON_NEUTRAL, "Copy ZIP unchanged") { _, _ -> addDataModel.chooseZip(false) }
+                dialog.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "Cancel") { _, _ -> addDataModel.cancel() }
+            }
+            is AddDataModel.Step.Executable -> {
+                dialog.setTitle("Choose game executable")
+                val choices = listOf("Keep current executable") + step.paths
+                val list = android.widget.ListView(this).apply {
+                    adapter = android.widget.ArrayAdapter(this@MainActivity, android.R.layout.simple_list_item_1, choices)
+                    setOnItemClickListener { _, _, position, _ -> addDataModel.chooseExecutable(if (position == 0) null else step.paths[position - 1]) }
+                }
+                val container = android.widget.FrameLayout(this).apply {
+                    addView(list, android.widget.FrameLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, (resources.displayMetrics.heightPixels * 0.45f).toInt()))
+                }
+                dialog.setView(container)
+                dialog.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "Cancel") { _, _ -> addDataModel.cancel() }
+                dialog.setOnShowListener { list.requestFocus(); list.setSelection(0) }
+            }
+            is AddDataModel.Step.Overwrite -> {
+                dialog.setTitle("Replace existing data?")
+                dialog.setMessage("Existing files or folders will be replaced. No files have been copied into the game folder yet.\n\n" + step.paths.joinToString("\n"))
+                dialog.setButton(android.content.DialogInterface.BUTTON_POSITIVE, "Yes") { _, _ -> addDataModel.confirmOverwrite() }
+                dialog.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "Cancel") { _, _ -> addDataModel.cancel() }
+            }
+            is AddDataModel.Step.Notice -> {
+                dialog.setTitle(if (step.success) "Add/Replace Data complete" else "Add/Replace Data failed")
+                dialog.setMessage(step.message)
+                dialog.setButton(android.content.DialogInterface.BUTTON_POSITIVE, "Close") { _, _ -> addDataModel.cancel() }
+            }
+            AddDataModel.Step.Idle -> return
+        }
+        dialog.setOnCancelListener { addDataModel.cancel() }
+        dialog.show()
+        applyHostFullscreen(dialog.window!!)
+        dialog.getButton(if (step is AddDataModel.Step.Overwrite) android.content.DialogInterface.BUTTON_NEGATIVE else android.content.DialogInterface.BUTTON_POSITIVE)?.requestFocus()
+    }
+
+
 
     private lateinit var adapter: GameAdapter
     private var gizmondoTab = true
+    private var libraryGames: List<GameEntry> = emptyList()
+    private var libraryLoad: Job? = null
+    private var refreshPending = false
     private var libraryBusy = false
     private var pendingReleaseUpdate: ReleaseUpdates.Update? = null
     private var busyDialog: AlertDialog? = null
@@ -113,6 +197,8 @@ class MainActivity : AppCompatActivity() {
         setSupportActionBar(findViewById<Toolbar>(R.id.toolbar))
 
         rootDir = LibraryPaths.root(this)
+        pendingDataGameId = savedInstanceState?.getString("add_data_game_id")
+        addDataModel = androidx.lifecycle.ViewModelProvider(this)[AddDataModel::class.java]
         emptyState = findViewById(R.id.empty_state)
         recycler = findViewById(R.id.recycler)
         adapter = GameAdapter(
@@ -124,6 +210,7 @@ class MainActivity : AppCompatActivity() {
                         .putExtra(GameSettingsActivity.EXTRA_GAME_NAME, entry.displayName),
                 )
             },
+            onAddData = { entry -> pickData(entry) },
             onRemove = { entry -> confirmRemove(entry) },
             onRename = { entry -> renameGame(entry) },
             onInformation = { entry -> showInformation(entry) },
@@ -131,12 +218,13 @@ class MainActivity : AppCompatActivity() {
         )
         recycler.layoutManager = GridLayoutManager(this, gridSpanCount())
         recycler.adapter = adapter
+        addDataModel.step.observe(this) { showDataStep(it) }
         gizmondoTab = savedInstanceState?.getBoolean("gizmondo_tab", true) ?: true
         val tabs = findViewById<com.google.android.material.tabs.TabLayout>(R.id.platform_tabs)
         tabs.addTab(tabs.newTab().setText("Gizmondo"), gizmondoTab)
         tabs.addTab(tabs.newTab().setText("Pocket PC"), !gizmondoTab)
         tabs.addOnTabSelectedListener(object : com.google.android.material.tabs.TabLayout.OnTabSelectedListener {
-            override fun onTabSelected(tab: com.google.android.material.tabs.TabLayout.Tab) { gizmondoTab = tab.position == 0; refreshLibrary() }
+            override fun onTabSelected(tab: com.google.android.material.tabs.TabLayout.Tab) { gizmondoTab = tab.position == 0; showLibraryTab() }
             override fun onTabUnselected(tab: com.google.android.material.tabs.TabLayout.Tab) {}
             override fun onTabReselected(tab: com.google.android.material.tabs.TabLayout.Tab) {}
         })
@@ -160,7 +248,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showReleaseUpdate() {
         val update = pendingReleaseUpdate ?: return
-        if (ReleaseUpdates.announced || libraryBusy || isFinishing || isDestroyed ||
+        if (ReleaseUpdates.announced || libraryBusy || dataDialog?.isShowing == true || isFinishing || isDestroyed ||
             !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return
         ReleaseUpdates.announced = true
         pendingReleaseUpdate = null
@@ -190,7 +278,12 @@ class MainActivity : AppCompatActivity() {
                     .setTitle(R.string.about_title)
                     .setMessage(NativeBridge.banner())
                     .setPositiveButton(android.R.string.ok, null)
-                    .show()
+                    .show().also { dialog ->
+                        dialog.findViewById<TextView>(android.R.id.message)?.apply {
+                            Linkify.addLinks(this, Linkify.WEB_URLS)
+                            movementMethod = LinkMovementMethod.getInstance()
+                        }
+                    }
                 true
             }
             else -> super.onOptionsItemSelected(item)
@@ -203,8 +296,9 @@ class MainActivity : AppCompatActivity() {
         return (widthDp / 164).coerceAtLeast(2)
     }
 
-    override fun onSaveInstanceState(outState: Bundle) {
-        outState.putBoolean("gizmondo_tab", gizmondoTab); super.onSaveInstanceState(outState)
+    override fun onSaveInstanceState(out: Bundle) {
+        out.putString("add_data_game_id", pendingDataGameId)
+        out.putBoolean("gizmondo_tab", gizmondoTab); super.onSaveInstanceState(out)
     }
 
     private fun showInformation(entry: GameEntry) {
@@ -240,39 +334,35 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshLibrary() {
-        val raw = NativeBridge.listGames(rootDir)
-        val parsed = parseGamesOrToast(raw).filter { NativeBridge.isGizmondoGame(rootDir,it.id) == gizmondoTab }
-        adapter.submit(parsed)
-        if (parsed.isEmpty()) {
-            recycler.visibility = View.GONE
-            emptyState.visibility = View.VISIBLE
-        } else {
-            recycler.visibility = View.VISIBLE
-            emptyState.visibility = View.GONE
+        // Coalesce refreshes, never re-open the entire catalogue once per card.
+        // Resuming still reloads saved settings, while tabs only filter memory.
+        if (libraryLoad?.isActive == true) { refreshPending = true; return }
+        libraryLoad = lifecycleScope.launch {
+            do {
+                refreshPending = false
+                val result = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val raw = NativeBridge.listGames(rootDir)
+                        if (raw.trimStart().startsWith("{")) {
+                            val error = JSONObject(raw)
+                            throw IllegalStateException(error.optString("error", "Invalid library response"))
+                        }
+                        GameEntry.listFromJson(raw)
+                    }
+                }
+                result.onSuccess { games -> libraryGames = games; showLibraryTab() }
+                    .onFailure { error ->
+                        Snackbar.make(recycler, getString(R.string.error_listing_games, error.message ?: "Unknown error"), Snackbar.LENGTH_LONG).show()
+                    }
+            } while (refreshPending && !libraryBusy)
         }
     }
 
-    private fun parseGamesOrToast(raw: String): List<GameEntry> {
-        return try {
-            // Library returns [] when empty, JSON object {ok:false,error:...} on error.
-            if (raw.startsWith("{")) {
-                val obj = JSONObject(raw)
-                if (!obj.optBoolean("ok", true)) {
-                    Snackbar.make(
-                        recycler,
-                        getString(R.string.error_listing_games, obj.optString("error")),
-                        Snackbar.LENGTH_LONG,
-                    ).show()
-                }
-                emptyList()
-            } else {
-                JSONArray(raw)
-                GameEntry.listFromJson(raw)
-            }
-        } catch (e: Exception) {
-            Snackbar.make(recycler, "Library parse failed: ${e.message}", Snackbar.LENGTH_LONG).show()
-            emptyList()
-        }
+    private fun showLibraryTab() {
+        val visible = libraryGames.filter { it.isGizmondo == gizmondoTab }
+        adapter.submit(visible)
+        recycler.visibility = if (visible.isEmpty()) View.GONE else View.VISIBLE
+        emptyState.visibility = if (visible.isEmpty()) View.VISIBLE else View.GONE
     }
 
     private fun setLibraryBusy(message: String?) {
@@ -287,6 +377,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        dataDialog?.dismiss()
+        dataDialog = null
         busyDialog?.dismiss()
         busyDialog = null
         pendingImportToken?.let { NativeBridge.cancelPreparedImport(rootDir, it) }

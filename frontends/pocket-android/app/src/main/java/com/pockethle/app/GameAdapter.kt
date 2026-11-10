@@ -19,6 +19,7 @@ import androidx.recyclerview.widget.RecyclerView
 class GameAdapter(
     private val onRun: (GameEntry) -> Unit,
     private val onSettings: (GameEntry) -> Unit,
+    private val onAddData: (GameEntry) -> Unit,
     private val onRemove: (GameEntry) -> Unit,
     private val onRename: (GameEntry) -> Unit,
     private val onInformation: (GameEntry) -> Unit,
@@ -28,6 +29,7 @@ class GameAdapter(
     private var items: List<GameEntry> = emptyList()
 
     fun submit(newItems: List<GameEntry>) {
+        if (items == newItems) return
         items = newItems
         notifyDataSetChanged()
     }
@@ -47,6 +49,7 @@ class GameAdapter(
     inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         private val title: TextView = view.findViewById(R.id.game_title)
         private val caption: TextView = view.findViewById(R.id.game_caption)
+        private val customSettings: TextView = view.findViewById(R.id.game_custom_settings)
         private val serial: TextView = view.findViewById(R.id.game_serial)
         private val publisherLabel: TextView = view.findViewById(R.id.game_publisher)
         private val moreBtn: ImageButton = view.findViewById(R.id.btn_more)
@@ -57,7 +60,7 @@ class GameAdapter(
             caption.isSelected = true
             val artwork = itemView.findViewById<android.widget.ImageView>(R.id.game_artwork)
             val label = itemView.findViewById<View>(R.id.game_label)
-            val gizmondo = NativeBridge.isGizmondoGame(libraryRoot, entry.id)
+            val gizmondo = entry.isGizmondo
             val bitmap = entry.icon?.takeIf { !gizmondo || it == "cartridge.png" }?.let {
                 BitmapFactory.decodeFile(File(libraryRoot,"games/${entry.id}/$it").absolutePath)
             }
@@ -67,7 +70,8 @@ class GameAdapter(
             artwork.visibility = if (showArtwork) View.VISIBLE else View.GONE
             label.visibility = if (showArtwork) View.GONE else View.VISIBLE
             itemView.contentDescription = entry.displayName
-            publisherLabel.text = "${if (gizmondo) "GIZMONDO" else "POCKET PC / WINCE"} • ${entry.screenWidth}×${entry.screenHeight}"
+            publisherLabel.text = "${entry.screenWidth}×${entry.screenHeight}" + (entry.graphicsApi?.let { " • $it" } ?: "")
+            customSettings.visibility = if (entry.customSettings) View.VISIBLE else View.GONE
             serial.text = entry.titleId
             serial.visibility = if (entry.titleId != null) View.VISIBLE else View.GONE
             itemView.setOnClickListener { onRun(entry) }
@@ -80,14 +84,16 @@ class GameAdapter(
             popup.menu.add(0, 4, 1, R.string.action_information)
             popup.menu.add(0, 3, 2, "Rename")
             popup.menu.add(0, 0, 3, R.string.action_settings)
-            popup.menu.add(0, 1, 4, R.string.action_remove)
-            popup.menu.add(0, 5, 5, "Game ID")
+            popup.menu.add(0, 6, 4, "Add/Replace Data")
+            popup.menu.add(0, 1, 5, R.string.action_remove)
+            popup.menu.add(0, 5, 6, "Game ID")
             popup.setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     2 -> onRun(entry)
                     3 -> onRename(entry)
                     4 -> onInformation(entry)
                     0 -> onSettings(entry)
+                    6 -> onAddData(entry)
                     1 -> onRemove(entry)
                     5 -> {
                         val context = itemView.context

@@ -110,7 +110,12 @@ fn query_reports_reservation_commit_protection_and_decommit_boundaries() {
     heap.virtual_free(a + 4096, 4096, false);
     assert_eq!(heap.query_virtual(a).unwrap()[3], 8192);
     heap.virtual_free(a, 0, true);
-    assert_eq!(heap.query_virtual(a), None);
+    // Releasing the reservation makes it a described free range, rather than
+    // falling through to VirtualQuery's unrelated coarse address heuristic.
+    assert_eq!(
+        heap.query_virtual(a),
+        Some([a, 0, 0, super::HOST_VIRTUAL_END - a, 0x10000, 0, 0])
+    );
 }
 #[test]
 fn fixed_arena_reservation_also_reports_only_committed_ram() {
@@ -124,4 +129,23 @@ fn fixed_arena_reservation_also_reports_only_committed_ram() {
     assert_eq!(heap.physical_free_bytes(), 0x40000);
     heap.virtual_free(a, 0, true);
     assert_eq!(heap.free_bytes(), 0x40000);
+}
+
+#[test]
+fn private_virtual_allocations_are_aligned_and_cannot_spill_into_shared_space() {
+    let mut heap = Heap::new(0x01fd_0000, 0x30000);
+    heap.add_region(HEAP_BASE, 0x40000);
+    let first = heap.virtual_alloc_in_private_slot(0x10001, false).unwrap();
+    assert_eq!(first, 0x01fd_0000);
+    assert!(heap.virtual_block(first).unwrap().2.is_empty());
+    assert_eq!(heap.virtual_alloc_in_private_slot(0x20000, true), None);
+    assert_eq!(
+        heap.virtual_alloc_in_private_slot(0x10000, true),
+        Some(0x01ff_0000)
+    );
+    assert!(heap.virtual_free(first, 0, true));
+    assert_eq!(
+        heap.virtual_alloc_in_private_slot(0x10001, true),
+        Some(first)
+    );
 }

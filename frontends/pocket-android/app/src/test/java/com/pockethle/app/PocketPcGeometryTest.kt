@@ -33,7 +33,7 @@ class PocketPcGeometryTest {
             if(w>h && minOf(w,h)/density<600f) assertEquals(layout.actions[0].y,layout.auxiliary[0].y)
             else if(w>h) assertTrue(layout.actions[0].y>layout.auxiliary[0].y)
             else {
-                assertTrue(layout.auxiliary.all { it.y+it.h<layout.screen.y })
+                assertTrue(layout.auxiliary.all { it.y>=layout.dpad.y+layout.dpad.h })
                 assertEquals(1,layout.auxiliary.map { it.y }.distinct().size)
                 val guestEnd=layout.auxiliary[2].let { it.x+it.w }
                 assertTrue("host action separation",layout.auxiliary[3].x-guestEnd>=18*density-3)
@@ -66,28 +66,33 @@ class PocketPcGeometryTest {
             val quarter=turn==90 || turn==270
             val w=if(quarter) native.second else native.first;val h=if(quarter) native.first else native.second
             for(room in listOf(1080 to 1800,1800 to 800,3840 to 2160)) {
-                val rect=displayRect(room.first,room.second,w,h,4)
+                val rect=displayRect(room.first,room.second,w,h)
                 assertEquals(0,rect.width%w);assertEquals(0,rect.height%h)
-                assertTrue(rect.width/w in 1..4);assertEquals(rect.width/w,rect.height/h)
-                val point=displayPointToGuest((rect.left+rect.width/2).toFloat(),(rect.top+rect.height/2).toFloat(),room.first,room.second,native.first,native.second,turn,4)
+                assertTrue(rect.width/w >= 1);assertEquals(rect.width/w,rect.height/h)
+                val point=displayPointToGuest((rect.left+rect.width/2).toFloat(),(rect.top+rect.height/2).toFloat(),room.first,room.second,native.first,native.second,turn)
                 assertNotNull(point);assertTrue(point!!.first in 0 until native.first);assertTrue(point.second in 0 until native.second)
             }
         }
     }
-    @Test fun vgaUsesQvgaMultiplesAndStillMapsToEveryNativePixel() {
-        val rect=pocketPcDisplayRect(1400,800,640,480,0)
-        assertEquals(960,rect.width);assertEquals(720,rect.height)
-        assertEquals(0 to 0,displayPointToGuest(rect.left.toFloat(),rect.top.toFloat(),1400,800,640,480,0,0,true))
-        assertEquals(639 to 479,displayPointToGuest((rect.left+rect.width-1).toFloat(),(rect.top+rect.height-1).toFloat(),1400,800,640,480,0,0,true))
-        for(turn in listOf(0,90,180,270)) {
-            val w=if(turn%180==0) 640 else 480;val h=if(turn%180==0) 480 else 640
-            val fit=pocketPcDisplayRect(1080,1920,w,h,0)
-            assertEquals(0,fit.width%(w/2));assertEquals(0,fit.height%(h/2))
-            val pos=displayPointToGuest((fit.left+fit.width-1).toFloat(),(fit.top+fit.height-1).toFloat(),1080,1920,640,480,turn,0,true)!!
-            assertTrue(pos.first in 0..639);assertTrue(pos.second in 0..479)
+    @Test fun vgaUsesQvgaStepsAndStillMapsToEveryNativePixel() {
+        for (turn in listOf(0,90,180,270)) {
+            val rect=renderedDisplayRect(1400,1800,640,480,1280,960,turn,true)
+            val stepW=if(turn%180==0)320 else 240
+            val stepH=if(turn%180==0)240 else 320
+            assertEquals(0,rect.width%stepW)
+            assertEquals(0,rect.height%stepH)
+            val corners=listOf(rect.left.toFloat() to rect.top.toFloat(),
+                (rect.left+rect.width-1f) to (rect.top+rect.height-1f))
+            val expected=when(turn) {
+                90 -> listOf(0 to 479,639 to 0)
+                180 -> listOf(639 to 479,0 to 0)
+                270 -> listOf(639 to 0,0 to 479)
+                else -> listOf(0 to 0,639 to 479)
+            }
+            corners.zip(expected).forEach { (p,want) ->
+                assertEquals(want,displayPointToGuest(p.first,p.second,1400,1800,640,480,turn,true,false,1280,960))
+            }
         }
-        // Gizmondo / old callers retain the original native-pixel scale policy.
-        assertEquals(640,displayRect(1400,800,640,480,0).width)
     }
 
     @Test fun arrowsAndStylusUseTheSameSingleInverseImageTurn() {

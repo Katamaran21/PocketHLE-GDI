@@ -18,8 +18,8 @@ class StylusGridTest {
     }
     @Test fun reservedInputsAndConfiguredFullscreenAreRefused() {
         val g=StylusGridConfig()
-        for(k in listOf("Escape","F10","F11","F12")) assertNotNull(g.bind(0,GridInput("keyboard",k),null))
-        for(k in listOf("Select","Back","Start","Guide","Mode","Misc1")) assertNotNull(g.bind(0,GridInput("controller",k),null))
+        for(k in listOf("Escape","F8","F9","F10","F11","F12")) assertNotNull(g.bind(0,GridInput("keyboard",k),null))
+        for(k in listOf("Select","Back","Start")) assertNotNull(g.bind(0,GridInput("controller",k),null))
         assertNotNull(g.bind(0,GridInput("controller","South"),"South"))
         g.bind(0,GridInput("controller","South"),null)
         assertFalse(StylusGridRouter(g,"South").assigned(GridInput("controller","South")))
@@ -41,11 +41,11 @@ class StylusGridTest {
     @Test fun settingsMigrateAndRoundTrip() {
         val old=GameSettings.fromJson(JSONObject().put("pocketpc_touch_steering",true))
         assertEquals("zones",old.controlsMode())
-        val g=StylusGridConfig();g.bind(7,GridInput("controller","RightStickLeft"),null)
+        val g=StylusGridConfig();g.bind(7,GridInput("controller","LeftStickLeft"),null)
         val settings=old.copy(pocketpcControls="grid",pocketpcTouchSteering=false,pocketpcStylusGridJson=g.json().toString())
         val saved=GameSettings.fromJson(settings.toJson())
         assertEquals("grid",saved.controlsMode())
-        assertEquals(7,StylusGridConfig.parse(saved.pocketpcStylusGridJson).cellFor(GridInput("controller","RightStickLeft"),null))
+        assertEquals(7,StylusGridConfig.parse(saved.pocketpcStylusGridJson).cellFor(GridInput("controller","LeftStickLeft"),null))
         assertEquals("normal",GameSettings.default().controlsMode())
     }
     @Test fun replacingBindingsAndCancellationDoNotLeakHeldPresses() {
