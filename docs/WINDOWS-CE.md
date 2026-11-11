@@ -92,6 +92,15 @@ CE6 input-method CLSID ABI. `__GetUserKData` reads a DWORD at the SDK byte offse
 from the live thread's KData window. API readiness queries report implemented
 device providers and preserve cooperative waits for unavailable sets.
 
+The original Explorer's recycle database uses typed CEDB properties, including
+Unicode names, integers, timestamps and binary data. Databases and mounted
+volumes persist through the private guest filesystem, with independent open
+cursors, bounded buffers, sort keys and unique-key checks. A failed read-size
+negotiation preserves the cursor; closing a database releases its handle before
+volume unmount. Gizmondo contacts retain their existing separate store. These
+volumes use PocketHLE's storage format; pre-existing foreign database files are
+rejected without being overwritten.
+
 CERF SampleApp's TreeView, Header and UpDown classes have independent control
 state and rendering. Trees retain Unicode labels, item data, hierarchy,
 expansion and selection; headers retain columns and display order; numeric

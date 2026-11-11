@@ -5,7 +5,13 @@ use pocket_kernel::controls::{TREE_FIRST, TREE_LAST};
 
 fn args(ctx: &mut CallCtx<'_>, values: &[u32]) {
     for (i, value) in values.iter().copied().enumerate() {
-        ctx.cpu.write_arg(i as u8, value).unwrap();
+        if i < 4 {
+            ctx.cpu.write_arg(i as u8, value).unwrap();
+        } else {
+            let sp = ctx.cpu.read_reg(pocket_cpu::regs::ArmReg::Sp).unwrap();
+            let at = sp + ctx.cpu.stack_arg_offset() + (i as u32 - 4) * 4;
+            ctx.cpu.write_mem(at, &value.to_le_bytes()).unwrap();
+        }
     }
 }
 fn words(ctx: &mut CallCtx<'_>, ptr: u32, values: &[u32]) {

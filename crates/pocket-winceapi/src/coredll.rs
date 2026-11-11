@@ -9728,7 +9728,10 @@ fn close_handle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
     let handle = ctx.arg_u32(0)?;
-    if ctx.kernel.cedb.cursors.remove(&handle).is_some() || close_owned_handle(ctx.kernel, handle) {
+    if ctx.kernel.cedb.cursors.remove(&handle).is_some()
+        || ctx.kernel.cedb.generic.cursors.remove(&handle).is_some()
+        || close_owned_handle(ctx.kernel, handle)
+    {
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
     if thread_handle_is_closed(ctx.kernel, handle)
@@ -31834,7 +31837,9 @@ mod tests {
         let fixtures = tempfile::tempdir().unwrap();
         let bases = [0x40790000u32, 0x407c0000];
         for (index, base) in bases.into_iter().enumerate() {
-            let mut bytes = loader_fixture_dll(Some(("coredll.dll", "GetTickCount")));
+            // GetTickCount uses an inline ARM thunk and has no Rust hook entry.
+            // This lifetime check needs a genuinely dispatched dynamic query.
+            let mut bytes = loader_fixture_dll(Some(("coredll.dll", "GetSystemMetrics")));
             bytes[0x98 + 28..0x98 + 32].copy_from_slice(&base.to_le_bytes());
             bytes[0x98 + 136..0x98 + 144].fill(0);
             std::fs::write(fixtures.path().join(format!("rom{index}.dll")), bytes).unwrap();
