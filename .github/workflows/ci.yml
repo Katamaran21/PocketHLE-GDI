@@ -126,7 +126,7 @@ jobs:
       - name: run workspace tests sequentially
         # Includes launcher profiles/controller navigation. Executable ARM
         # diagnostics require the non-default arm-diagnostics feature.
-        run: cargo test --workspace --release --locked -- --test-threads=1
+        run: cargo test --workspace --release --locked --no-fail-fast -- --test-threads=1
 
   build-unicorn:
     name: build with unicorn-engine

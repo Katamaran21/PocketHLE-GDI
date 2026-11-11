@@ -751,22 +751,30 @@ mod tests {
             fields: vec![volume, enabled],
             status: 0,
         };
-        let other = kernel.registry.clone();
+        let (child, _) = kernel.object_handles.new_child().unwrap();
+        let mut other = super::super::tests::fresh_kernel();
+        other.attach_handle_context(kernel.child_handle_context(child).unwrap());
+        other.ce.version = Some((6, 0, 0));
         assert!(apply(&mut kernel, &state).is_err());
-        assert_eq!(other.value(r"HKCU\ControlPanel\Volume", "Volume"), None);
+        assert_eq!(
+            other.registry.value(r"HKCU\ControlPanel\Volume", "Volume"),
+            None
+        );
         kernel.controls.get_mut(volume).unwrap().text = "0".into();
         apply(&mut kernel, &state).unwrap();
         assert_eq!(
-            other.value(r"HKCU\ControlPanel\Volume", "Volume"),
+            other.registry.value(r"HKCU\ControlPanel\Volume", "Volume"),
             Some(RegistryValue::Dword(0))
         );
         assert_eq!(kernel.audio.wave_volume(0), Some(0));
+        other.sync_ce_settings();
+        assert_eq!(other.audio.wave_volume(0), Some(0));
         kernel.controls.get_mut(volume).unwrap().text = "100".into();
         kernel.controls.get_mut(enabled).unwrap().checked = false;
         apply(&mut kernel, &state).unwrap();
         assert_eq!(kernel.audio.wave_volume(0), Some(0));
         assert_eq!(
-            other.value(r"HKCU\ControlPanel\Volume", "Volume"),
+            other.registry.value(r"HKCU\ControlPanel\Volume", "Volume"),
             Some(RegistryValue::Dword(u32::MAX))
         );
     }

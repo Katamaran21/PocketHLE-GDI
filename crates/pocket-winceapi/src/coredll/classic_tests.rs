@@ -357,7 +357,14 @@ fn ce_image_shell_folders_override_mobile_defaults_and_create_through_the_vfs() 
         query(&mut cpu, &mut kernel, &mut dispatcher, 1),
         DispatchOutcome::ReturnedR0(1)
     );
-    assert!(writable.join("Windows/Programs").is_dir());
+    // CE keeps the registry spelling while its VFS resolves case-insensitive
+    // shell folder names, including on Linux and Android host filesystems.
+    let programs = kernel.vfs.resolve(r"\wINDows\pROgrams").unwrap();
+    assert!(programs.is_dir());
+    assert!(programs
+        .canonicalize()
+        .unwrap()
+        .starts_with(writable.canonicalize().unwrap()));
     std::fs::write(writable.join("Blocked"), b"keep").unwrap();
     kernel.registry.set_value(
         key,
