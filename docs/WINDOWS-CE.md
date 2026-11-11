@@ -96,6 +96,9 @@ The shell bootstrap exposes the existing keyboard through `SipEnumIM` and the
 CE6 input-method CLSID ABI. `__GetUserKData` reads a DWORD at the SDK byte offset
 from the live thread's KData window. API readiness queries report implemented
 device providers and preserve cooperative waits for unavailable sets.
+Bounded `StringCchCopyNExW`/`CatNExW` and their byte-counted aliases use the
+CE seven-argument ABI, return end/remaining pointers and do not read beyond
+the requested source component. The original shell uses these for paths.
 
 The original Explorer's recycle database uses typed CEDB properties, including
 Unicode names, integers, timestamps and binary data. Databases and mounted
