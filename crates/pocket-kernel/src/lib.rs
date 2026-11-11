@@ -1108,6 +1108,9 @@ pub struct LoadedModule {
     pub satellites: Vec<u32>,
     /// Exact mapped ranges, including import thunks, for teardown and RAM accounting.
     pub resident_regions: Vec<(u32, u32)>,
+    /// Allocator slot for the image or its separate import-thunk pool. ROM
+    /// images keep their preferred address and must not enter the free list.
+    pub module_slot: Option<u32>,
     /// `HMODULE` handed back to the guest. Equal to [`Self::base`],
     /// which is what the real CE loader returns.
     pub handle: u32,
@@ -1929,6 +1932,15 @@ impl KernelState {
                 true
             }
         });
+        self.ce.sip_enumerations.retain(|frame| {
+            if finished(frame.thread) {
+                heap.free(frame.scratch);
+                false
+            } else {
+                true
+            }
+        });
+        self.ce.api_waits.retain(|key, _| !finished(key.0));
         let dead_host_buffers: Vec<_> = self
             .legacy_winsock
             .hostent_buffers
@@ -2164,6 +2176,10 @@ impl KernelState {
         for frame in self.gdi.font_enum_frames.drain(..) {
             self.heap.free(frame.scratch);
         }
+        for frame in self.ce.sip_enumerations.drain(..) {
+            self.heap.free(frame.scratch);
+        }
+        self.ce.api_waits.clear();
         self.gdi.clear_guest_fonts();
         self.gdi.owner_draw_frames.clear();
         self.gdi.list_paint_frames.clear();

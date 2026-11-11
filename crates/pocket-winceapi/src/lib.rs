@@ -35,6 +35,7 @@ mod ce_notify;
 mod ce_phonebook;
 mod ce_services;
 mod ce_shortcut;
+mod ce_sip;
 pub mod commctrl;
 mod copilot;
 pub mod coredll;
@@ -303,6 +304,7 @@ impl WinCeDispatcher {
         ce_database::register(&mut d);
         ce_notify::register(&mut d);
         ce_services::register(&mut d);
+        ce_sip::register(&mut d);
         ws2::register(&mut d);
         legacy_services::register(&mut d);
         ddraw::register(&mut d);

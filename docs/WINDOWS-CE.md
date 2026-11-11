@@ -71,6 +71,18 @@ shared registry. The original ROM `cplmain.cpl` is used only for read-only
 resources; its instructions and `DllMain` are not executed. Other OEM CPLs and
 hardware settings remain outside this implementation.
 
+Original CE6 application DLLs such as `ceshell.dll` may have no relocation
+table. The application loader reserves their preferred address and places import
+thunks in a separate module slot. Existing mappings, including cold and
+no-access pages, prevent the load with error 487. Unloading releases only that
+module's exact mappings and allocator slot. Core OS DLLs and drivers continue
+to use HLE providers; their ROM code is never executed.
+
+The shell bootstrap exposes the existing keyboard through `SipEnumIM` and the
+CE6 input-method CLSID ABI. `__GetUserKData` reads a DWORD at the SDK byte offset
+from the live thread's KData window. API readiness queries report implemented
+device providers and preserve cooperative waits for unavailable sets.
+
 ## Build and distribution
 
 ```cmd

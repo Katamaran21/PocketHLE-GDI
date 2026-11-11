@@ -848,6 +848,7 @@ mod tests {
             attached: false,
             satellites: vec![],
             resident_regions: vec![],
+            module_slot: None,
             handle: 0x3000,
             name: "audio-fixture.dll".into(),
             base: 0x3000,

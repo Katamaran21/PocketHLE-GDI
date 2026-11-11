@@ -203,6 +203,20 @@ impl KernelState {
                     .then_some((resource, copy))
             })
             .collect();
+        let thunks: Vec<_> = self
+            .runtime_thunks
+            .keys()
+            .copied()
+            .filter(|address| {
+                self.modules[index]
+                    .resident_regions
+                    .iter()
+                    .any(|&(start, size)| {
+                        *address >= start
+                            && u64::from(*address) < u64::from(start) + u64::from(size)
+                    })
+            })
+            .collect();
         while let Some(&(start, size)) = self.modules[index].resident_regions.last() {
             if size != 0 {
                 cpu.unmap_region(start, size)?;
@@ -214,8 +228,8 @@ impl KernelState {
             self.gdi.resource_strings.remove(&resource);
             self.heap.free(copy);
         }
-        let satellites = self.modules.remove(index).satellites;
-        for satellite in satellites {
+        let module = self.modules.remove(index);
+        for satellite in module.satellites {
             if let Some(module) = self
                 .modules
                 .iter_mut()
@@ -229,9 +243,12 @@ impl KernelState {
             }
         }
         self.dynamic_exports.remove(&base);
-        self.runtime_thunks
-            .retain(|address, _| *address < base || *address >= base + crate::MODULE_REGION_STRIDE);
-        self.free_module_bases.push(base);
+        for thunk in thunks {
+            self.runtime_thunks.remove(&thunk);
+        }
+        if let Some(slot) = module.module_slot {
+            self.free_module_bases.push(slot);
+        }
         Ok(())
     }
 }

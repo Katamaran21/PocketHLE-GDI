@@ -341,6 +341,10 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "printf", printf);
     d.register_handler(dll, "fprintf", crt_fprintf);
     d.register_handler(dll, "fwprintf", crt_fwprintf);
+    d.register_handler(dll, "wprintf", crt_wprintf);
+    d.register_handler(dll, "fputwc", crt_fputwc);
+    d.register_handler(dll, "putwchar", crt_putwchar);
+    d.register_handler(dll, "GetStdioPathW", get_stdio_path_w);
     d.register_handler(dll, "vfprintf", crt_vfprintf);
     d.register_handler(dll, "_getstdfilex", get_std_file);
     d.register_handler(dll, "_wfreopen", wfreopen);
@@ -1376,10 +1380,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     // size when it fails, but spelling that out here keeps the
     // trace clean.
     d.register_handler(dll, "SipGetInfo", sip_get_info);
-    d.register_constant(dll, "SipSetCurrentIM", 1, one_returning);
     d.register_handler(dll, "SipShowIM", sip_show_im);
     d.register_handler(dll, "SipSetInfo", crate::shell_keyboard::sip_set_info);
-    d.register_constant(dll, "SipStatus", 0, zero_returning);
     // `AllKeys(BOOL)` toggles whether the shell forwards every key
     // (incl. Power / Today) to the foreground app. PocketHLE is
     // single-app so the flag is a no-op; report success.
@@ -5652,20 +5654,6 @@ fn map_resource_module_inner(
     for (dll, table) in &ctx.kernel.ce.ordinals {
         local_gles.insert(dll.clone(), table.clone());
     }
-    let base = ctx
-        .kernel
-        .free_module_bases
-        .last()
-        .copied()
-        .unwrap_or(ctx.kernel.next_module_base);
-    if base
-        .checked_add(MODULE_REGION_STRIDE)
-        .is_none_or(|end| end > MODULE_REGION_END)
-    {
-        log::warn!("LoadLibraryW({request:?}): module region exhausted");
-        set_thread_error(ctx, 8);
-        return Ok(None);
-    }
     let executable = !data_file
         && (image.entry_point != 0 || !image.exports.is_empty() || !image.imports.is_empty());
     if image.size_of_image > MODULE_REGION_STRIDE
@@ -5690,7 +5678,6 @@ fn map_resource_module_inner(
                         || native_dependency_file(ctx.kernel, host_path, &import.dll).is_some()))
         })
         .collect();
-    let thunk_base = base + pocket_cpu::round_up_to_page(image.size_of_image);
     let import_bytes = if data_file {
         0
     } else {
@@ -5702,17 +5689,69 @@ fn map_resource_module_inner(
         } else {
             0
         };
-    let copy_helper = thunk_base + import_bytes;
     let thunk_size = pocket_cpu::round_up_to_page(import_bytes.saturating_add(copy_helper_size));
-    if image.size_of_image > MODULE_REGION_STRIDE
-        || thunk_base
-            .checked_add(thunk_size)
-            .is_none_or(|end| end > base + MODULE_REGION_STRIDE)
+    let image_span = pocket_cpu::round_up_to_page(image.size_of_image);
+    if image_span
+        .checked_add(thunk_size)
+        .is_none_or(|size| size > MODULE_REGION_STRIDE)
     {
         log::warn!("LoadLibraryW({request:?}): image exceeds module slot");
         set_thread_error(ctx, 193);
         return Ok(None);
     }
+    let slot = ctx
+        .kernel
+        .free_module_bases
+        .last()
+        .copied()
+        .unwrap_or(ctx.kernel.next_module_base);
+    let fixed = executable && !pocket_pe::runtime_module_has_relocations(&bytes)?;
+    let base = if fixed { image.image_base } else { slot };
+    let separate_thunks = fixed && base != slot;
+    let module_slot = if separate_thunks && thunk_size == 0 {
+        None
+    } else {
+        Some(slot)
+    };
+    if module_slot.is_some()
+        && slot
+            .checked_add(MODULE_REGION_STRIDE)
+            .is_none_or(|end| end > MODULE_REGION_END)
+    {
+        log::warn!("LoadLibraryW({request:?}): module region exhausted");
+        set_thread_error(ctx, 8);
+        return Ok(None);
+    }
+    if fixed {
+        // Original CE6 Explorer uses a relocation-free ceshell at 0x40790000.
+        // Its code stays at the ROM address; imports live in a separate pool,
+        // so tightly packed ROM DLLs do not overwrite each other's thunks.
+        let end = base.checked_add(image_span);
+        let collision = ctx.kernel.modules.iter().any(|module| {
+            u64::from(base) < u64::from(module.base) + u64::from(module.image_size)
+                && u64::from(module.base) < u64::from(base) + u64::from(image_span)
+        });
+        if base < SLOT_ALIAS_BASE
+            || base % 4096 != 0
+            || end.is_none_or(|end| end > pocket_kernel::HEAP_BASE)
+            || collision
+            || !ctx.cpu.is_region_free(base, image_span)?
+            || (separate_thunks
+                && thunk_size != 0
+                && base < slot.saturating_add(thunk_size)
+                && slot < end.unwrap())
+        {
+            log::warn!("LoadLibraryW({request:?}): preferred address 0x{base:08x} is unavailable");
+            set_thread_error(ctx, 487);
+            return Ok(None);
+        }
+    }
+    let thunk_base = if separate_thunks {
+        slot
+    } else {
+        base + image_span
+    };
+    let copy_helper = thunk_base + import_bytes;
     let mut forwarders = std::collections::BTreeMap::new();
     if executable {
         if ctx.cpu.arch() != pocket_cpu::Arch::Arm
@@ -5898,16 +5937,20 @@ fn map_resource_module_inner(
         for &(start, size) in &resident {
             ctx.kernel.heap.release_resident(start, size);
         }
-        ctx.kernel
-            .runtime_thunks
-            .retain(|address, _| *address < base || *address >= base + MODULE_REGION_STRIDE);
+        ctx.kernel.runtime_thunks.retain(|address, _| {
+            !resident.iter().any(|&(start, size)| {
+                *address >= start && u64::from(*address) < u64::from(start) + u64::from(size)
+            })
+        });
         ctx.kernel.dynamic_exports.remove(&base);
         return Err(error);
     }
-    if ctx.kernel.free_module_bases.last() == Some(&base) {
-        ctx.kernel.free_module_bases.pop();
-    } else {
-        ctx.kernel.next_module_base = base + MODULE_REGION_STRIDE;
+    if let Some(slot) = module_slot {
+        if ctx.kernel.free_module_bases.last() == Some(&slot) {
+            ctx.kernel.free_module_bases.pop();
+        } else {
+            ctx.kernel.next_module_base = slot + MODULE_REGION_STRIDE;
+        }
     }
     let name = module_file_name(request);
     log::info!(
@@ -5922,6 +5965,7 @@ fn map_resource_module_inner(
         attached: false,
         satellites: Vec::new(),
         resident_regions: resident,
+        module_slot,
         handle: base,
         name,
         base,
@@ -8163,6 +8207,85 @@ fn crt_fwprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(
         text.encode_utf16().count() as u32
     ))
+}
+
+fn crt_wprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let pointer = ctx.arg_u32(0)?;
+    if pointer == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    let format = String::from_utf16_lossy(&read_wstr(ctx, pointer, 0x4000)?);
+    let text = render_printf(ctx, &format, true, 1)?;
+    emit_stream_text(ctx, STD_FILE_BASE + 1, &text)?;
+    Ok(DispatchOutcome::ReturnedR0(
+        text.encode_utf16().count() as u32
+    ))
+}
+fn write_wide_character(
+    ctx: &mut CallCtx<'_>,
+    character: u32,
+    stream: u32,
+) -> Result<DispatchOutcome, KernelError> {
+    if character > u16::MAX as u32 {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    let Some(character) = char::from_u32(character) else {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    };
+    let text = character.to_string();
+    if matches!(std_file_label(stream), Some("stdout" | "stderr")) {
+        emit_stream_text(ctx, stream, &text)?;
+    } else if !ctx.kernel.vfs.is_open(stream)
+        || write_stdio_raw(ctx, stream, text.as_bytes()) != Some(text.len())
+    {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    Ok(DispatchOutcome::ReturnedR0(character as u32))
+}
+fn crt_fputwc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let character = ctx.arg_u32(0)?;
+    let stream = ctx.arg_u32(1)?;
+    write_wide_character(ctx, character, stream)
+}
+fn crt_putwchar(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let character = ctx.arg_u32(0)?;
+    write_wide_character(ctx, character, STD_FILE_BASE + 1)
+}
+fn get_stdio_path_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let id = ctx.arg_u32(0)?;
+    let output = ctx.arg_u32(1)?;
+    let length = ctx.arg_u32(2)?;
+    if id > 2
+        || length == 0
+        || ctx
+            .cpu
+            .check_guest_access(length, 4, Prot::READ | Prot::WRITE)
+            .is_err()
+    {
+        set_thread_error(ctx, 87);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    // The CE command-line tools query their console device before printing.
+    // Keep this in the guest namespace, independent of host paths/handles.
+    let path = wide_to_bytes(&"CON:".encode_utf16().chain(Some(0)).collect::<Vec<_>>());
+    let capacity = ctx.cpu.read_u32_le(length)?;
+    let required = path.len() as u32 / 2;
+    if output == 0 || capacity < required {
+        ctx.cpu.write_mem(length, &required.to_le_bytes())?;
+        set_thread_error(ctx, 122);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if ctx
+        .cpu
+        .check_guest_access(output, path.len() as u32, Prot::WRITE)
+        .is_err()
+    {
+        set_thread_error(ctx, 87);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    ctx.cpu.write_mem(output, &path)?;
+    ctx.cpu.write_mem(length, &required.to_le_bytes())?;
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 /// `int vfprintf(FILE *stream, const char *fmt, va_list ap)`.
@@ -30748,6 +30871,7 @@ mod tests {
             attached: true,
             satellites: vec![],
             resident_regions: vec![],
+            module_slot: Some(base),
             handle: base,
             name: format!("{base:x}.dll"),
             base,
@@ -31007,6 +31131,48 @@ mod tests {
     }
 
     #[test]
+    fn control_panel_loads_rom_resources_with_hle_exports_and_no_native_attach() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("cplmain.cpl"), passive_test_dll()).unwrap();
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        kernel.ce.system_modules.insert("cplmain.cpl".into());
+        kernel.module_search_dirs.push(directory.path().into());
+        let export = 0x70004000;
+        kernel.dynamic_exports.insert(
+            pocket_kernel::ce::CPL_MODULES[0].1,
+            [("CPlApplet".into(), export)].into_iter().collect(),
+        );
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut kernel,
+            thunk: &thunk,
+        };
+        let Some(DispatchOutcome::ReturnedR0(base)) =
+            control_panel::load(&mut ctx, "\\Windows\\cplmain.cpl").unwrap()
+        else {
+            panic!("missing CPL provider")
+        };
+        assert_ne!(base, 0);
+        assert_eq!(ctx.kernel.dynamic_exports[&base]["CPlApplet"], export);
+        assert!(!ctx.kernel.modules[0].data_file);
+        assert!(ctx.kernel.modules[0].attached);
+        assert_eq!(ctx.kernel.modules[0].image_entry, 0);
+        assert!(ctx.kernel.module_attach_frames.is_empty());
+        assert!(ctx
+            .cpu
+            .check_guest_access(base + 0x1000, 1, Prot::READ)
+            .is_ok());
+        assert!(ctx
+            .cpu
+            .check_guest_access(base + 0x1000, 1, Prot::EXEC)
+            .is_err());
+        unload_module(&mut ctx, base).unwrap();
+        assert!(ctx.kernel.modules.is_empty());
+    }
+
+    #[test]
     fn invalid_runtime_image_sets_error_without_consuming_module_slot_or_ram() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("broken.dll"), b"not a PE").unwrap();
@@ -31239,6 +31405,7 @@ mod tests {
                 attached: accept_attach,
                 satellites: Vec::new(),
                 resident_regions: vec![(base, 0x2000)],
+                module_slot: Some(base),
                 handle: base,
                 base,
                 name: "test.dll".into(),
@@ -31554,6 +31721,137 @@ mod tests {
     }
 
     #[test]
+    fn rom_dlls_keep_preferred_bases_and_free_only_their_own_thunk_slots() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let ram = pocket_kernel::memory_division::MemoryDivision::new(256 * 4096, 16).unwrap();
+        assert!(kernel.heap.attach_ram(Some(ram.clone())));
+        let fixtures = tempfile::tempdir().unwrap();
+        let bases = [0x40790000u32, 0x407c0000];
+        for (index, base) in bases.into_iter().enumerate() {
+            let mut bytes = loader_fixture_dll(Some(("coredll.dll", "GetTickCount")));
+            bytes[0x98 + 28..0x98 + 32].copy_from_slice(&base.to_le_bytes());
+            bytes[0x98 + 136..0x98 + 144].fill(0);
+            std::fs::write(fixtures.path().join(format!("rom{index}.dll")), bytes).unwrap();
+        }
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut kernel,
+            thunk: &thunk,
+        };
+        for (index, base) in bases.into_iter().enumerate() {
+            assert_eq!(
+                map_resource_module(
+                    &mut ctx,
+                    &fixtures.path().join(format!("rom{index}.dll")),
+                    &format!("rom{index}.dll")
+                )
+                .unwrap(),
+                Some(base)
+            );
+            assert_eq!(ctx.kernel.dynamic_exports[&base]["Value"], base + 0x1018);
+            let pool = pocket_kernel::MODULE_REGION_BASE + index as u32 * MODULE_REGION_STRIDE;
+            assert_eq!(ctx.cpu.read_u32_le(base + 0x1c00).unwrap(), pool);
+            assert_eq!(ctx.kernel.modules[index].module_slot, Some(pool));
+            assert!(ctx.kernel.runtime_thunks.contains_key(&pool));
+        }
+        let next = ctx.kernel.next_module_base;
+        unload_module(&mut ctx, bases[0]).unwrap();
+        assert!(ctx.cpu.read_mem(bases[0] + 0x1000, 1).is_err());
+        assert!(ctx.cpu.read_mem(bases[1] + 0x1000, 1).is_ok());
+        assert!(!ctx
+            .kernel
+            .runtime_thunks
+            .contains_key(&pocket_kernel::MODULE_REGION_BASE));
+        assert!(ctx
+            .kernel
+            .runtime_thunks
+            .contains_key(&(pocket_kernel::MODULE_REGION_BASE + MODULE_REGION_STRIDE)));
+        assert_eq!(
+            ctx.kernel.free_module_bases,
+            vec![pocket_kernel::MODULE_REGION_BASE]
+        );
+        assert_eq!(
+            map_resource_module(&mut ctx, &fixtures.path().join("rom0.dll"), "rom0.dll").unwrap(),
+            Some(bases[0])
+        );
+        assert_eq!(ctx.kernel.next_module_base, next);
+        unload_module(&mut ctx, bases[0]).unwrap();
+        unload_module(&mut ctx, bases[1]).unwrap();
+        assert!(ctx.kernel.runtime_thunks.is_empty());
+        assert!(ctx.kernel.modules.is_empty());
+        assert_eq!(ram.snapshot().program_used, 0);
+        assert!(ctx
+            .kernel
+            .free_module_bases
+            .iter()
+            .all(|base| *base < MODULE_REGION_END));
+    }
+
+    #[test]
+    fn rom_base_collisions_include_cold_and_noaccess_pages_without_committing_them() {
+        for cold in [false, true] {
+            let base = 0x40790000u32;
+            let mut bytes = loader_fixture_dll(None);
+            bytes[0x98 + 28..0x98 + 32].copy_from_slice(&base.to_le_bytes());
+            bytes[0x98 + 136..0x98 + 144].fill(0);
+            let fixture = tempfile::tempdir().unwrap();
+            let path = fixture.path().join("rom.dll");
+            std::fs::write(&path, bytes).unwrap();
+            let mut cpu = StubCpu::new();
+            let mut kernel = fresh_kernel();
+            let ram = pocket_kernel::memory_division::MemoryDivision::new(256 * 4096, 16).unwrap();
+            assert!(kernel.heap.attach_ram(Some(ram.clone())));
+            if cold {
+                cpu.map_image_region(
+                    base + 0x2000,
+                    4096,
+                    Prot::READ,
+                    vec![73],
+                    kernel.heap.image_page_budget(),
+                )
+                .unwrap();
+            } else {
+                cpu.map_region(base + 0x2000, 4096, Prot::NONE).unwrap();
+                cpu.write_mem(base + 0x2000, &[73]).unwrap();
+            }
+            let thunk = dummy_thunk();
+            let mut ctx = CallCtx {
+                cpu: &mut cpu,
+                kernel: &mut kernel,
+                thunk: &thunk,
+            };
+            assert_eq!(
+                map_resource_module(&mut ctx, &path, "rom.dll").unwrap(),
+                None
+            );
+            assert_eq!(ctx.kernel.thread_last_errors[&0], 487);
+            assert!(ctx.kernel.modules.is_empty());
+            assert!(ctx.kernel.free_module_bases.is_empty());
+            assert_eq!(
+                ctx.kernel.next_module_base,
+                pocket_kernel::MODULE_REGION_BASE
+            );
+            assert_eq!(ram.snapshot().program_used, 0);
+            assert_eq!(ctx.cpu.read_mem(base + 0x2000, 1).unwrap(), vec![73]);
+            ctx.cpu.unmap_region(base + 0x2000, 4096).unwrap();
+            assert_eq!(
+                map_resource_module(&mut ctx, &path, "rom.dll").unwrap(),
+                Some(base)
+            );
+            assert_eq!(
+                ctx.kernel.next_module_base,
+                pocket_kernel::MODULE_REGION_BASE
+            );
+            assert_eq!(ctx.kernel.modules[0].module_slot, None);
+            unload_module(&mut ctx, base).unwrap();
+            assert!(ctx.kernel.free_module_bases.is_empty());
+            assert_eq!(ram.snapshot().program_used, 0);
+        }
+    }
+
+    #[test]
     fn image_entry_page_oom_rolls_back_loader_reservations() {
         let mut cpu = StubCpu::new();
         let mut kernel = fresh_kernel();
@@ -31826,6 +32124,7 @@ mod tests {
                 attached: false,
                 satellites: Vec::new(),
                 resident_regions: Vec::new(),
+                module_slot: Some(base),
                 handle: base,
                 base,
                 name: "audio.dll".into(),

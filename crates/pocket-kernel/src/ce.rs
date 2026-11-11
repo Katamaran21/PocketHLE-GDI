@@ -68,6 +68,14 @@ pub struct SendMessages {
     pub callbacks: Vec<SendCallback>,
 }
 
+#[derive(Debug)]
+pub struct SipEnumeration {
+    pub thread: usize,
+    pub thunk: u32,
+    pub frame: crate::GuestCallFrame,
+    pub scratch: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     pub version: Option<(u32, u32, u32)>,
@@ -78,5 +86,7 @@ pub struct State {
     pub send_messages: SendMessages,
     pub control_panel: Option<ControlPanel>,
     pub settings: Settings,
+    pub sip_enumerations: Vec<SipEnumeration>,
+    pub api_waits: HashMap<(usize, u32, u32), (u32, Instant)>,
     pub(crate) inline_ids: Option<(u32, u32)>,
 }
