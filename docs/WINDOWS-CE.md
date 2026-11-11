@@ -66,6 +66,11 @@ bar. The desktop background is `#3A6EA5`. Explorer remains behind child processe
 such as BlankApp; closing a child removes its pixels and exposes the desktop.
 Pointer releases and key releases return to the process that received the press.
 The taskbar and active shell menus retain their own layers.
+Native child windows hosted inside built-in controls participate in the same
+composition. SampleApp's tab pages retain their controls, follow ancestor
+visibility and clip to the tab and main window. Default painting and BeginPaint
+erase a real window's own backing surface; they do not clear the shared screen
+over already composed Control Panel icons or neighbouring windows.
 
 Portable Explorer's Start menus, Run/Browse dialog and native list controls use
 the mounted CE filesystem. Image lists retain copied icon pixels and overlay

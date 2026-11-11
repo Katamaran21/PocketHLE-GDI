@@ -6290,6 +6290,98 @@ mod tests {
         assert_eq!(bar.part_span(1, 240), (70, 240));
     }
 
+    #[test]
+    fn native_tab_pages_compose_controls_clip_and_follow_parent_visibility() {
+        use controls::{ControlClass, WS_VISIBLE};
+        use gdi::Surface;
+        let mut cpu = StubCpu::new();
+        let mut process = Process::map_into(
+            image_based_at(0x10000, 0x1000),
+            &mut cpu,
+            &|_, _| None,
+            &NullDispatcher,
+        )
+        .unwrap();
+        let k = &mut process.state;
+        k.ce.windows.enabled = true;
+        k.framebuffer.resize(320, 240);
+        let main = 0xdead0001;
+        let page = 0xdead0002;
+        k.window_rects.insert(main, (10, 10, 260, 190));
+        k.window_styles.insert(
+            main,
+            (
+                WS_VISIBLE | windowing::WS_CAPTION | windowing::WS_SYSMENU,
+                0,
+            ),
+        );
+        k.active_window = main;
+        let tab = k.controls.create(
+            main,
+            ControlClass::Tab,
+            1,
+            String::new(),
+            WS_VISIBLE | 0x40000000,
+            6,
+            6,
+            220,
+            120,
+        );
+        // SampleApp's native page has a built-in control as its parent.
+        // An oversized page also verifies clipping at that mixed boundary.
+        k.window_rects.insert(page, (2, 22, 250, 140));
+        k.window_styles.insert(page, (WS_VISIBLE | 0x40000000, 0));
+        k.window_parents.insert(page, tab);
+        let dc = k.gdi.create_memory_dc();
+        let bitmap = k.gdi.create_compatible_bitmap(250, 140);
+        k.gdi.dc_mut(dc).unwrap().selected_bitmap = Some(bitmap);
+        Surface::Bitmap(k.gdi.bitmap_mut(bitmap).unwrap()).fill_rect(0, 0, 250, 140, 0x07e0);
+        k.window_dcs.insert(page, dc);
+        let button = k.controls.create(
+            page,
+            ControlClass::Button,
+            2,
+            "Page button".into(),
+            WS_VISIBLE | 0x40000000,
+            10,
+            10,
+            100,
+            24,
+        );
+        k.composite_controls();
+        let (px, py) = k.window_client_origin(page).unwrap();
+        let (tx, ty) = k.window_client_origin(tab).unwrap();
+        let pixel = |k: &KernelState, x: i32, y: i32| {
+            let offset = (y as usize * 320 + x as usize) * 2;
+            u16::from_le_bytes(
+                k.framebuffer.resident_cpu().unwrap().pixels[offset..offset + 2]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(pixel(k, px + 4, py + 4), 0x07e0);
+        let button_origin = k.window_client_origin(button).unwrap();
+        assert_ne!(pixel(k, button_origin.0 + 4, button_origin.1 + 4), 0x07e0);
+        assert_ne!(pixel(k, tx + 224, py + 4), 0x07e0);
+        assert_ne!(pixel(k, px + 4, ty + 124), 0x07e0);
+        let revision = k.framebuffer.frame_counter;
+        k.composite_controls();
+        assert_eq!(k.framebuffer.frame_counter, revision);
+        k.window_visibility.insert(page, false);
+        k.composite_controls();
+        assert_ne!(pixel(k, px + 4, py + 4), 0x07e0);
+        assert_eq!(k.controls.is_visible(button), Some(false));
+        k.window_visibility.insert(page, true);
+        k.window_visibility.insert(main, false);
+        k.composite_controls();
+        assert_eq!(k.controls.is_visible(tab), Some(false));
+        assert_eq!(k.controls.is_visible(button), Some(false));
+        assert_eq!(
+            pixel(k, px + 4, py + 4),
+            framebuffer::colorref_to_rgb565(windowing::system_color(1)),
+        );
+    }
+
     /// An unset trailing edge behaves like -1 rather than collapsing
     /// the part to zero width.
     #[test]

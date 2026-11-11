@@ -17219,7 +17219,15 @@ fn def_window_proc_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
             if ctx.kernel.controls.panel(hwnd).is_some() {
                 return control_color::paint(ctx, hwnd, true);
             }
-            if ctx.kernel.window_background_erase_pending {
+            let dc = window_dc(ctx, hwnd);
+            if dc != GDI_SCREEN_DC {
+                // CE6 Control Panel forwards WM_PAINT to DefWindowProc. A
+                // screen-wide erase here hid its already composed applet icons
+                // without changing the retained layers' presentation stamp.
+                if ctx.kernel.gdi.pending_window_erases.remove(&hwnd) {
+                    erase_child_background(ctx, hwnd, dc)?;
+                }
+            } else if ctx.kernel.window_background_erase_pending {
                 erase_window_background(ctx);
             }
             Ok(DispatchOutcome::ReturnedR0(0))
@@ -17447,7 +17455,7 @@ fn begin_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             .map(|b| (b.width, b.height))
             .unwrap_or((0, 0))
     };
-    let erase = (hwnd == 0 || hwnd == FAKE_HWND) && ctx.kernel.window_background_erase_pending;
+    let erase = dc == GDI_SCREEN_DC && ctx.kernel.window_background_erase_pending;
     if erase {
         erase_window_background(ctx);
     }
@@ -35436,6 +35444,107 @@ mod tests {
             &[0xff, 0xff]
         );
         assert!(!kernel.window_background_erase_pending);
+    }
+
+    #[test]
+    fn default_native_paint_preserves_applet_icons_and_other_window_pixels() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        kernel.ce.windows.enabled = true;
+        kernel.framebuffer.resize(240, 160);
+        kernel.window_background = Some(0x00ffffff);
+        kernel.window_background_erase_pending = true;
+        kernel.window_rects.insert(FAKE_HWND, (10, 10, 180, 130));
+        kernel.window_styles.insert(FAKE_HWND, (0x10c80000, 0));
+        kernel
+            .window_classes
+            .insert(FAKE_HWND, "ControlPanel".into());
+        kernel
+            .gdi
+            .class_values
+            .insert(("controlpanel".into(), -10), 0x40000006);
+        let list = kernel.controls.create(
+            FAKE_HWND,
+            ControlClass::ListView,
+            0,
+            String::new(),
+            0x50000000,
+            2,
+            2,
+            160,
+            80,
+        );
+        let images = kernel.gdi.create_image_list(16, 16);
+        let mut image = pocket_kernel::imaging::Image::new(16, 16).unwrap();
+        image.pixels.fill(0x07e0);
+        kernel
+            .gdi
+            .image_lists
+            .get_mut(&images)
+            .unwrap()
+            .replace(-1, &image);
+        let control = kernel.controls.get_mut(list).unwrap();
+        control.list_items.push(("Display".into(), 1));
+        control.list_images.push(0);
+        control.list_image_lists[0] = images;
+        control.list_image_sizes[0] = (16, 16);
+        kernel.composite_controls();
+        let initial = kernel.framebuffer.resident_cpu().unwrap().pixels.clone();
+        assert!(initial.chunks_exact(2).any(|p| p == [0xe0, 0x07]));
+        cpu.write_reg(ArmReg::Sp, 0x4000).unwrap();
+        cpu.write_reg(ArmReg::R0, FAKE_HWND).unwrap();
+        cpu.write_reg(ArmReg::R1, WM_PAINT).unwrap();
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut kernel,
+            thunk: &thunk,
+        };
+        assert_eq!(
+            def_window_proc_w(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        // The default brush changes the window backing, never the screen.
+        assert_eq!(
+            ctx.kernel.framebuffer.resident_cpu().unwrap().pixels,
+            initial
+        );
+        ctx.kernel.composite_controls();
+        let pixels = &ctx.kernel.framebuffer.resident_cpu().unwrap().pixels;
+        assert!(pixels.chunks_exact(2).any(|p| p == [0xe0, 0x07]));
+        assert_eq!(
+            u16::from_le_bytes(pixels[..2].try_into().unwrap()),
+            colorref_to_rgb565(pocket_kernel::windowing::system_color(1)),
+        );
+        let revision = ctx.kernel.framebuffer.frame_counter;
+        assert_eq!(
+            def_window_proc_w(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        ctx.kernel.composite_controls();
+        assert_eq!(ctx.kernel.framebuffer.frame_counter, revision);
+        // BeginPaint on that same real primary HWND must use its local DC too.
+        ctx.cpu
+            .map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        ctx.cpu.write_reg(ArmReg::R0, FAKE_HWND).unwrap();
+        ctx.cpu.write_reg(ArmReg::R1, 0x1000).unwrap();
+        let before = ctx
+            .kernel
+            .framebuffer
+            .resident_cpu()
+            .unwrap()
+            .pixels
+            .clone();
+        assert_eq!(
+            begin_paint(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(ctx.kernel.window_dcs[&FAKE_HWND]),
+        );
+        assert_eq!(
+            ctx.kernel.framebuffer.resident_cpu().unwrap().pixels,
+            before
+        );
+        assert_eq!(ctx.cpu.read_u32_le(0x1004).unwrap(), 0);
     }
 
     #[test]
