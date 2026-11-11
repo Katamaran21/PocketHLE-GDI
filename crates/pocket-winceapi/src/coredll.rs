@@ -5705,7 +5705,18 @@ fn map_resource_module_inner(
         .last()
         .copied()
         .unwrap_or(ctx.kernel.next_module_base);
-    let fixed = executable && !pocket_pe::runtime_module_has_relocations(&bytes)?;
+    let fixed = if executable {
+        match pocket_pe::runtime_module_has_relocations(&bytes) {
+            Ok(relocations) => !relocations,
+            Err(error) => {
+                log::warn!("LoadLibraryW({request:?}): {error}");
+                set_thread_error(ctx, 193);
+                return Ok(None);
+            }
+        }
+    } else {
+        false
+    };
     let base = if fixed { image.image_base } else { slot };
     let separate_thunks = fixed && base != slot;
     let module_slot = if separate_thunks && thunk_size == 0 {
