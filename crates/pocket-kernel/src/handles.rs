@@ -14,6 +14,7 @@ pub enum HandleObject {
     Mutex(u32),
     File(u32),
     Mapping(u32),
+    ApiSet(u32),
     Device(u32),
     RemoteThread(u32, usize),
     RemoteProcess(u32),
@@ -43,6 +44,9 @@ struct Domain {
     names: HashMap<String, HandleObject>,
     clipboard_formats: HashMap<String, u32>,
     clipboard: crate::clipboard::Clipboard,
+    api_sets: crate::api_sets::Registry,
+    app_events: crate::app_events::AppEvents,
+    utc_clock: Option<(std::time::Instant, std::time::SystemTime)>,
     next: u32,
     next_pid: u32,
     active: HashSet<u32>,
@@ -84,6 +88,70 @@ impl Default for HandleTable {
     }
 }
 impl HandleTable {
+    pub fn utc_now(&self) -> std::time::SystemTime {
+        self.domain
+            .lock()
+            .unwrap()
+            .utc_clock
+            .map_or_else(std::time::SystemTime::now, |(anchor, timestamp)| {
+                timestamp.checked_add(anchor.elapsed()).unwrap_or(timestamp)
+            })
+    }
+    /// Set only the emulated device clock, shared by all children. Interval
+    /// timers keep their monotonic clock; the host clock is never changed.
+    pub fn set_utc_time(&self, timestamp: std::time::SystemTime) {
+        let mut d = self.domain.lock().unwrap();
+        d.utc_clock = Some((std::time::Instant::now(), timestamp));
+        d.app_events.emit(1);
+    }
+    pub fn register_app_event(&self, name: String, event: u32) -> Result<(), u32> {
+        self.domain.lock().unwrap().app_events.register(name, event)
+    }
+    pub fn emit_app_event(&self, event: u32) {
+        self.domain.lock().unwrap().app_events.emit(event);
+    }
+    pub fn take_app_event(&self) -> Option<(String, String)> {
+        self.domain.lock().unwrap().app_events.take()
+    }
+    pub fn create_api_set(
+        &mut self,
+        name: [u8; 4],
+        methods: Vec<u32>,
+        signatures: Vec<u64>,
+    ) -> Option<u32> {
+        let handle = self.reserve()?;
+        let mut d = self.domain.lock().unwrap();
+        d.api_sets.insert(
+            handle,
+            crate::api_sets::ApiSet {
+                owner: self.pid,
+                name,
+                methods,
+                signatures,
+                id: None,
+            },
+        );
+        d.entries
+            .insert((self.pid, handle), Some(HandleObject::ApiSet(handle)));
+        Some(handle)
+    }
+    pub fn register_api_set(&self, handle: u32, id: u32) -> Result<(), u32> {
+        let mut d = self.domain.lock().unwrap();
+        let Some(Some(HandleObject::ApiSet(key))) = d.entries.get(&(self.pid, handle)).copied()
+        else {
+            return Err(6);
+        };
+        d.api_sets.register(self.pid, key, id)
+    }
+    pub fn query_api_set(&self, name: [u8; 4]) -> Option<u32> {
+        self.domain.lock().unwrap().api_sets.query(name)
+    }
+    pub fn api_set_provider(&self, id: u32) -> Option<crate::api_sets::ApiSet> {
+        self.domain.lock().unwrap().api_sets.provider(id)
+    }
+    pub fn api_set_ready(&self, id: u32) -> bool {
+        self.domain.lock().unwrap().api_sets.ready(id)
+    }
     pub fn process_id(&self) -> u32 {
         self.pid
     }
@@ -358,6 +426,9 @@ impl HandleTable {
         if last {
             d.names.retain(|_, o| *o != object);
             d.files.remove(&object);
+            if let HandleObject::ApiSet(key) = object {
+                d.api_sets.remove(key);
+            }
         }
         Some((self.local(object), last))
     }
@@ -439,6 +510,9 @@ impl HandleTable {
         let mut domain = self.domain.lock().unwrap();
         domain.exits.insert((self.pid, thread), code);
         domain.clipboard.release(self.pid, thread);
+        if thread.is_none() {
+            domain.api_sets.release(self.pid);
+        }
     }
     pub fn exit_code(&self, pid: u32, thread: Option<usize>) -> Option<u32> {
         let d = self.domain.lock().unwrap();
@@ -465,6 +539,7 @@ impl HandleTable {
     pub fn mark_inactive(&self) {
         let mut d = self.domain.lock().unwrap();
         d.clipboard.release(self.pid, None);
+        d.api_sets.release(self.pid);
         d.active.remove(&self.pid);
         d.held_start.remove(&self.pid);
         d.process_kills.remove(&self.pid);

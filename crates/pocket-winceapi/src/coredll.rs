@@ -2338,7 +2338,10 @@ fn waitable_is_signalled_for(kernel: &KernelState, handle: u32, thread: usize) -
         Some(HandleObject::Mutex(key)) => mutex_ready(kernel, key, thread),
         Some(HandleObject::File(_) | HandleObject::RemoteFile(..)) => true, // synchronous regular-file I/O
         Some(
-            HandleObject::Device(_) | HandleObject::RemoteDevice(..) | HandleObject::Mapping(_),
+            HandleObject::Device(_)
+            | HandleObject::RemoteDevice(..)
+            | HandleObject::Mapping(_)
+            | HandleObject::ApiSet(_),
         ) => false,
         None if kernel.object_handles.is_closed(handle) => false,
         None => kernel
@@ -3311,6 +3314,7 @@ fn close_owned_handle(kernel: &mut KernelState, handle: u32) -> bool {
             }
         }
         HandleObject::CurrentProcess => {}
+        HandleObject::ApiSet(_) => {}
     }
     true
 }
@@ -3886,7 +3890,7 @@ fn get_exit_code_process(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
 }
 
 fn ce_run_app_at_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, UNIX_EPOCH};
 
     let app = ctx.arg_u32(0)?;
     let time = ctx.arg_u32(1)?;
@@ -3934,7 +3938,7 @@ fn ce_run_app_at_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         } else {
             UNIX_EPOCH.checked_add(delta)?
         };
-        let now = SystemTime::now();
+        let now = ctx.kernel.object_handles.utc_now();
         let deadline = if deadline <= now + Duration::from_secs(10) {
             now
         } else {
@@ -23045,12 +23049,28 @@ fn srand_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn time_handler(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let now = std::time::SystemTime::now()
+fn time_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let output = ctx.arg_u32(0)?;
+    let seconds = match ctx
+        .kernel
+        .object_handles
+        .utc_now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
-    Ok(DispatchOutcome::ReturnedR0(now))
+    {
+        Ok(duration) => duration.as_secs() as i64,
+        Err(error) => {
+            -(error.duration().as_secs() as i64) - i64::from(error.duration().subsec_nanos() != 0)
+        }
+    };
+    let value = seconds as u32;
+    if output != 0 {
+        if ctx.cpu.check_guest_access(output, 4, Prot::WRITE).is_err() {
+            set_thread_error(ctx, 87);
+            return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+        }
+        ctx.cpu.write_mem(output, &value.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(value))
 }
 
 // ---------- TLS ----------
@@ -23266,7 +23286,7 @@ fn get_system_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     if p == 0 {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    let buf: Vec<u8> = crate::datetime::now()
+    let buf: Vec<u8> = crate::datetime::now(ctx.kernel.object_handles.utc_now())
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
@@ -23287,11 +23307,16 @@ fn get_system_time_as_file_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome
     }
     // 11644473600 seconds between 1601-01-01 and 1970-01-01.
     const EPOCH_DIFF_100NS: u64 = 11_644_473_600 * 10_000_000;
-    let now_100ns = std::time::SystemTime::now()
+    let now_100ns = match ctx
+        .kernel
+        .object_handles
+        .utc_now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.as_nanos() / 100) as u64)
-        .unwrap_or(0);
-    let ft = now_100ns.wrapping_add(EPOCH_DIFF_100NS);
+    {
+        Ok(duration) => (duration.as_nanos() / 100) as i128,
+        Err(error) => -((error.duration().as_nanos() / 100) as i128),
+    };
+    let ft = (now_100ns + i128::from(EPOCH_DIFF_100NS)) as u64;
     let lo = (ft & 0xFFFF_FFFF) as u32;
     let hi = (ft >> 32) as u32;
     let mut buf = [0u8; 8];

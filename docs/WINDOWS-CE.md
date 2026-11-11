@@ -101,6 +101,19 @@ their normal OS desktop parent, participate in desktop/taskbar composition and
 suppress the fallback PocketPC strip while the registered taskbar exists.
 Destroying a registered window removes its registration. `SignalStarted` records
 the shell's startup identifier; it does not boot OEM services or drivers.
+`SipSetDefaultRect` keeps the keyboard's rendering, hit testing and SIPINFO
+geometry above the native taskbar, including rotated layouts. Hidden geometry
+changes do not publish a new frame.
+Native `CreateAPISet`/`RegisterAPISet` retain owned method tables and full 64-bit
+CE6 signatures, expose registered IDs to readiness/name queries and release them
+with their last handle or owning process. Handle-based API servers and general
+cross-process signature marshalling remain outside this subset.
+`CeRunAppAtEvent` subscriptions live in the shared device session, with cancellation
+by normalized executable name. Setting the emulated UTC clock with `SetSystemTime`
+or `SetLocalTime` delivers time-change notifications through the child runner;
+saving a different device name delivers the machine-name event. Interval timers
+and the host clock are unaffected. Other event sources require their actual
+device providers, and subscriptions/clock edits are not persisted between sessions.
 Bounded `StringCchCopyNExW`/`CatNExW` and their byte-counted aliases use the
 CE seven-argument ABI, return end/remaining pointers and do not read beyond
 the requested source component. The original shell uses these for paths.

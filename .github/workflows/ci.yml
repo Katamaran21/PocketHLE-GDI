@@ -19,6 +19,12 @@ on:
 permissions:
   contents: read
 
+# A manual publish checks the same branch as its PR. Keep the newest revision
+# running when the author shuts down the workstation; retire obsolete builds.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: ""

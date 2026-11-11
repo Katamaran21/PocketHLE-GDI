@@ -12,6 +12,11 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler("coredll.dll", "SipEnumIM", enumerate);
     d.register_handler("coredll.dll", "SipGetCurrentIM", current);
     d.register_handler("coredll.dll", "SipSetCurrentIM", select);
+    d.register_handler(
+        "coredll.dll",
+        "SipSetDefaultRect",
+        crate::shell_keyboard::sip_default_rect,
+    );
     d.register_constant("coredll.dll", "SipStatus", 1, status);
 }
 fn status(_: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {

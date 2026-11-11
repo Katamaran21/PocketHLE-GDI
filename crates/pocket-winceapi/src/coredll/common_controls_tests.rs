@@ -1,7 +1,7 @@
 //! Regressions for CERF SampleApp's startup and the CE6 common-control ABI.
 use super::*;
 use pocket_cpu::Cpu;
-use pocket_kernel::controls::{TREE_FIRST, TREE_LAST};
+use pocket_kernel::controls::{TREE_FIRST, TREE_LAST, TREE_ROOT};
 
 fn args(ctx: &mut CallCtx<'_>, values: &[u32]) {
     for (i, value) in values.iter().copied().enumerate() {

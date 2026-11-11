@@ -24,6 +24,9 @@ fn user_kdata(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(value))
 }
 fn api_available(ctx: &CallCtx<'_>, api: u32) -> bool {
+    if ctx.kernel.object_handles.api_set_ready(api) {
+        return true;
+    }
     // CE6 moved non-handle API sets to 80. Older SDKs use 2/3/7/8/9.
     // These are the device providers implemented here. Networking, TAPI and
     // services.exe are not made ready just because their files exist in ROM.

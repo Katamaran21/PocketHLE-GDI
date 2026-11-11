@@ -26,6 +26,8 @@ pub mod aygshell;
 mod backlight_tests;
 mod bluetooth;
 mod camera;
+mod ce_api_sets;
+mod ce_app_events;
 mod ce_crypto;
 mod ce_database;
 mod ce_fonts;
@@ -305,6 +307,8 @@ impl WinCeDispatcher {
         ce_notify::register(&mut d);
         ce_services::register(&mut d);
         ce_sip::register(&mut d);
+        ce_api_sets::register(&mut d);
+        ce_app_events::register(&mut d);
         ws2::register(&mut d);
         legacy_services::register(&mut d);
         ddraw::register(&mut d);

@@ -1,9 +1,7 @@
 //! Stateful TreeView, Header and UpDown messages used by CERF SampleApp.
 //! Structures follow the CE6 SDK ABI; guest procedures remain application-owned.
 use super::*;
-use pocket_kernel::controls::{
-    CommonControlChange, CommonControlFrame, HeaderItem, TreeItem, TREE_ROOT,
-};
+use pocket_kernel::controls::{CommonControlChange, CommonControlFrame, HeaderItem, TreeItem};
 
 pub(super) const CHANGE: u32 = 0x7fff_ff02;
 

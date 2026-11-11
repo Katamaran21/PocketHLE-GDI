@@ -33,6 +33,8 @@ use pocket_cpu::{
 };
 use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
+pub mod api_sets;
+mod app_events;
 pub mod async_keys;
 pub mod audio;
 pub mod bluetooth;
@@ -1858,10 +1860,37 @@ impl KernelState {
         if self.pending_process_launch.is_some() {
             return self.pending_process_launch.take();
         }
+        while self.process_launch_enabled {
+            let Some((guest_path, command_line)) = self.object_handles.take_app_event() else {
+                break;
+            };
+            let Some(executable) = self.vfs.resolve(&guest_path).filter(|path| path.is_file())
+            else {
+                log::debug!("CeRunAppAtEvent: registered executable unavailable: {guest_path:?}");
+                continue;
+            };
+            let Some((process_handle, table)) = self.object_handles.new_child() else {
+                log::warn!(
+                    "CeRunAppAtEvent: could not allocate a guest process for {guest_path:?}"
+                );
+                break;
+            };
+            table.hold_start();
+            return Some(ProcessLaunch {
+                concurrent: true,
+                command_line,
+                creation_flags: 0,
+                call_key: None,
+                executable,
+                guest_path,
+                process_handle,
+                thread_handle: process_handle + 1,
+            });
+        }
         if self.scheduled_process_launches.is_empty() {
             return None;
         }
-        self.take_scheduled_process_launch(std::time::SystemTime::now())
+        self.take_scheduled_process_launch(self.object_handles.utc_now())
     }
 
     /// Drain one expired notification through the same guest process runner.
