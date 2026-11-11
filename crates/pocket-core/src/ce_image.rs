@@ -361,10 +361,18 @@ mod tests {
             b"original"
         );
         assert!(!original.path().join("Favorites").exists());
-        assert!(overlay.join("Favorites").is_dir());
+        // Portable Explorer uses mixed-case guest names. Check its private
+        // directory through CE path resolution on case-sensitive hosts too.
+        let favorites = parent.resolve("\\application\\FAVORITES").unwrap();
+        assert!(favorites.is_dir());
+        assert_eq!(favorites.parent(), Some(overlay.as_path()));
 
         let mut child = Vfs::new();
         child.inherit_namespace(&parent.namespace_snapshot());
+        assert_eq!(
+            child.resolve("\\APPLICATION\\favorites"),
+            Some(favorites.clone())
+        );
         assert_eq!(
             std::fs::read(child.resolve("\\Application\\Prefs.dat").unwrap()).unwrap(),
             b"modified"
