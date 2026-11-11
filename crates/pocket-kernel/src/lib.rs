@@ -2362,6 +2362,18 @@ impl KernelState {
         self.gapi_action_key == gapi::VK_RETURN
             && !self.gdi.shell_menus.taskbar_hidden
             && !self.gdi.shell_menus.gx_fullscreen
+            && self.ce.shell.taskbar.is_none()
+    }
+
+    pub fn is_desktop_window(&self, hwnd: u32) -> bool {
+        self.ce.shell.desktop == Some(hwnd)
+            || self.native_window_screen_rect(hwnd).is_some_and(|bounds| {
+                windowing::is_desktop_layer(
+                    self.window_styles.get(&hwnd).map_or(0, |s| s.0),
+                    bounds,
+                    (self.framebuffer.width, self.framebuffer.height),
+                )
+            })
     }
 
     pub fn window_client_origin(&self, mut hwnd: u32) -> Option<(i32, i32)> {

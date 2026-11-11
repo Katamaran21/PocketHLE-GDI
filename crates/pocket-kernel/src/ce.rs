@@ -77,6 +77,13 @@ pub struct SipEnumeration {
 }
 
 #[derive(Debug, Default)]
+pub struct ShellWindows {
+    pub desktop: Option<u32>,
+    pub taskbar: Option<(u32, bool)>,
+    pub started: HashSet<u32>,
+}
+
+#[derive(Debug, Default)]
 pub struct State {
     pub version: Option<(u32, u32, u32)>,
     pub ordinals: HashMap<String, HashMap<u16, String>>,
@@ -86,6 +93,7 @@ pub struct State {
     pub send_messages: SendMessages,
     pub control_panel: Option<ControlPanel>,
     pub settings: Settings,
+    pub shell: ShellWindows,
     pub sip_enumerations: Vec<SipEnumeration>,
     pub api_waits: HashMap<(usize, u32, u32), (u32, Instant)>,
     pub(crate) inline_ids: Option<(u32, u32)>,

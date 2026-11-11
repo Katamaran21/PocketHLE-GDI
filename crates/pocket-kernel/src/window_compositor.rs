@@ -202,13 +202,7 @@ impl KernelState {
             .collect();
         extra.sort_unstable();
         order.extend(extra);
-        order.sort_by_key(|hwnd| {
-            !windowing::is_desktop_layer(
-                windows[hwnd].style,
-                windows[hwnd].rect,
-                (self.framebuffer.width, self.framebuffer.height),
-            )
-        });
+        order.sort_by_key(|hwnd| !self.is_desktop_window(*hwnd));
         let controls = self.controls.clone();
         let control_layers: HashMap<u32, Bitmap> = self
             .window_dcs

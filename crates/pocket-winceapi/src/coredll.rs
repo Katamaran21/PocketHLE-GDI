@@ -50,6 +50,7 @@ mod progress;
 mod recovery_tests;
 #[path = "coredll/registry_enumeration.rs"]
 mod registry_enumeration;
+mod shell_registration;
 pub(crate) mod status_control;
 mod tab_control;
 mod toolbar;
@@ -134,6 +135,7 @@ mod text_draw;
 mod window_graphics;
 
 pub fn register(d: &mut WinCeDispatcher) {
+    shell_registration::register(d);
     control_panel::register(d);
     d.register_handler("coredll.dll", "EqualRect", equal_rect);
     images::register(d);

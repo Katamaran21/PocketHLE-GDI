@@ -96,6 +96,11 @@ The shell bootstrap exposes the existing keyboard through `SipEnumIM` and the
 CE6 input-method CLSID ABI. `__GetUserKData` reads a DWORD at the SDK byte offset
 from the live thread's KData window. API readiness queries report implemented
 device providers and preserve cooperative waits for unavailable sets.
+Original Explorer registers its own desktop and taskbar windows. These keep
+their normal OS desktop parent, participate in desktop/taskbar composition and
+suppress the fallback PocketPC strip while the registered taskbar exists.
+Destroying a registered window removes its registration. `SignalStarted` records
+the shell's startup identifier; it does not boot OEM services or drivers.
 Bounded `StringCchCopyNExW`/`CatNExW` and their byte-counted aliases use the
 CE seven-argument ABI, return end/remaining pointers and do not read beyond
 the requested source component. The original shell uses these for paths.
