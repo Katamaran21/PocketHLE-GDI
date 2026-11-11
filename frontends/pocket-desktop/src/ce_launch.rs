@@ -208,10 +208,17 @@ mod tests {
         std::fs::write(root.path().join("windows-ce.json"), r#"{"executable":"test.exe"}"#).unwrap();
         let launch = CeLaunch::load(root.path());
         assert!(launch.profile_name.is_empty());
+        assert_eq!(launch.executable, "test.exe");
         assert_eq!(launch.screen, ScreenPref::VgaLandscape);
         let file = root.path().join("ce6.json");
         std::fs::write(&file, serde_json::to_vec(&launch).unwrap()).unwrap();
-        assert_eq!(CeLaunch::load_profile(root.path(), file.to_str().unwrap()).unwrap(), launch);
+        // Portable profiles resolve the EXE beside the JSON, independently of
+        // the host working directory. Legacy launcher settings stay relative.
+        let expected = CeLaunch {
+            executable: root.path().canonicalize().unwrap().join("test.exe").to_string_lossy().into_owned(),
+            ..launch
+        };
+        assert_eq!(CeLaunch::load_profile(root.path(), file.to_str().unwrap()).unwrap(), expected);
         assert_ne!(device_slug("a/b"), device_slug("a\\b"));
         assert_ne!(device_slug("Демо"), device_slug("Другой"));
     }
