@@ -243,6 +243,7 @@ jobs:
           cp docs/WINDOWS-CE.md dist/PocketHLE-windows/README-Windows-CE.md
           mkdir -p dist/PocketHLE-windows/profiles
           cp profiles/wince6-portable.json dist/PocketHLE-windows/profiles/
+          cp profiles/wince6-native.json profiles/wince6-native-cerf.json dist/PocketHLE-windows/profiles/
           cp -f README.ru.md dist/PocketHLE-windows/ 2>/dev/null || true
       - name: zip artifacts
         shell: pwsh

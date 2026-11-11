@@ -24,6 +24,7 @@
 //! The crate is designed to be `Send + Sync` so the Android side can
 //! call into it from any thread without locking.
 
+use anyhow::Context;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -829,6 +830,57 @@ pub struct WindowsCeSettings {
     pub app_prefix: String,
     pub command_line: String,
     pub classic_windows: bool,
+    /// Extra application directories, with writes kept in the device overlay.
+    pub mounts: Vec<WindowsCeMount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsCeMount {
+    pub guest_prefix: String,
+    pub host_dir: PathBuf,
+}
+
+impl WindowsCeSettings {
+    pub fn resolved_mounts(&self, library_root: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
+        anyhow::ensure!(self.mounts.len() <= 32, "Too many Windows CE folders");
+        let mut result: Vec<(String, PathBuf)> = Vec::new();
+        for mount in &self.mounts {
+            let prefix = mount.guest_prefix.trim().replace('/', "\\");
+            anyhow::ensure!(
+                prefix.starts_with('\\')
+                    && !prefix.contains([':', '\0'])
+                    && !prefix.split('\\').any(|p| p == "." || p == "..")
+                    && !prefix.trim_matches('\\').is_empty(),
+                "Use an absolute CE folder such as \\CERF\\"
+            );
+            let prefix = format!("{}\\", prefix.trim_end_matches('\\'));
+            anyhow::ensure!(
+                !result
+                    .iter()
+                    .any(|(old, _)| old.eq_ignore_ascii_case(&prefix)),
+                "Duplicate CE folder {prefix}"
+            );
+            anyhow::ensure!(
+                !mount.host_dir.as_os_str().is_empty(),
+                "Choose a host folder for {prefix}"
+            );
+            let host = if mount.host_dir.is_absolute() {
+                mount.host_dir.clone()
+            } else {
+                library_root.join(&mount.host_dir)
+            };
+            let host = host
+                .canonicalize()
+                .with_context(|| format!("Opening CE folder {}", host.display()))?;
+            anyhow::ensure!(
+                host.is_dir(),
+                "CE folder {} is not a directory",
+                host.display()
+            );
+            result.push((prefix, host));
+        }
+        Ok(result)
+    }
 }
 
 impl Default for WindowsCeSettings {
@@ -840,6 +892,43 @@ impl Default for WindowsCeSettings {
             app_prefix: "\\Application\\".into(),
             command_line: String::new(),
             classic_windows: true,
+            mounts: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod ce_mount_tests {
+    use super::*;
+    #[test]
+    fn legacy_ce_settings_default_to_no_extra_folders_and_portable_paths_resolve() {
+        let mut settings: WindowsCeSettings =
+            serde_json::from_str(r#"{"image_root":"ce-images/wince6/fs"}"#).unwrap();
+        assert!(settings.mounts.is_empty());
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("ce-apps/cerf/arm")).unwrap();
+        settings.mounts.push(WindowsCeMount {
+            guest_prefix: "/CERF/".into(),
+            host_dir: PathBuf::from("ce-apps/cerf/arm"),
+        });
+        let decoded: WindowsCeSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            decoded.resolved_mounts(root.path()).unwrap(),
+            vec![(
+                "\\CERF\\".into(),
+                root.path().join("ce-apps/cerf/arm").canonicalize().unwrap()
+            )]
+        );
+        settings.mounts.push(WindowsCeMount {
+            guest_prefix: "\\cerf\\".into(),
+            host_dir: PathBuf::from("ce-apps/cerf/arm"),
+        });
+        assert!(settings.resolved_mounts(root.path()).is_err());
+        settings.mounts.pop();
+        for bad in ["\\", "\\CERF\\..\\Windows", "C:\\Windows", "\\CERF\0"] {
+            settings.mounts[0].guest_prefix = bad.into();
+            assert!(settings.resolved_mounts(root.path()).is_err());
         }
     }
 }

@@ -12,18 +12,27 @@ page accepts an application EXE, an extracted image directory, and a device data
 directory. Use **Save profile** to keep those choices. For CE6, select the `fs`
 directory containing `Windows/coredll.dll`, or its parent containing `fs/Windows`.
 
-The profile ZIP contains `profiles/wince6-portable.json` and a launcher script.
-Place your filesystem under `wince6/fs` and Portable Explorer under
-`portable-explorer/bin`, beside the `profiles` directory. Put the Windows emulator
+The profile ZIP starts the original `Windows/explorer.exe` through
+`profiles/wince6-native.json`. Place your filesystem under `wince6/fs`, beside
+the `profiles` directory. Put the Windows emulator
 beside `run-wince6-gui.cmd`, or pass its path as the script's first argument.
 Paths in a JSON profile file are resolved relative to that file's directory.
 
 ```cmd
-pockethle-gui.exe --ce-profile profiles\wince6-portable.json --windowed
+pockethle-gui.exe --ce-profile profiles\wince6-native.json --windowed
 ```
 
-`profiles/wince6.json` retains the original local workstation configuration.
-For a different location, use the portable template or the GUI's folder selectors.
+`profiles/wince6.json` selects the workstation's original image Explorer and
+mounts its CERF ARM applications at `\CERF\`. For a different location, use
+the native template or the GUI's folder selectors. The `mounts` list stores
+`guest_prefix` and `host_dir`; paths in profile files are relative to that file,
+while library settings resolve them against the library root. Windows and
+Android share this contract, and children inherit the parent's live namespace.
+Extra application folders use writable device overlays, preserving their sources.
+
+Portable Explorer remains a separate profile and `run-wince6-portable.cmd`
+launcher. Its optional files belong in `portable-explorer/bin`; its old local
+configuration is preserved in `profiles/wince6-portable-local.json`.
 
 The private device directory receives writable filesystem overlays and
 `registry.json`. The supplied image stays read-only. Original hives are imported
@@ -100,8 +109,10 @@ tools\build-windows.cmd build --release -j 1 -p pocket-cli -p pocket-desktop --f
 
 See [Android build](ANDROID-BUILD.md) for the pinned Linux SDK/NDK workflow.
 `tools/package-wince-profile.py --output profile.zip` produces public templates.
-Adding `--image PATH --explorer-bin PATH` produces a private library backup with
-the supplied files. Do not publish that private backup as an emulator release.
+Adding `--image PATH` produces a private backup with the original Explorer.
+`--cerf-apps PATH` includes the additional ARM applications and `--explorer-bin
+PATH` optionally includes Portable Explorer as a separate library entry.
+Do not publish that private backup as an emulator release.
 
 Source and static FFmpeg reconstruction materials accompany the public binaries.
 The xBRZ-containing binary distribution uses GPL-3.0 terms; individual components

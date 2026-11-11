@@ -1,0 +1,10 @@
+{
+  "profile_name": "wince6-portable-local",
+  "executable": "D:\\DownloadNEW\\PocketHLE-GDI\\ce-data\\portable-explorer\\bin\\explorer-portable.exe",
+  "image_root": "D:\\DownloadNEW\\wince6\\fs",
+  "data_dir": "D:\\DownloadNEW\\PocketHLE-GDI\\ce-data\\wince6",
+  "app_prefix": "\\Application\\",
+  "command_line": "\\Application\\",
+  "screen": "vga_landscape",
+  "classic_windows": true
+}
