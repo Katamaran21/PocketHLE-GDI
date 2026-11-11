@@ -28,6 +28,7 @@ mod ce_gdi;
 #[path = "coredll/choice_controls.rs"]
 mod choice_controls;
 pub(crate) mod command_bar;
+mod common_controls;
 #[path = "coredll/control_color.rs"]
 mod control_color;
 #[path = "coredll/coordinates.rs"]
@@ -11574,10 +11575,31 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             .window_threads
             .insert(hwnd, ctx.kernel.current_thread);
         ctx.kernel.window_input_contexts.remove(&hwnd);
+        common_controls::initialize(ctx, hwnd);
         log::debug!(
             "CreateWindowExW(class={class_name:?}, id={id}, text={text:?}) -> child hwnd=0x{hwnd:08x}"
         );
         return Ok(DispatchOutcome::ReturnedR0(hwnd));
+    }
+    let registered_proc = ctx
+        .kernel
+        .window_class_procs
+        .get(&class_name)
+        .copied()
+        .or_else(|| {
+            ctx.kernel
+                .window_class_procs
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&class_name))
+                .map(|(_, proc)| *proc)
+        });
+    if ctx.kernel.ce.windows.enabled && registered_proc.is_none() {
+        // CERF SampleApp exposed recursive WM_CREATE when an unknown system
+        // class inherited the application's main procedure. CE requires a
+        // registered class; unsupported controls must fail with CLASS_NOT_FOUND.
+        set_thread_error(ctx, 1407);
+        log::warn!("CreateWindowExW: unregistered class {class_name:?}");
+        return Ok(DispatchOutcome::ReturnedR0(0));
     }
     let owner = ctx.arg_u32(8)?;
     let hwnd = if let Some(kind) = ctx.kernel.window_class_controls.get(&class_name).copied() {
@@ -11655,12 +11677,7 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             ctx.kernel.create_frame_stack.len() + usize::from(ctx.kernel.create_frame.is_some())
         );
     }
-    let wnd_proc = ctx
-        .kernel
-        .window_class_procs
-        .get(&class_name)
-        .copied()
-        .unwrap_or(ctx.kernel.wnd_proc);
+    let wnd_proc = registered_proc.unwrap_or(ctx.kernel.wnd_proc);
     if wnd_proc != 0 && hwnd == FAKE_HWND {
         ctx.kernel.wnd_proc = wnd_proc;
     }
@@ -13178,6 +13195,9 @@ fn control_message(
     if let Some(v) = tab_control::message(ctx, hwnd, message, wparam, lparam)? {
         return Ok(v);
     }
+    if let Some(v) = common_controls::message(ctx, hwnd, message, wparam, lparam)? {
+        return Ok(v);
+    }
     if let Some(v) = toolbar::message(ctx, hwnd, message, wparam, lparam)? {
         return Ok(v);
     }
@@ -13246,6 +13266,7 @@ fn control_message(
             | ControlClass::StatusBar
             | ControlClass::ScrollBar
             | ControlClass::Progress => 0x100,
+            ControlClass::Header => 0x100,
             ControlClass::ComboBox => {
                 0x81 | if wparam == 0x0d || (wparam == 0x1b && c.choice_open) {
                     4
@@ -13256,6 +13277,8 @@ fn control_message(
             ControlClass::ListView
             | ControlClass::ListBox
             | ControlClass::TrackBar
+            | ControlClass::TreeView
+            | ControlClass::UpDown
             | ControlClass::Tab => 0x81,
         });
     }
@@ -13287,6 +13310,8 @@ fn control_message(
             class,
             Some(
                 ControlClass::ListView
+                    | ControlClass::TreeView
+                    | ControlClass::UpDown
                     | ControlClass::TrackBar
                     | ControlClass::Tab
                     | ControlClass::ListBox
@@ -13462,6 +13487,9 @@ pub(crate) fn send_back_to_focus_window(
 }
 
 pub(crate) fn send_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let Some(outcome) = common_controls::resume(ctx)? {
+        return Ok(outcome);
+    }
     if let Some(outcome) = finish_control_notify(ctx)? {
         return Ok(outcome);
     }
@@ -13600,6 +13628,9 @@ fn translate_message(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 }
 
 fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let Some(outcome) = common_controls::resume(ctx)? {
+        return Ok(outcome);
+    }
     if let Some(outcome) = tab_control::resume(ctx)? {
         return Ok(outcome);
     }
@@ -13666,6 +13697,12 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     let lparam = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
     if let Some(outcome) = tab_control::dispatch(ctx, hwnd, message, wparam, false)? {
         return Ok(outcome);
+    }
+    if message == common_controls::CHANGE {
+        if let Some(outcome) = common_controls::dispatch(ctx, hwnd, message, wparam, lparam, false)?
+        {
+            return Ok(outcome);
+        }
     }
     let timer_callback = message == WM_TIMER && lparam != 0;
     // Thread messages (hwnd == NULL) have no window procedure. CoPilot
@@ -14031,6 +14068,45 @@ fn control_action_message(
             code,
             index,
         } => {
+            if ctx
+                .kernel
+                .controls
+                .get(hwnd)
+                .is_some_and(|c| matches!(c.class, ControlClass::TreeView | ControlClass::UpDown))
+            {
+                return Some(Some((hwnd, common_controls::CHANGE, code, index as u32)));
+            }
+            if ctx
+                .kernel
+                .controls
+                .get(hwnd)
+                .is_some_and(|c| c.class == ControlClass::Header)
+            {
+                let key = (hwnd, -1001);
+                let ptr = ctx
+                    .kernel
+                    .window_extra
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        let ptr = ctx.kernel.heap.alloc(48).unwrap_or(0);
+                        if ptr != 0 {
+                            ctx.kernel.window_extra.insert(key, ptr);
+                        }
+                        ptr
+                    });
+                if ptr == 0 {
+                    return Some(None);
+                }
+                let bytes = [hwnd, id, code, index as u32, 0, 0]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>();
+                if ctx.cpu.write_mem(ptr, &bytes).is_err() {
+                    return Some(None);
+                }
+                return Some(Some((parent, 0x4e, id, ptr)));
+            }
             if code == (-552i32) as u32
                 && ctx
                     .kernel
@@ -16912,6 +16988,9 @@ pub(crate) fn resume_notify_builtin(
 }
 
 fn def_window_proc_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let Some(outcome) = common_controls::resume(ctx)? {
+        return Ok(outcome);
+    }
     let sp = ctx.cpu.read_reg(ArmReg::Sp)?;
     let closing = callback_frame_index(
         &ctx.kernel.window_destroy_frames,
@@ -16942,6 +17021,10 @@ fn def_window_proc_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
         return Ok(outcome);
     }
     let hwnd = ctx.arg_u32(0)?;
+    let (message, wp, lp) = (ctx.arg_u32(1)?, ctx.arg_u32(2)?, ctx.arg_u32(3)?);
+    if let Some(outcome) = common_controls::dispatch(ctx, hwnd, message, wp, lp, false)? {
+        return Ok(outcome);
+    }
     if let Some(outcome) = classic_window::default_message(ctx, hwnd)? {
         return Ok(outcome);
     }
@@ -20540,6 +20623,9 @@ fn get_class_name_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
                     ControlClass::Edit => "EDIT",
                     ControlClass::Static => "STATIC",
                     ControlClass::ListView => "SysListView32",
+                    ControlClass::TreeView => "SysTreeView32",
+                    ControlClass::Header => "SysHeader32",
+                    ControlClass::UpDown => "msctls_updown32",
                     ControlClass::TrackBar => "msctls_trackbar32",
                     ControlClass::Progress => "msctls_progress32",
                     ControlClass::ListBox => "LISTBOX",
@@ -20724,6 +20810,9 @@ fn load_icon_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// readouts on: the app hides those statics with `ShowWindow(SW_HIDE)`
 /// and shows them again when the dialog's checkboxes say so.
 fn dialog_box_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let Some(outcome) = common_controls::resume(ctx)? {
+        return Ok(outcome);
+    }
     if let Some(outcome) = tab_control::resume(ctx)? {
         return Ok(outcome);
     }
@@ -20962,6 +21051,11 @@ fn dialog_box_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
         let (hwnd, message, wp, lp) = take_posted_message_at(ctx.kernel, index).unwrap();
         if let Some(outcome) = tab_control::dispatch(ctx, hwnd, message, wp, true)? {
             return Ok(outcome);
+        }
+        if message == common_controls::CHANGE {
+            if let Some(outcome) = common_controls::dispatch(ctx, hwnd, message, wp, lp, true)? {
+                return Ok(outcome);
+            }
         }
         let proc = ctx
             .kernel

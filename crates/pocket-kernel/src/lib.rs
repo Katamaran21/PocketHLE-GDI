@@ -1941,6 +1941,14 @@ impl KernelState {
             }
         });
         self.ce.api_waits.retain(|key, _| !finished(key.0));
+        self.controls.common_control_frames.retain(|frame| {
+            if finished(frame.thread) {
+                heap.free(frame.scratch);
+                false
+            } else {
+                true
+            }
+        });
         let dead_host_buffers: Vec<_> = self
             .legacy_winsock
             .hostent_buffers
@@ -2180,6 +2188,9 @@ impl KernelState {
             self.heap.free(frame.scratch);
         }
         self.ce.api_waits.clear();
+        for frame in self.controls.common_control_frames.drain(..) {
+            self.heap.free(frame.scratch);
+        }
         self.gdi.clear_guest_fonts();
         self.gdi.owner_draw_frames.clear();
         self.gdi.list_paint_frames.clear();

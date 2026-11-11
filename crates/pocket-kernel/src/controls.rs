@@ -21,6 +21,12 @@
 use crate::font;
 use crate::gdi::Surface;
 
+mod common;
+pub use common::{
+    CommonControlChange, CommonControlFrame, HeaderItem, HeaderState, TreeItem, TreeState,
+    UpDownState, TREE_FIRST, TREE_LAST, TREE_ROOT, TREE_SORT,
+};
+
 /// Which built-in window class a control was created from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlClass {
@@ -28,6 +34,9 @@ pub enum ControlClass {
     Edit,
     Static,
     ListView,
+    TreeView,
+    Header,
+    UpDown,
     ListBox,
     ComboBox,
     TrackBar,
@@ -73,6 +82,12 @@ impl ControlClass {
             Some(Self::Tab)
         } else if name.eq_ignore_ascii_case("SysListView32") {
             Some(Self::ListView)
+        } else if name.eq_ignore_ascii_case("SysTreeView32") {
+            Some(Self::TreeView)
+        } else if name.eq_ignore_ascii_case("SysHeader32") {
+            Some(Self::Header)
+        } else if name.eq_ignore_ascii_case("msctls_updown32") {
+            Some(Self::UpDown)
         } else {
             None
         }
@@ -444,6 +459,9 @@ pub struct ChildWindow {
     pub toolbar: ToolbarState,
     pub status_bar: crate::StatusBar,
     pub tab: TabState,
+    pub tree: TreeState,
+    pub header: HeaderState,
+    pub updown: UpDownState,
 }
 
 /// Native tab items keep guest application data separate from their labels.
@@ -1644,6 +1662,9 @@ impl ChildWindow {
         }
         let face = gdi.and_then(|g| crate::text::selected(g, self.font));
         match self.class {
+            ControlClass::TreeView => self.render_tree(surf, gdi),
+            ControlClass::Header => self.render_header(surf, face.as_ref()),
+            ControlClass::UpDown => self.render_updown(surf),
             ControlClass::Tab => self.render_tabs(surf),
             ControlClass::Toolbar => self.render_toolbar(surf, gdi),
             ControlClass::Rebar => surf.fill_rect(self.x, self.y, self.w, self.h, Self::FACE),
@@ -2113,6 +2134,7 @@ pub struct Controls {
     pub recognized_holds: std::collections::HashSet<(usize, u32, i32, i32)>,
     pub capture_frames: Vec<(usize, u32, crate::GuestCallFrame, u32)>,
     pub tab_notify_frames: Vec<TabNotifyFrame>,
+    pub common_control_frames: Vec<CommonControlFrame>,
     children: Vec<ChildWindow>,
     inherited_hidden: std::collections::HashSet<u32>,
     native_origins: std::collections::HashMap<u32, (i32, i32)>,
@@ -2148,6 +2170,7 @@ impl Default for Controls {
             recognized_holds: Default::default(),
             capture_frames: Vec::new(),
             tab_notify_frames: Vec::new(),
+            common_control_frames: Vec::new(),
             children: Vec::new(),
             inherited_hidden: Default::default(),
             native_origins: Default::default(),
@@ -2255,6 +2278,9 @@ impl Controls {
                 ..Default::default()
             },
             tab: TabState::default(),
+            tree: TreeState::default(),
+            header: HeaderState::default(),
+            updown: UpDownState::default(),
         });
         hwnd
     }
@@ -2625,6 +2651,17 @@ impl Controls {
             .map(|c| self.parent_origin(c.parent))
             .unwrap_or((0, 0));
         let child = self.get_mut(hwnd)?;
+        if matches!(
+            child.class,
+            ControlClass::TreeView | ControlClass::Header | ControlClass::UpDown
+        ) {
+            if !child.enabled {
+                return Some(ControlAction::Consumed);
+            }
+            let action = child.common_pointer(x - origin.0 - child.x, y - origin.1 - child.y);
+            self.focus = hwnd;
+            return Some(action.unwrap_or(ControlAction::Consumed));
+        }
         if child.class == ControlClass::Tab {
             if !child.enabled {
                 return Some(ControlAction::Consumed);
@@ -3010,6 +3047,7 @@ impl Controls {
             return Some(ControlAction::Consumed);
         }
         match child.class {
+            ControlClass::TreeView | ControlClass::UpDown => child.common_key(vk),
             ControlClass::Tab if matches!(vk, 0x25..=0x28 | 0x24 | 0x23 | 0x20 | 0x0d) => {
                 let len = child.tab.items.len();
                 if len == 0 {

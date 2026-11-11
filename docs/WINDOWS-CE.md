@@ -83,6 +83,15 @@ CE6 input-method CLSID ABI. `__GetUserKData` reads a DWORD at the SDK byte offse
 from the live thread's KData window. API readiness queries report implemented
 device providers and preserve cooperative waits for unavailable sets.
 
+CERF SampleApp's TreeView, Header and UpDown classes have independent control
+state and rendering. Trees retain Unicode labels, item data, hierarchy,
+expansion and selection; headers retain columns and display order; numeric
+controls retain signed ranges and edit buddies. Tree selection/expansion and
+numeric changes send synchronous parent notifications, including vetoes and
+continuation restoration. In CE desktop mode, an unregistered class fails with
+error 1407 instead of reentering the application's main WM_CREATE handler.
+This is a supported common-control subset, not complete commctrl conformance.
+
 ## Build and distribution
 
 ```cmd
