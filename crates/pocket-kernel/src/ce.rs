@@ -94,6 +94,7 @@ pub struct State {
     pub control_panel: Option<ControlPanel>,
     pub settings: Settings,
     pub shell: ShellWindows,
+    pub clipboard: crate::clipboard::Client,
     pub sip_enumerations: Vec<SipEnumeration>,
     pub api_waits: HashMap<(usize, u32, u32), (u32, Instant)>,
     pub(crate) inline_ids: Option<(u32, u32)>,

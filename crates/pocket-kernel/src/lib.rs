@@ -41,6 +41,7 @@ pub mod ce;
 pub mod ce_hive;
 pub mod cedb;
 pub mod classic_sip;
+pub mod clipboard;
 pub mod colors;
 pub mod controls;
 pub mod crypto;

@@ -104,6 +104,17 @@ the shell's startup identifier; it does not boot OEM services or drivers.
 Bounded `StringCchCopyNExW`/`CatNExW` and their byte-counted aliases use the
 CE seven-argument ABI, return end/remaining pointers and do not read beyond
 the requested source component. The original shell uses these for paths.
+Unsigned CE long-to-text conversions preserve all 32 bits for shell file sizes.
+Both FILETIME/local-FILETIME directions preserve 100-ns precision in the virtual
+UTC timezone.
+
+The session clipboard stores Unicode/ANSI text, DIBs and memory-backed custom
+formats such as Explorer's file-copy packets. Children share owned snapshots,
+while GetClipboardData returns a handle in the reader's own heap and
+GetClipboardDataAlloc returns a separately owned LocalFree-compatible copy.
+Open/close ownership is per thread, enumeration distinguishes completion from
+errors, and stale local copies are released when contents change. Delayed
+rendering and clipboard GDI-object formats remain unsupported.
 
 The original Explorer's recycle database uses typed CEDB properties, including
 Unicode names, integers, timestamps and binary data. Databases and mounted

@@ -42,6 +42,7 @@ struct Domain {
     entries: HashMap<(u32, u32), Option<HandleObject>>,
     names: HashMap<String, HandleObject>,
     clipboard_formats: HashMap<String, u32>,
+    clipboard: crate::clipboard::Clipboard,
     next: u32,
     next_pid: u32,
     active: HashSet<u32>,
@@ -85,6 +86,13 @@ impl Default for HandleTable {
 impl HandleTable {
     pub fn process_id(&self) -> u32 {
         self.pid
+    }
+    /// The closure must not access guest memory or reenter the handle domain.
+    pub fn with_clipboard<T>(
+        &self,
+        f: impl FnOnce(&mut crate::clipboard::Clipboard, u32) -> T,
+    ) -> T {
+        f(&mut self.domain.lock().unwrap().clipboard, self.pid)
     }
     pub fn register_clipboard_format(&self, name: &str) -> Option<u32> {
         let name = name.to_lowercase();
@@ -428,11 +436,9 @@ impl HandleTable {
         self.domain.lock().unwrap().active.contains(&pid)
     }
     pub fn set_exit(&self, thread: Option<usize>, code: u32) {
-        self.domain
-            .lock()
-            .unwrap()
-            .exits
-            .insert((self.pid, thread), code);
+        let mut domain = self.domain.lock().unwrap();
+        domain.exits.insert((self.pid, thread), code);
+        domain.clipboard.release(self.pid, thread);
     }
     pub fn exit_code(&self, pid: u32, thread: Option<usize>) -> Option<u32> {
         let d = self.domain.lock().unwrap();
@@ -458,6 +464,7 @@ impl HandleTable {
     }
     pub fn mark_inactive(&self) {
         let mut d = self.domain.lock().unwrap();
+        d.clipboard.release(self.pid, None);
         d.active.remove(&self.pid);
         d.held_start.remove(&self.pid);
         d.process_kills.remove(&self.pid);

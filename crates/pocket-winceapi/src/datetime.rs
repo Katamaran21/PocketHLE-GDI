@@ -23,11 +23,9 @@ pub(crate) fn now() -> [u16; 8] {
     ]
 }
 pub(crate) fn register(d: &mut WinCeDispatcher) {
-    d.register_handler(
-        "coredll.dll",
-        "FileTimeToLocalFileTime",
-        file_time_to_local_file_time,
-    );
+    for name in ["FileTimeToLocalFileTime", "LocalFileTimeToFileTime"] {
+        d.register_handler("coredll.dll", name, file_time_to_local_file_time);
+    }
     d.register_handler(
         "coredll.dll",
         "GetTimeZoneInformation",
@@ -42,7 +40,7 @@ pub(crate) fn register(d: &mut WinCeDispatcher) {
         d.register_handler("coredll.dll", name, format_api);
     }
 }
-/// Convert UTC FILETIME to the emulated local FILETIME. The emulated
+/// Convert between UTC FILETIME and the emulated local FILETIME. The emulated
 /// timezone is UTC with no DST, consistently with GetLocalTime and
 /// GetTimeZoneInformation, so the exact 100-ns timestamp is preserved.
 fn file_time_to_local_file_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -409,7 +407,14 @@ mod tests {
     fn file_time_to_local_preserves_full_precision_in_virtual_utc() {
         let (mut cpu, mut k, mut d) = setup();
         // Include the epoch, a nonzero high DWORD and sub-millisecond ticks.
-        for ticks in [0u64, 1, 0x01db_eeab_1234_5679, 0x7fff_ffff_ffff_ffff] {
+        for (name, ticks) in ["FileTimeToLocalFileTime", "LocalFileTimeToFileTime"]
+            .into_iter()
+            .flat_map(|name| {
+                [0u64, 1, 0x01db_eeab_1234_5679, 0x7fff_ffff_ffff_ffff]
+                    .into_iter()
+                    .map(move |ticks| (name, ticks))
+            })
+        {
             cpu.write_mem(0x1200, &ticks.to_le_bytes()).unwrap();
             cpu.write_mem(0x1300, &[0xaa; 12]).unwrap();
             assert_eq!(
@@ -418,7 +423,7 @@ mod tests {
                     &mut k,
                     &mut d,
                     "coredll.dll",
-                    "FileTimeToLocalFileTime",
+                    name,
                     &[0x1200, 0x1300, 0x41ff, 0xb9000000]
                 ),
                 DispatchOutcome::ReturnedR0(1)

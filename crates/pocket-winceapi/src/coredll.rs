@@ -27,6 +27,7 @@ mod shell_execute;
 mod ce_gdi;
 #[path = "coredll/choice_controls.rs"]
 mod choice_controls;
+mod clipboard;
 pub(crate) mod command_bar;
 mod common_controls;
 #[path = "coredll/control_color.rs"]
@@ -299,7 +300,10 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "atof", atof_handler);
     d.register_handler(dll, "_itoa", itoa_handler);
     d.register_handler(dll, "_ltoa", itoa_handler);
+    d.register_handler(dll, "_ultoa", itoa_handler);
     d.register_handler(dll, "_itow", itow_handler);
+    d.register_handler(dll, "_ltow", itow_handler);
+    d.register_handler(dll, "_ultow", itow_handler);
     d.register_handler(dll, "_isctype", isctype);
     d.register_handler(dll, "strchr", strchr);
     d.register_handler(dll, "strrchr", strrchr);
@@ -1432,17 +1436,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_set_new_handler", crt_set_new_handler);
     d.register_handler(dll, "_query_new_handler", crt_query_new_handler);
 
-    // ---- Clipboard (no-op) ----
-    d.register_handler(dll, "OpenClipboard", open_clipboard);
-    d.register_handler(dll, "CloseClipboard", close_clipboard);
-    d.register_handler(dll, "EmptyClipboard", empty_clipboard);
-    d.register_handler(
-        dll,
-        "IsClipboardFormatAvailable",
-        is_clipboard_format_available,
-    );
-    d.register_handler(dll, "GetClipboardData", get_clipboard_data);
-    d.register_handler(dll, "SetClipboardData", set_clipboard_data);
+    // ---- Session clipboard ----
+    clipboard::register(d);
 }
 
 // ---------- generic helpers ----------
@@ -7114,10 +7109,8 @@ mod colors_time_tests {
     }
 }
 
-/// MSVC `_isctype(int c, int mask)`: returns the subset of `mask` the
-/// character satisfies. `isalpha`, `isdigit`, `isspace` and friends are
-/// macros that call straight into this, so returning 0 unconditionally
-/// broke every parser the guest CRT has.
+/// CE long is 32 bits. Original ceshell uses _ultow for unsigned file sizes;
+/// interpreting its high bit as a sign produces the wrong decimal text.
 fn itow_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let value = ctx.arg_u32(0)? as i32;
     let dst = ctx.arg_u32(1)?;
@@ -7125,7 +7118,7 @@ fn itow_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if dst == 0 || !(2..=36).contains(&radix) {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    let negative = value < 0 && radix == 10;
+    let negative = value < 0 && radix == 10 && crate::import_name(ctx.thunk) != "_ultow";
     let mut magnitude = if negative {
         (value as i64).unsigned_abs()
     } else {
@@ -7145,7 +7138,10 @@ fn itow_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     digits.reverse();
     digits.push(0);
-    ctx.cpu.write_mem(dst, &wide_to_bytes(&digits))?;
+    let bytes = wide_to_bytes(&digits);
+    ctx.cpu
+        .check_guest_access(dst, bytes.len() as u32, pocket_cpu::Prot::WRITE)?;
+    ctx.cpu.write_mem(dst, &bytes)?;
     Ok(DispatchOutcome::ReturnedR0(dst))
 }
 
@@ -7156,8 +7152,8 @@ fn itoa_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if dst == 0 || !(2..=36).contains(&radix) {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    let negative = value < 0 && radix == 10;
-    let mut magnitude = if value < 0 && radix == 10 {
+    let negative = value < 0 && radix == 10 && crate::import_name(ctx.thunk) != "_ultoa";
+    let mut magnitude = if negative {
         (value as i64).unsigned_abs()
     } else {
         value as u32 as u64
@@ -7176,6 +7172,8 @@ fn itoa_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     digits.reverse();
     digits.push(0);
+    ctx.cpu
+        .check_guest_access(dst, digits.len() as u32, pocket_cpu::Prot::WRITE)?;
     ctx.cpu.write_mem(dst, &digits)?;
     Ok(DispatchOutcome::ReturnedR0(dst))
 }
@@ -25499,31 +25497,6 @@ fn sip_show_im(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn sip_get_info(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let p = ctx.arg_u32(0)?;
     crate::shell_keyboard::sip_info(ctx, p)
-}
-
-// ---------- Clipboard (no-op stubs) ----------
-//
-// PocketHLE doesn't model a system clipboard; it's safe to behave
-// as if we successfully opened an empty clipboard. The game just
-// won't be able to round-trip text through it.
-
-fn open_clipboard(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(1))
-}
-fn close_clipboard(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(1))
-}
-fn empty_clipboard(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(1))
-}
-fn is_clipboard_format_available(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0))
-}
-fn get_clipboard_data(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0))
-}
-fn set_clipboard_data(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 // ---------- Audio: waveOut* ---------------------------------------
