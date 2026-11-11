@@ -66,7 +66,8 @@ def package(output, image=None, explorer=None):
     with tempfile.NamedTemporaryFile(dir=output.parent, prefix='.wince-profile-', suffix='.zip', delete=False) as temp:
         pending = Path(temp.name)
     try:
-        with zipfile.ZipFile(pending, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        with zipfile.ZipFile(pending, 'w', zipfile.ZIP_DEFLATED, compresslevel=6,
+                             strict_timestamps=False) as archive:
             put_json(archive, 'profiles/wince6-portable.json', profile)
             archive.writestr('run-wince6-gui.cmd', LAUNCHER.replace('\n', '\r\n'))
             put_json(archive, 'windows-ce-android.json', dict(screen='vga_landscape', rotation='none', max_slices=0, windows_ce=settings))

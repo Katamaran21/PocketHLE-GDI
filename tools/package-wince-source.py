@@ -20,7 +20,10 @@ def main():
     files = subprocess.check_output(['git', 'ls-files', '-z'], cwd=ROOT).decode().split('\0')
     args.output.parent.mkdir(parents=True, exist_ok=True)
     prefix = 'PocketHLE-GDI-source/'
-    with zipfile.ZipFile(args.output, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+    # Cargo archives deliberately use epoch timestamps for reproducibility.
+    # ZIP's DOS date range begins in 1980; clamp dates without changing sources.
+    with zipfile.ZipFile(args.output, 'w', zipfile.ZIP_DEFLATED, compresslevel=6,
+                         strict_timestamps=False) as archive:
         for name in sorted(filter(None, files)):
             path = ROOT / name
             if not path.is_file() or name == '.cargo/config.toml':
@@ -49,6 +52,10 @@ def main():
             'For Android, sign rebuilt APKs with your own key; the publisher key is private.\n')
         archive.writestr(prefix + 'SOURCE-REVISION.json', json.dumps(dict(
             commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT).decode().strip()), indent=2))
+    with zipfile.ZipFile(args.output) as archive:
+        bad = archive.testzip()
+        if bad:
+            raise SystemExit(f'Source ZIP integrity check failed: {bad}')
     print(args.output)
 
 
