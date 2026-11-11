@@ -19,7 +19,7 @@ pub(super) fn register(d: &mut WinCeDispatcher) {
         d.register_handler("coredll.dll", name, handler);
     }
 }
-fn guid(ctx: &CallCtx<'_>, ptr: u32) -> Option<Guid> {
+fn guid(ctx: &mut CallCtx<'_>, ptr: u32) -> Option<Guid> {
     if !access(ctx, ptr, 16, Prot::READ) {
         return None;
     }
@@ -49,7 +49,7 @@ fn snapshot(ctx: &mut CallCtx<'_>, volume: Guid) -> Result<model::Volume, u32> {
         .generic
         .snapshot(&mut ctx.kernel.vfs, volume)
 }
-fn sort(ctx: &CallCtx<'_>, ptr: u32) -> Option<Sort> {
+fn sort(ctx: &mut CallCtx<'_>, ptr: u32) -> Option<Sort> {
     if !access(ctx, ptr, 32, Prot::READ) {
         return None;
     }
@@ -73,7 +73,7 @@ fn sort(ctx: &CallCtx<'_>, ptr: u32) -> Option<Sort> {
         properties,
     })
 }
-fn info(ctx: &CallCtx<'_>, ptr: u32) -> Option<Database> {
+fn info(ctx: &mut CallCtx<'_>, ptr: u32) -> Option<Database> {
     if !access(ctx, ptr, 220, Prot::READ) {
         return None;
     }
