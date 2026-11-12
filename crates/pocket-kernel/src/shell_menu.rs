@@ -53,10 +53,29 @@ pub struct Bar {
     pub owner: u32,
     pub menu: u32,
     pub sip: bool,
+    /// CE command-bar adornment. It sends WM_CLOSE to the bar's owner and
+    /// reserves no caption/client inset (the original Control Panel layout).
+    pub close_button: bool,
     pub background: u16,
     /// Classic CE command bars have a window rectangle; Mobile bars use the
     /// existing bottom strip when this is None.
     pub bounds: Option<[i32; 4]>,
+}
+impl Bar {
+    pub fn close_rect(&self, bounds: [i32; 4]) -> Option<[i32; 4]> {
+        if !self.close_button || self.bounds.is_none() {
+            return None;
+        }
+        let size = (bounds[3] - bounds[1] - 6)
+            .min(bounds[2] - bounds[0] - 6)
+            .min(18);
+        if size <= 0 {
+            return None;
+        }
+        let right = bounds[2] - 3;
+        let top = bounds[1] + (bounds[3] - bounds[1] - size) / 2;
+        Some([right - size, top, right, top + size])
+    }
 }
 #[derive(Debug, Clone)]
 struct Popup {
@@ -78,11 +97,13 @@ pub struct ShellMenus {
     column: usize,
     path: Vec<Popup>,
     captured: bool,
+    close_capture: Option<u32>,
 }
 #[derive(Debug, PartialEq)]
 pub enum Action {
     Consumed,
     Command(u32, u32),
+    Close(u32),
     Sip,
     Open(u32, u32),
 }
@@ -188,6 +209,7 @@ impl ShellMenus {
         }
         self.path.clear();
         self.active = 0;
+        self.close_capture = None;
     }
     pub fn begin_tracking(&mut self, tracking: TrackingMenu, menu: u32) {
         self.close();
@@ -198,6 +220,7 @@ impl ShellMenus {
                 owner: tracking.owner,
                 menu: 0,
                 sip: false,
+                close_button: false,
                 background: 0xffff,
                 bounds: None,
             },
@@ -513,7 +536,7 @@ impl ShellMenus {
             self.close();
             return None;
         }
-        if self.active != handle {
+        if self.active != handle && self.close_capture != Some(handle) {
             self.close();
         }
         let rows = ((height - HEIGHT) / 20).max(1) as usize;
@@ -523,6 +546,38 @@ impl ShellMenus {
         let in_bar = |x: i32, y: i32| {
             x >= bar_rect[0] && y >= bar_rect[1] && x < bar_rect[2] && y < bar_rect[3]
         };
+        let close_rect = self.bars[&handle].close_rect(bar_rect);
+        let in_close = |x: u16, y: u16| {
+            close_rect.is_some_and(|r| {
+                i32::from(x) >= r[0]
+                    && i32::from(y) >= r[1]
+                    && i32::from(x) < r[2]
+                    && i32::from(y) < r[3]
+            })
+        };
+        if matches!(ev, InputEvent::PointerDown { x, y } if in_close(x, y))
+            && self.tracking.is_none()
+        {
+            self.close();
+            self.captured = false;
+            self.close_capture = Some(handle);
+            return Some(Action::Consumed);
+        }
+        if self.close_capture == Some(handle) {
+            match ev {
+                InputEvent::PointerUp { x, y } => {
+                    self.close_capture = None;
+                    return Some(if in_close(x, y) {
+                        Action::Close(self.bars[&handle].owner)
+                    } else {
+                        Action::Consumed
+                    });
+                }
+                InputEvent::PointerMove { .. } => return Some(Action::Consumed),
+                InputEvent::PointerDown { .. } => self.close_capture = None,
+                _ => {}
+            }
+        }
         match ev {
             InputEvent::PointerDown { x, y } => {
                 let (x, y) = (x as i32, y as i32);
@@ -534,7 +589,11 @@ impl ShellMenus {
                         return Some(Action::Sip);
                     }
                     let index = self
-                        .titles(bar, menus, bar_rect[2] - bar_rect[0])
+                        .titles(
+                            bar,
+                            menus,
+                            close_rect.map_or(bar_rect[2], |r| r[0]) - bar_rect[0],
+                        )
                         .iter()
                         .position(|(a, w)| x >= bar_rect[0] + *a && x < bar_rect[0] + *a + *w);
                     if index.is_some_and(|i| {
@@ -665,8 +724,14 @@ impl ShellMenus {
             surface.fill_rect(bar_rect[0], y, bw, bh, bar.background);
             surface.fill_rect(bar_rect[0], y, bw, 1, 0x8410);
             if let Some(items) = menus.get(&bar.menu) {
-                for (index, (item, (x, width))) in
-                    items.iter().zip(self.titles(bar, menus, bw)).enumerate()
+                for (index, (item, (x, width))) in items
+                    .iter()
+                    .zip(self.titles(
+                        bar,
+                        menus,
+                        bar.close_rect(bar_rect).map_or(bw, |r| r[0] - bar_rect[0]),
+                    ))
+                    .enumerate()
                 {
                     let x = x + bar_rect[0];
                     let active =
@@ -691,6 +756,16 @@ impl ShellMenus {
                     for col in 0..5 {
                         surface.fill_rect(w - 21 + col * 3, icon_y + 2 + row * 3, 2, 2, 0xffff);
                     }
+                }
+            }
+            if let Some(r) = bar.close_rect(bar_rect) {
+                let pressed = self.close_capture == Some(handle);
+                crate::windowing::draw_edge(surface, r, if pressed { 10 } else { 5 }, 0xf);
+                let offset = i32::from(pressed);
+                let center = ((r[0] + r[2]) / 2 + offset, (r[1] + r[3]) / 2 + offset);
+                for delta in -3..=3 {
+                    surface.put_pixel(center.0 + delta, center.1 + delta, 0);
+                    surface.put_pixel(center.0 + delta, center.1 - delta, 0);
                 }
             }
         }
@@ -809,6 +884,7 @@ mod tests {
                 owner: 7,
                 menu: 10,
                 sip: true,
+                close_button: false,
                 background: 0xc618,
                 bounds: None,
             },
@@ -827,6 +903,58 @@ mod tests {
         let states = HashMap::from([(11, HashMap::from([(80, 3)]))]);
         (shell, menus, states)
     }
+    #[test]
+    fn ce_command_bar_close_captures_its_press_cancels_outside_and_keeps_file_menu() {
+        let (mut shell, menus, states) = fixture();
+        let bar = shell.bars.get_mut(&1).unwrap();
+        bar.bounds = Some([1, 1, 319, 25]);
+        bar.sip = false;
+        bar.close_button = true;
+        let rect = bar.close_rect(bar.bounds.unwrap()).unwrap();
+        let (x, y) = (
+            ((rect[0] + rect[2]) / 2) as u16,
+            ((rect[1] + rect[3]) / 2) as u16,
+        );
+        let send = |shell: &mut ShellMenus, event| shell.input(1, event, 320, 240, &menus, &states);
+        assert_eq!(send(&mut shell, InputEvent::PointerUp { x, y }), None);
+        assert_eq!(
+            send(&mut shell, InputEvent::PointerDown { x, y }),
+            Some(Action::Consumed)
+        );
+        let mut frame = crate::framebuffer::Framebuffer::new(320, 240);
+        shell.render(
+            1,
+            &mut Surface::Screen(&mut frame),
+            &GdiState::default(),
+            &menus,
+            &states,
+        );
+        let center = ((u32::from(y) + 1) * 320 + u32::from(x) + 1) as usize * 2;
+        assert_eq!(&frame.pixels[center..center + 2], &[0, 0]);
+        assert_eq!(
+            send(&mut shell, InputEvent::PointerMove { x: 100, y: 80 }),
+            Some(Action::Consumed)
+        );
+        assert_eq!(
+            send(&mut shell, InputEvent::PointerUp { x: 100, y: 80 }),
+            Some(Action::Consumed)
+        );
+        assert_eq!(
+            send(&mut shell, InputEvent::PointerDown { x, y }),
+            Some(Action::Consumed)
+        );
+        assert_eq!(
+            send(&mut shell, InputEvent::PointerUp { x, y }),
+            Some(Action::Close(7))
+        );
+        assert_eq!(shell.bars[&1].menu, 10);
+        assert_eq!(
+            send(&mut shell, InputEvent::PointerDown { x: 10, y: 12 }),
+            Some(Action::Open(7, 11))
+        );
+        assert!(shell.active_popup().is_some());
+    }
+
     #[test]
     fn cascades_stay_visible_and_pointer_navigation_returns_the_guest_command() {
         let (mut shell, menus, states) = fixture();

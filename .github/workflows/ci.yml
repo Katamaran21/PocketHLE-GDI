@@ -128,11 +128,11 @@ jobs:
             cmake build-essential libclang-dev clang lld python3
       - name: build static FFmpeg
         run: bash tools/build-ffmpeg.sh x86_64-unknown-linux-gnu 4
-      - run: cargo build --workspace --release --locked
+      - run: cargo build --workspace --release --locked --features pocket-winceapi/unicorn-tests
       - name: run workspace tests sequentially
-        # Includes launcher profiles/controller navigation. Executable ARM
-        # diagnostics require the non-default arm-diagnostics feature.
-        run: cargo test --workspace --release --locked --no-fail-fast -- --test-threads=1
+        # Includes launcher navigation and synthetic ARM/Thumb callback ABI
+        # regressions. HARDWARE DIAG fixtures remain a separate opt-in feature.
+        run: cargo test --workspace --release --locked --features pocket-winceapi/unicorn-tests --no-fail-fast -- --test-threads=1
 
   build-unicorn:
     name: build with unicorn-engine

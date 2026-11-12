@@ -229,6 +229,8 @@ impl KernelState {
             self.heap.free(copy);
         }
         let module = self.modules.remove(index);
+        self.ce.module_versions.remove(&base);
+        self.ce.com.servers.retain(|_, handle| *handle != base);
         for satellite in module.satellites {
             if let Some(module) = self
                 .modules

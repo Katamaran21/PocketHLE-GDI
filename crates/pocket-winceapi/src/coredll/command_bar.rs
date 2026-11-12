@@ -1,13 +1,17 @@
 //! CE CommandBar/CommandBands own real child windows and ordered rebar bands.
 //! Portable Explorer uses the CE ordinal imports even without a system image.
 use super::*;
-use pocket_kernel::controls::{RebarBand, RebarState};
+use pocket_kernel::{
+    controls::{RebarBand, RebarState},
+    windowing,
+};
 
 pub(crate) fn register(d: &mut WinCeDispatcher) {
     for (ordinal, name, handler) in [
         (3, "CommandBar_Create", create_bar as crate::Handler),
         (4, "CommandBar_Show", show),
         (5, "CommandBar_AddBitmap", add_bitmap),
+        (6, "CommandBar_InsertComboBox", insert_combo),
         (7, "CommandBar_InsertControl", insert_control),
         (8, "CommandBar_InsertMenubar", insert_menu),
         (9, "CommandBar_GetMenu", get_menu),
@@ -348,12 +352,21 @@ fn attach_menu(
             break;
         }
     }
+    // Control.exe requests WS_BORDER and positions its list from the global
+    // work area. A synthetic caption would cover File/View and the first icons.
+    // In classic profiles put Close in its existing CE command bar instead.
+    let owner_style = ctx.kernel.window_styles.get(&owner).map_or(0, |s| s.0);
+    let close_button = ctx.kernel.ce.windows.enabled
+        && owner_style & 0xc000_0000 == 0
+        && owner_style & 0x0080_0000 != 0
+        && owner_style & windowing::WS_CAPTION != windowing::WS_CAPTION;
     ctx.kernel.gdi.shell_menus.bars.insert(
         hwnd,
         pocket_kernel::shell_menu::Bar {
             owner,
             menu,
             sip: false,
+            close_button,
             background: colorref_to_rgb565(sys_color(4)),
             bounds: Some([0, 0, 1, 24]),
         },
@@ -452,6 +465,29 @@ fn insert_control(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     let style = ctx.arg_u32(4)?;
     let id = ctx.arg_u32(5)? & 0xffff;
     let raw_index = ctx.arg_u32(6)? & 0xffff;
+    insert_child(ctx, hwnd, class, width, style, id, raw_index)
+}
+
+fn insert_combo(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // WordPad inserts its font list with the six-argument public CE ABI;
+    // unlike InsertControl there is no class-name argument in this call.
+    let hwnd = ctx.arg_u32(0)?;
+    let width = ctx.arg_u32(2)?;
+    let style = ctx.arg_u32(3)?;
+    let id = ctx.arg_u32(4)? & 0xffff;
+    let index = ctx.arg_u32(5)? & 0xffff;
+    insert_child(ctx, hwnd, ControlClass::ComboBox, width, style, id, index)
+}
+
+fn insert_child(
+    ctx: &mut CallCtx<'_>,
+    hwnd: u32,
+    class: ControlClass,
+    width: u32,
+    style: u32,
+    id: u32,
+    raw_index: u32,
+) -> Result<DispatchOutcome, KernelError> {
     let Some(bar) = ctx
         .kernel
         .controls
@@ -526,6 +562,9 @@ fn adorn(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             .toolbar
             .buttons
             .push([u32::MAX, 0xf060, 4, 0, 0]);
+    }
+    if let Some(bar) = ctx.kernel.gdi.shell_menus.bars.get_mut(&hwnd) {
+        bar.close_button = true;
     }
     align_bar(ctx, hwnd);
     queue_window_paint(ctx.kernel, hwnd);
@@ -643,6 +682,70 @@ mod tests {
             panic!("unexpected detour");
         };
         v
+    }
+
+    #[test]
+    fn control_panel_close_uses_its_existing_command_bar_without_changing_client_geometry() {
+        let mut cpu = super::super::tests::scanf_cpu();
+        let mut state = super::super::tests::fresh_kernel();
+        state.framebuffer = pocket_kernel::framebuffer::deferred::DeferredFramebuffer::new(
+            pocket_kernel::framebuffer::Framebuffer::new(320, 240),
+        )
+        .unwrap();
+        state.ce.windows.enabled = true;
+        let owner = 0x111;
+        let style = windowing::classic_style(0x10800000);
+        assert_eq!(style, 0x10800000);
+        state.window_rects.insert(owner, (0, 0, 320, 240));
+        state.window_styles.insert(owner, (style, 0));
+        state.window_visibility.insert(owner, true);
+        state.active_window = owner;
+        state.ce.windows.z_order.push(owner);
+        state.menu_items.insert(
+            0x222,
+            vec![pocket_kernel::MenuItem {
+                id: 11,
+                text: "&File".encode_utf16().collect(),
+                ..Default::default()
+            }],
+        );
+        let thunk = super::super::tests::dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut state,
+            thunk: &thunk,
+        };
+        args(&mut ctx, &[0, owner, 25]);
+        let hwnd = value(create_bar(&mut ctx).unwrap());
+        assert_eq!(
+            attach_menu(&mut ctx, hwnd, 0x222).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        ctx.kernel.refresh_control_visibility();
+        assert_eq!(ctx.kernel.window_client_origin(owner), Some((1, 1)));
+        assert_eq!(ctx.kernel.window_client_size(owner), Some((318, 238)));
+        assert_eq!(ctx.kernel.controls.screen_rect(hwnd), Some((1, 1, 318, 24)));
+        let bar = &ctx.kernel.gdi.shell_menus.bars[&hwnd];
+        let rect = bar.close_rect(bar.bounds.unwrap()).unwrap();
+        let (x, y) = (
+            ((rect[0] + rect[2]) / 2) as u16,
+            ((rect[1] + rect[3]) / 2) as u16,
+        );
+        assert_eq!(
+            crate::aygshell::menu_input(&mut ctx, InputEvent::PointerDown { x, y }),
+            Some(None)
+        );
+        assert_eq!(
+            crate::aygshell::menu_input(&mut ctx, InputEvent::PointerUp { x, y }),
+            Some(Some((owner, 0x10, 0, 0)))
+        );
+        assert!(ctx.kernel.window_rects.contains_key(&owner));
+        ctx.kernel.ce.windows.enabled = false;
+        assert_eq!(
+            attach_menu(&mut ctx, hwnd, 0x222).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert!(!ctx.kernel.gdi.shell_menus.bars[&hwnd].close_button);
     }
 
     #[test]
@@ -764,6 +867,49 @@ mod tests {
         assert_eq!(
             (c.class, c.parent, c.id, c.x, c.w),
             (ControlClass::Static, bar, 1050, 24, 80)
+        );
+    }
+
+    #[test]
+    fn wordpad_font_combo_uses_six_arguments_and_owns_a_real_toolbar_slot() {
+        let mut cpu = super::super::tests::scanf_cpu();
+        let mut state = super::super::tests::fresh_kernel();
+        state.window_rects.insert(0x111, (0, 0, 320, 240));
+        let thunk = super::super::tests::dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut state,
+            thunk: &thunk,
+        };
+        args(&mut ctx, &[0, 0x111, 25]);
+        let bar = value(create_bar(&mut ctx).unwrap());
+        ctx.kernel
+            .controls
+            .get_mut(bar)
+            .unwrap()
+            .toolbar
+            .buttons
+            .push([0, 100, 4, 0, 0]);
+        args(&mut ctx, &[bar, 0x10000000, 100, 0x00300003, 1050, 0xffff]);
+        let combo = value(insert_combo(&mut ctx).unwrap());
+        let c = ctx.kernel.controls.get(combo).unwrap();
+        assert_eq!(
+            (c.class, c.parent, c.id, c.x, c.w),
+            (ControlClass::ComboBox, bar, 1050, 24, 100)
+        );
+        assert_eq!(c.style & 0x00300003, 0x00300003);
+        assert_eq!(
+            ctx.kernel.controls.get(bar).unwrap().toolbar.buttons[1],
+            [100, 0, 0x104, combo, 0]
+        );
+        args(&mut ctx, &[bar, 0, 100, 3, 1051, 10]);
+        assert_eq!(
+            insert_combo(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert_eq!(
+            ctx.kernel.controls.get(bar).unwrap().toolbar.buttons.len(),
+            2
         );
     }
 

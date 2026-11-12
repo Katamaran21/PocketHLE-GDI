@@ -15,13 +15,20 @@ pub const SCROLLBAR: i32 = 16;
 
 /// The classic profile gives PocketPC application windows their requested
 /// frame buttons. Portable Explorer omits WS_CAPTION on its browse window;
-/// popup desktops and ordinary controls keep their own geometry.
+/// popup desktops and ordinary controls keep their own geometry. Border-only
+/// windows such as CE6 Control Panel lay out against SPI_GETWORKAREA and use
+/// a command-bar Close button instead of an extra caption inset.
 pub fn classic_style(style: u32) -> u32 {
     if style & 0xc000_0000 == 0
-        && style & (WS_MINIMIZEBOX | WS_MAXIMIZEBOX) != 0
+        && style & (0x0040_0000 | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX) != 0
         && style & WS_CAPTION != WS_CAPTION
     {
-        style | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME
+        let resize = if style & (WS_MINIMIZEBOX | WS_MAXIMIZEBOX) != 0 {
+            WS_THICKFRAME
+        } else {
+            0
+        };
+        style | WS_CAPTION | WS_SYSMENU | resize
     } else {
         style
     }

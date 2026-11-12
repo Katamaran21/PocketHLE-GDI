@@ -560,6 +560,7 @@ pub(crate) mod tests {
             image_base: 0,
             image_size: 0,
             image_entry: 0,
+            image_version: 0x0004_0000,
             dynamic_exports: std::collections::HashMap::new(),
             image_imports: Vec::new(),
             gles_local_ordinals: std::collections::HashMap::new(),

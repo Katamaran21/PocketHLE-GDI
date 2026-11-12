@@ -25,10 +25,14 @@ pub fn configure_device(
         }
     }
     state.registry.configure_persistence(&registry_path)?;
+    let app_defaults_changed = image
+        .map(|image| image.complete_application_defaults(&mut state.registry))
+        .transpose()?
+        .unwrap_or(false);
     // Publish the imported image registry at first boot as well as on exit.
     // Explorer's profile remains usable after a host interruption before it
     // writes a preference or reaches normal process teardown.
-    if !registry_path.exists() {
+    if app_defaults_changed || !registry_path.exists() {
         state.registry.flush()?;
     }
     if let Some(image) = image {
@@ -298,6 +302,35 @@ impl WindowsCeImage {
         Ok(())
     }
 
+    fn complete_application_defaults(&self, registry: &mut Registry) -> Result<bool> {
+        use pocket_kernel::registry::RegistryValue;
+        const MARKER: &str = r"HKLM\Software\PocketHLE\ImageDefaults";
+        const WORD: &str = r"HKLM\Software\Microsoft\Pocket Word\Directories";
+        if registry.value(MARKER, "BuiltInApplications") == Some(RegistryValue::Dword(1)) {
+            return Ok(false);
+        }
+        let baseline = registry.isolated_copy();
+        let mut staged = baseline.isolated_copy();
+        // This CE6 filesystem carries letter.pwt/meetnote.pwt in Windows,
+        // but omits WordPad's required Templates registry value. Supply its
+        // directory in the private profile, preserving imported/saved choices.
+        if self.windows.join("pword.exe").is_file() && staged.value(WORD, "Templates").is_none() {
+            anyhow::ensure!(
+                staged.set_value(WORD, "Templates", RegistryValue::Sz(r"\Windows".into())),
+                "CE application defaults allocation failed"
+            );
+        }
+        anyhow::ensure!(
+            staged.set_value(MARKER, "BuiltInApplications", RegistryValue::Dword(1)),
+            "CE application defaults allocation failed"
+        );
+        anyhow::ensure!(
+            registry.commit_isolated(&baseline, &staged),
+            "CE application defaults commit failed"
+        );
+        Ok(true)
+    }
+
     /// Per-process metadata and fonts. Registry import is a separate, once per
     /// device operation so CreateProcess never resets a parent's preferences.
     pub fn configure_process(&self, state: &mut pocket_kernel::KernelState) {
@@ -345,6 +378,49 @@ mod tests {
     use pocket_kernel::vfs::Vfs;
 
     #[test]
+    fn wordpad_defaults_preserve_saved_paths_and_do_not_resurrect_user_deletions() {
+        use pocket_kernel::registry::RegistryValue;
+        const WORD: &str = r"HKLM\Software\Microsoft\Pocket Word\Directories";
+        let source = tempfile::tempdir().unwrap();
+        let windows = source.path().join("Windows");
+        std::fs::create_dir(&windows).unwrap();
+        std::fs::write(windows.join("pword.exe"), b"fixture").unwrap();
+        let image = WindowsCeImage {
+            filesystem: source.path().to_path_buf(),
+            windows,
+            version: (6, 0, 0),
+            ordinals: HashMap::new(),
+            hives: Vec::new(),
+            fonts: Vec::new(),
+        };
+        for saved in [None, Some(r"\My Documents\Templates")] {
+            let data = tempfile::tempdir().unwrap();
+            let path = data.path().join("registry.json");
+            let mut registry = Registry::new();
+            if let Some(saved) = saved {
+                assert!(registry.set_value(WORD, "Templates", RegistryValue::Sz(saved.into())));
+            }
+            registry.configure_persistence(&path).unwrap();
+            assert!(image.complete_application_defaults(&mut registry).unwrap());
+            assert_eq!(
+                registry.value(WORD, "Templates"),
+                Some(RegistryValue::Sz(saved.unwrap_or(r"\Windows").into()))
+            );
+            assert!(registry.delete_value(WORD, "Templates"));
+            registry.flush().unwrap();
+            let mut reopened = Registry::new();
+            reopened.configure_persistence(&path).unwrap();
+            assert!(!image.complete_application_defaults(&mut reopened).unwrap());
+            assert_eq!(reopened.value(WORD, "Templates"), None);
+        }
+        assert!(!source.path().join("registry.json").exists());
+        assert_eq!(
+            std::fs::read(image.windows.join("pword.exe")).unwrap(),
+            b"fixture"
+        );
+    }
+
+    #[test]
     fn image_control_panel_modules_use_the_registered_hle_provider() {
         let image = WindowsCeImage {
             filesystem: PathBuf::from("image/fs"),
@@ -359,6 +435,7 @@ mod tests {
             source_path: "control-fixture.exe".into(),
             machine: pocket_pe::machine::ARM,
             subsystem: pocket_pe::subsystem::WINDOWS_CE_GUI,
+            subsystem_version: (4, 0),
             image_base: 0x10000,
             size_of_image: 0x2000,
             stack_reserve: 0x4000,

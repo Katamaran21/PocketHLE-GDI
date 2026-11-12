@@ -119,6 +119,8 @@ pub struct LoadedImage {
     pub source_path: String,
     pub machine: u16,
     pub subsystem: u16,
+    /// Minimum subsystem version requested by the PE, used by GetProcessVersion.
+    pub subsystem_version: (u16, u16),
     pub image_base: u32,
     pub size_of_image: u32,
     /// Primary-thread stack reservation from the PE optional header.
@@ -323,6 +325,10 @@ fn load_bytes_inner(
         source_path: String::new(),
         machine,
         subsystem: subsys,
+        subsystem_version: (
+            oh.windows_fields.major_subsystem_version,
+            oh.windows_fields.minor_subsystem_version,
+        ),
         image_base,
         size_of_image,
         stack_reserve: oh.windows_fields.size_of_stack_reserve as u32,
@@ -966,6 +972,7 @@ mod tests {
             source_path: String::new(),
             machine: machine::ARM,
             subsystem: subsystem::WINDOWS_CE_GUI,
+            subsystem_version: (4, 0),
             image_base: 0x100000,
             stack_reserve: 0x10000,
             size_of_image: 0x2000,
@@ -1084,6 +1091,7 @@ mod tests {
             source_path: "x".into(),
             machine: machine::ARM,
             subsystem: subsystem::WINDOWS_CE_GUI,
+            subsystem_version: (4, 0),
             image_base: 0x10000,
             stack_reserve: 0x10000,
             size_of_image: 0,

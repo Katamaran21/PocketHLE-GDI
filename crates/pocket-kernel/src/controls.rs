@@ -430,6 +430,8 @@ pub struct ChildWindow {
     pub list_images: Vec<i32>,
     pub list_states: Vec<u32>,
     pub list_text_callbacks: Vec<bool>,
+    /// LVIF_DI_SETITEM caches only the returned subitem, not every report column.
+    pub list_cached_text: Vec<std::collections::BTreeSet<u32>>,
     pub list_image_callbacks: Vec<bool>,
     pub list_image_lists: [u32; 3],
     pub list_image_sizes: [(u32, u32); 3],
@@ -2242,6 +2244,7 @@ impl Controls {
             list_images: Vec::new(),
             list_states: Vec::new(),
             list_text_callbacks: Vec::new(),
+            list_cached_text: Vec::new(),
             list_image_callbacks: Vec::new(),
             list_image_lists: [0; 3],
             list_image_sizes: [(0, 0); 3],

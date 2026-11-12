@@ -848,6 +848,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     // `SDL_SetVideoMode` fails with "No video mode large enough".
     d.register_handler(dll, "GetSystemDefaultUILanguage", en_us_lang_id);
     d.register_handler(dll, "GetUserDefaultLCID", en_us_lang_id);
+    // CE6 WordPad queries the system locale while populating its font lists.
+    d.register_handler(dll, "GetSystemDefaultLCID", en_us_lang_id);
     d.register_constant(dll, "SetROP2", 1, one_returning);
     d.register_constant(dll, "SetStretchBltMode", 1, one_returning);
     d.register_constant(dll, "GdiSetBatchLimit", 1, one_returning);
@@ -975,6 +977,10 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetExitCodeThread", get_exit_code_thread);
     d.register_handler(dll, "ExitThread", exit_thread);
     d.register_handler(dll, "GetCurrentProcessId", get_current_process_id);
+    d.register_handler(dll, "GetProcessVersion", get_process_version);
+    d.register_handler(dll, "MulDiv", mul_div);
+    d.register_handler(dll, "IsBadReadPtr", is_bad_read_ptr);
+    d.register_handler(dll, "IsBadWritePtr", is_bad_write_ptr);
     d.register_handler(dll, "GetCurrentProcess", get_current_process);
     d.register_handler(dll, "GetCurrentThread", get_current_thread);
     d.register_handler(dll, "CreateThread", create_thread);
@@ -2048,6 +2054,71 @@ fn ver_query_value_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 fn get_idle_time(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // CE returns MAXDWORD when the platform has no idle-time counter.
     Ok(DispatchOutcome::ReturnedR0(u32::MAX))
+}
+
+fn get_process_version(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let id = ctx.arg_u32(0)?;
+    // CE6 also accepts HMODULE (GetDllVersion in winbase.h). WordPad's
+    // ceshell runtime first queries its own process before selecting its ABI.
+    let version = if id == 0
+        || id == PROCESS_INSTANCE_HANDLE
+        || id == ctx.kernel.image_base
+        || id == ctx.kernel.object_handles.process_id()
+    {
+        Some(ctx.kernel.image_version)
+    } else {
+        ctx.kernel
+            .ce
+            .module_versions
+            .get(&id)
+            .copied()
+            .or_else(|| ctx.kernel.object_handles.process_version(id))
+    };
+    match version {
+        Some(version) => Ok(DispatchOutcome::ReturnedR0(version)),
+        None => {
+            set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+            Ok(DispatchOutcome::ReturnedR0(0))
+        }
+    }
+}
+
+fn is_bad_read_ptr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    is_bad_pointer(ctx, Prot::READ)
+}
+
+fn is_bad_write_ptr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    is_bad_pointer(ctx, Prot::WRITE)
+}
+
+fn is_bad_pointer(ctx: &mut CallCtx<'_>, access: Prot) -> Result<DispatchOutcome, KernelError> {
+    // The original CE imaging factory checks caller buffers before decoding
+    // Explorer's wallpaper. Probe permissions without reading or changing them.
+    let address = ctx.arg_u32(0)?;
+    let size = ctx.arg_u32(1)?;
+    Ok(DispatchOutcome::ReturnedR0(u32::from(
+        size != 0 && ctx.cpu.check_guest_access(address, size, access).is_err(),
+    )))
+}
+
+fn mul_div(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // The native CE WebBrowser sizes OLE rectangles in HIMETRIC units. Use
+    // a signed 64-bit product and round ties away from zero, as the SDK ABI
+    // requires; a zero divisor or an unrepresentable LONG returns -1.
+    let product = i64::from(ctx.arg_u32(0)? as i32) * i64::from(ctx.arg_u32(1)? as i32);
+    let divisor = i64::from(ctx.arg_u32(2)? as i32);
+    if divisor == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    let rounded = (product.abs() + divisor.abs() / 2) / divisor.abs();
+    let value = if (product < 0) != (divisor < 0) {
+        -rounded
+    } else {
+        rounded
+    };
+    Ok(DispatchOutcome::ReturnedR0(
+        i32::try_from(value).unwrap_or(-1) as u32,
+    ))
 }
 
 pub(crate) fn get_tick_count(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -4817,7 +4888,17 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
             return Ok(DispatchOutcome::ReturnedR0(0));
         }
     };
-    let name = String::from_utf16_lossy(&path).to_ascii_lowercase();
+    load_library_named(ctx, &String::from_utf16_lossy(&path))
+}
+
+pub(crate) fn load_library_named(
+    ctx: &mut CallCtx<'_>,
+    request: &str,
+) -> Result<DispatchOutcome, KernelError> {
+    if let Some(result) = finish_module_attach(ctx)? {
+        return Ok(result);
+    }
+    let name = request.to_ascii_lowercase();
     if module_file_name(&name) == "note_prj.dll" || name == "note_prj" {
         let handle = pocket_kernel::NOTE_PRJ_MODULE_HANDLE;
         if ctx.kernel.dynamic_exports.contains_key(&handle) {
@@ -6008,6 +6089,10 @@ fn map_resource_module_inner(
         host_path.display(),
         image.sections.len(),
         image.resources.len()
+    );
+    ctx.kernel.ce.module_versions.insert(
+        base,
+        (u32::from(image.subsystem_version.0) << 16) | u32::from(image.subsystem_version.1),
     );
     ctx.kernel.modules.push(LoadedModule {
         data_file,
@@ -12920,7 +13005,13 @@ fn list_view_message(
                 read_cstr_string(ctx, ptr, 1024)?
             };
             let c = ctx.kernel.controls.get_mut(hwnd).unwrap();
-            u32::from(c.set_list_text(index, subitem, text))
+            let changed = c.set_list_text(index, subitem, text);
+            if changed {
+                c.list_cached_text
+                    .resize_with(c.list_items.len(), Default::default);
+                c.list_cached_text[index].insert(subitem);
+            }
+            u32::from(changed)
         }
         0x1007 | 0x104d | 0x1006 | 0x104c => {
             // insert/set LVITEMA/W
@@ -12953,6 +13044,10 @@ fn list_view_message(
                     .resize_with(control.list_items.len(), Default::default);
                 control.list_subitems.insert(index, Default::default());
                 control
+                    .list_cached_text
+                    .resize_with(control.list_items.len(), Default::default);
+                control.list_cached_text.insert(index, Default::default());
+                control
                     .list_positions
                     .resize(control.list_items.len(), None);
                 control.list_positions.insert(index, None);
@@ -12976,12 +13071,27 @@ fn list_view_message(
                 }
                 index as u32
             } else if subitem != 0 {
-                u32::from(mask & 1 != 0 && control.set_list_text(index, subitem, text))
+                let changed = mask & 1 != 0 && control.set_list_text(index, subitem, text);
+                if changed {
+                    control
+                        .list_cached_text
+                        .resize_with(item_count, Default::default);
+                    if text_callback {
+                        control.list_cached_text[index].remove(&subitem);
+                    } else {
+                        control.list_cached_text[index].insert(subitem);
+                    }
+                }
+                u32::from(changed)
             } else if let Some(item) = control.list_items.get_mut(index) {
                 if mask & 1 != 0 {
                     item.0 = text;
                     control.list_text_callbacks.resize(item_count, false);
                     control.list_text_callbacks[index] = text_callback;
+                    control
+                        .list_cached_text
+                        .resize_with(item_count, Default::default);
+                    control.list_cached_text[index].remove(&0);
                 }
                 if mask & 4 != 0 {
                     item.1 = field(32);
@@ -13021,6 +13131,9 @@ fn list_view_message(
                 if (wp as usize) < c.list_text_callbacks.len() {
                     c.list_text_callbacks.remove(wp as usize);
                 }
+                if (wp as usize) < c.list_cached_text.len() {
+                    c.list_cached_text.remove(wp as usize);
+                }
                 if (wp as usize) < c.list_image_callbacks.len() {
                     c.list_image_callbacks.remove(wp as usize);
                 }
@@ -13037,6 +13150,7 @@ fn list_view_message(
             c.list_images.clear();
             c.list_states.clear();
             c.list_text_callbacks.clear();
+            c.list_cached_text.clear();
             c.list_image_callbacks.clear();
             c.list_positions.clear();
             c.list_scroll_y = 0;
@@ -33210,6 +33324,7 @@ mod tests {
             image_base: 0,
             image_size: 0,
             image_entry: 0,
+            image_version: 0x0004_0000,
             dynamic_exports: std::collections::HashMap::new(),
             image_imports: Vec::new(),
             gles_local_ordinals: std::collections::HashMap::new(),
@@ -42909,6 +43024,7 @@ mod pocket_menu_tests {
                 owner: 123,
                 menu: 12,
                 sip: true,
+                close_button: false,
                 background: 0,
             },
         );

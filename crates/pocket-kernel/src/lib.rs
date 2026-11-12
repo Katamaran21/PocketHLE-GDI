@@ -1235,6 +1235,7 @@ pub struct KernelState {
     /// Size and entry point copied from the loaded PE header for module introspection APIs.
     pub image_size: u32,
     pub image_entry: u32,
+    pub image_version: u32,
     pub dynamic_exports: HashMap<u32, HashMap<String, u32>>,
     /// Original executable IAT, retained for binding native DLL data and functions together.
     pub image_imports: Vec<pocket_pe::ImportSymbol>,
@@ -2068,6 +2069,7 @@ impl KernelState {
         // Registry values belong to the device; handles and overrides stay local.
         self.registry.store = context.registry_store;
         self.object_handles = context.table;
+        self.object_handles.set_process_version(self.image_version);
         self.events = context.events;
         self.semaphores = context.semaphores;
         self.mutexes = context.mutexes;
@@ -4599,6 +4601,10 @@ impl Process {
         let img_base = image.image_base;
         let img_size = image.size_of_image;
         let img_entry = image.entry_va();
+        let img_version =
+            (u32::from(image.subsystem_version.0) << 16) | u32::from(image.subsystem_version.1);
+        let object_handles = handles::HandleTable::default();
+        object_handles.set_process_version(img_version);
         let image_imports = image.imports.clone();
         // A game's satellite DLLs sit next to the EXE on a real device, so
         // the directory we loaded the EXE from is the natural search path
@@ -4637,7 +4643,7 @@ impl Process {
                     stack_region: Some((stack_base - 0x2000, stack_size + 0x2000)),
                     ..MainThreadState::default()
                 },
-                object_handles: handles::HandleTable::default(),
+                object_handles,
                 crypto: Default::default(),
                 cedb: Default::default(),
                 mapped_views: Default::default(),
@@ -4650,6 +4656,7 @@ impl Process {
                 image_base: img_base,
                 image_size: img_size,
                 image_entry: img_entry,
+                image_version: img_version,
                 dynamic_exports,
                 image_imports,
                 gles_local_ordinals: HashMap::new(),
@@ -5862,6 +5869,7 @@ mod tests {
                 owner,
                 menu: 0,
                 sip: true,
+                close_button: false,
                 background: 0xf800,
                 bounds: None,
             },
@@ -6617,6 +6625,7 @@ mod tests {
             source_path: "test".into(),
             machine: pocket_pe::machine::ARM,
             subsystem: pocket_pe::subsystem::WINDOWS_CE_GUI,
+            subsystem_version: (4, 0),
             image_base,
             stack_reserve: 0x10000,
             size_of_image: text_size + 0x1000,
@@ -6920,6 +6929,7 @@ mod tests {
             source_path: "test".into(),
             machine: pocket_pe::machine::ARM,
             subsystem: pocket_pe::subsystem::WINDOWS_CE_GUI,
+            subsystem_version: (4, 0),
             image_base: 0x10000,
             stack_reserve: 0x10000,
             size_of_image: 0x2000,

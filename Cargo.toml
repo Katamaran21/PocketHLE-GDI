@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.6-wince.1"
+version = "0.4.7-wince.1"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/Katamaran21/PocketHLE-GDI"

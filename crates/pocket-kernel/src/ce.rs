@@ -76,6 +76,59 @@ pub struct SipEnumeration {
     pub scratch: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ComStage {
+    Loading,
+    Factory,
+    Creating,
+    Releasing,
+}
+
+#[derive(Debug)]
+pub struct ComActivation {
+    pub thread: usize,
+    pub thunk: u32,
+    pub frame: crate::GuestCallFrame,
+    pub output: u32,
+    pub outer: u32,
+    pub scratch: u32,
+    pub server: String,
+    pub create: bool,
+    pub stage: ComStage,
+    pub factory: u32,
+    pub result: u32,
+    pub value: u32,
+}
+
+#[derive(Debug, Default)]
+pub struct ComState {
+    pub activations: Vec<ComActivation>,
+    pub callbacks: Vec<ComCallback>,
+    pub bind_contexts: HashMap<u32, BindContext>,
+    /// COM keeps loaded servers until process teardown, independently of an
+    /// individual factory's reference count.
+    pub servers: HashMap<String, u32>,
+}
+
+#[derive(Debug)]
+pub struct BindContext {
+    pub vtable: u32,
+    pub refs: u32,
+    pub options: [u32; 8],
+    pub bound: Vec<u32>,
+    pub params: HashMap<String, u32>,
+}
+
+#[derive(Debug)]
+pub struct ComCallback {
+    pub thread: usize,
+    pub thunk: u32,
+    pub frame: crate::GuestCallFrame,
+    pub calls: Vec<(u32, u32)>,
+    pub result: u32,
+    pub free: Vec<u32>,
+}
+
 #[derive(Debug, Default)]
 pub struct ShellWindows {
     pub desktop: Option<u32>,
@@ -86,6 +139,8 @@ pub struct ShellWindows {
 #[derive(Debug, Default)]
 pub struct State {
     pub version: Option<(u32, u32, u32)>,
+    pub module_versions: HashMap<u32, u32>,
+    pub com: ComState,
     pub ordinals: HashMap<String, HashMap<u16, String>>,
     pub system_modules: HashSet<String>,
     pub windows: crate::windowing::ClassicWindows,

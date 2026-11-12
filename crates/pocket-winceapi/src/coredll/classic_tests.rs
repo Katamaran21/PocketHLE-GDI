@@ -5,6 +5,38 @@ use pocket_kernel::{controls::ControlClass, framebuffer::Framebuffer, windowing}
 const HWND: u32 = 0xdead0080;
 
 #[test]
+fn ole_rectangle_scaling_rounds_signed_ties_and_rejects_long_overflow() {
+    let mut cpu = tests::scanf_cpu();
+    let mut kernel = tests::fresh_kernel();
+    kernel.thread_last_errors.insert(0, 123);
+    let thunk = tests::dummy_thunk();
+    let mut ctx = CallCtx {
+        cpu: &mut cpu,
+        kernel: &mut kernel,
+        thunk: &thunk,
+    };
+    for (a, b, divisor, expected) in [
+        (5, 1, 2, 3),
+        (-5, 1, 2, -3),
+        (5, 1, -2, -3),
+        (-5, -1, -2, -3),
+        (4, 1, 3, 1),
+        (i32::MIN, 1, 1, i32::MIN),
+        (i32::MIN, i32::MIN, i32::MIN, i32::MIN),
+        (i32::MAX, 2, 2, i32::MAX),
+        (i32::MAX, 2, 1, -1),
+        (1, 1, 0, -1),
+    ] {
+        message(&mut ctx, a as u32, b as u32, divisor as u32, 0);
+        assert_eq!(
+            mul_div(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(expected as u32)
+        );
+    }
+    assert_eq!(ctx.kernel.thread_last_errors.get(&0), Some(&123));
+}
+
+#[test]
 fn caption_uses_class_and_window_icons_with_transparency_and_repaints_on_change() {
     let mut state = framed_kernel();
     let mut icon = pocket_kernel::imaging::Image::new(2, 2).unwrap();
@@ -493,48 +525,121 @@ fn classic_client_dc_and_child_clipping_preserve_the_caption() {
 
 #[test]
 fn classic_close_delivers_system_command_and_wm_close_before_destruction() {
-    let mut cpu = StubCpu::new();
-    let mut state = framed_kernel();
+    for style in [0x10cf0000, windowing::classic_style(0x10400000)] {
+        let mut cpu = StubCpu::new();
+        let mut state = framed_kernel();
+        state.window_styles.insert(HWND, (style, 0));
+        let thunk = tests::dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut state,
+            thunk: &thunk,
+        };
+        let rect = ctx.kernel.window_rects[&HWND];
+        let close = windowing::caption_buttons(
+            rect,
+            ctx.kernel.window_styles[&HWND].0,
+            ctx.kernel.window_metrics(HWND),
+        )
+        .into_iter()
+        .find(|b| b.hit == 20)
+        .unwrap();
+        let (x, y) = (
+            (close.rect[0] + close.rect[2]) as u16 / 2,
+            (close.rect[1] + close.rect[3]) as u16 / 2,
+        );
+        let down = classic_window::take_input(&mut ctx, InputEvent::PointerDown { x, y })
+            .unwrap()
+            .unwrap();
+        assert_eq!(down.1, 0xa1);
+        message(&mut ctx, down.0, down.1, down.2, down.3);
+        classic_window::default_message(&mut ctx, HWND).unwrap();
+        let up = classic_window::take_input(&mut ctx, InputEvent::PointerUp { x, y })
+            .unwrap()
+            .unwrap();
+        message(&mut ctx, up.0, up.1, up.2, up.3);
+        classic_window::default_message(&mut ctx, HWND).unwrap();
+        assert!(ctx
+            .kernel
+            .posted_messages
+            .iter()
+            .any(|m| m.0 == HWND && m.1 == 0x112 && m.2 == 0xf060));
+        message(&mut ctx, HWND, 0x112, 0xf060, up.3);
+        classic_window::default_message(&mut ctx, HWND).unwrap();
+        assert!(ctx.kernel.posted_messages.contains(&(HWND, 0x10, 0, 0)));
+        assert!(!ctx.kernel.posted_messages.iter().any(|m| m.1 == 2));
+        assert!(ctx.kernel.window_rects.contains_key(&HWND));
+    }
+}
+
+#[test]
+fn pointer_probes_check_the_whole_range_and_permissions_without_changing_error_state() {
+    let mut cpu = tests::scanf_cpu();
+    cpu.map_region(0x700000, 0x1000, Prot::READ).unwrap();
+    let mut kernel = framed_kernel();
+    kernel.thread_last_errors.insert(0, 1234);
     let thunk = tests::dummy_thunk();
     let mut ctx = CallCtx {
         cpu: &mut cpu,
-        kernel: &mut state,
+        kernel: &mut kernel,
         thunk: &thunk,
     };
-    let rect = ctx.kernel.window_rects[&HWND];
-    let close = windowing::caption_buttons(
-        rect,
-        ctx.kernel.window_styles[&HWND].0,
-        ctx.kernel.window_metrics(HWND),
-    )
-    .into_iter()
-    .find(|b| b.hit == 20)
-    .unwrap();
-    let (x, y) = (
-        (close.rect[0] + close.rect[2]) as u16 / 2,
-        (close.rect[1] + close.rect[3]) as u16 / 2,
+    for (address, size, read_bad, write_bad) in [
+        (0, 0, 0, 0),
+        (0, 1, 1, 1),
+        (0x700000, 0x1000, 0, 1),
+        (0x700fff, 2, 1, 1),
+        (0xfffffff0, 32, 1, 1),
+        (0x1400, 4, 0, 0),
+    ] {
+        ctx.cpu.write_reg(ArmReg::R0, address).unwrap();
+        ctx.cpu.write_reg(ArmReg::R1, size).unwrap();
+        assert_eq!(
+            is_bad_read_ptr(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(read_bad)
+        );
+        assert_eq!(
+            is_bad_write_ptr(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(write_bad)
+        );
+    }
+    assert_eq!(ctx.kernel.thread_last_errors.get(&0), Some(&1234));
+}
+
+#[test]
+fn process_version_distinguishes_image_module_and_remote_process_and_rejects_stale_ids() {
+    let mut cpu = tests::scanf_cpu();
+    let mut kernel = framed_kernel();
+    kernel.image_version = 0x0006_0001;
+    kernel.ce.module_versions.insert(0x31000000, 0x0005_0002);
+    let (_, child) = kernel.object_handles.new_child().unwrap();
+    child.set_process_version(0x0004_0003);
+    let thunk = tests::dummy_thunk();
+    let mut ctx = CallCtx {
+        cpu: &mut cpu,
+        kernel: &mut kernel,
+        thunk: &thunk,
+    };
+    for (id, version) in [
+        (0, 0x0006_0001),
+        (1, 0x0006_0001),
+        (PROCESS_INSTANCE_HANDLE, 0x0006_0001),
+        (0x31000000, 0x0005_0002),
+        (child.process_id(), 0x0004_0003),
+    ] {
+        ctx.cpu.write_reg(ArmReg::R0, id).unwrap();
+        assert_eq!(
+            get_process_version(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(version)
+        );
+    }
+    child.mark_inactive();
+    ctx.cpu.write_reg(ArmReg::R0, child.process_id()).unwrap();
+    assert_eq!(
+        get_process_version(&mut ctx).unwrap(),
+        DispatchOutcome::ReturnedR0(0)
     );
-    let down = classic_window::take_input(&mut ctx, InputEvent::PointerDown { x, y })
-        .unwrap()
-        .unwrap();
-    assert_eq!(down.1, 0xa1);
-    message(&mut ctx, down.0, down.1, down.2, down.3);
-    classic_window::default_message(&mut ctx, HWND).unwrap();
-    let up = classic_window::take_input(&mut ctx, InputEvent::PointerUp { x, y })
-        .unwrap()
-        .unwrap();
-    message(&mut ctx, up.0, up.1, up.2, up.3);
-    classic_window::default_message(&mut ctx, HWND).unwrap();
-    assert!(ctx
-        .kernel
-        .posted_messages
-        .iter()
-        .any(|m| m.0 == HWND && m.1 == 0x112 && m.2 == 0xf060));
-    message(&mut ctx, HWND, 0x112, 0xf060, up.3);
-    classic_window::default_message(&mut ctx, HWND).unwrap();
-    assert!(ctx.kernel.posted_messages.contains(&(HWND, 0x10, 0, 0)));
-    assert!(!ctx.kernel.posted_messages.iter().any(|m| m.1 == 2));
-    assert!(ctx.kernel.window_rects.contains_key(&HWND));
+    assert_eq!(ctx.kernel.thread_last_errors.get(&0), Some(&87));
 }
 
 #[test]

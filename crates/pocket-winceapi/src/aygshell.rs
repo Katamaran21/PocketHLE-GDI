@@ -404,6 +404,7 @@ fn sh_create_menu_bar(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             owner: parent,
             menu,
             sip: flags & 8 == 0 && !ctx.kernel.gdi.shell_menus.sip_button_hidden,
+            close_button: false,
             background,
         },
     );
@@ -432,6 +433,7 @@ pub(crate) fn menu_input(
     ctx.kernel.framebuffer.mark_dirty();
     use pocket_kernel::shell_menu::Action;
     match action {
+        Action::Close(owner) => Some(Some((owner, 0x10, 0, 0))),
         Action::Command(owner, id) => Some(Some((owner, 0x111, id, 0))),
         Action::Open(owner, menu) => Some(Some((owner, 0x117, menu, 0))),
         Action::Sip => {

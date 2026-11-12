@@ -94,6 +94,39 @@ shared registry. The original ROM `cplmain.cpl` is used only for read-only
 resources; its instructions and `DllMain` are not executed. Other OEM CPLs and
 hardware settings remain outside this implementation.
 
+In classic profiles, border-only applications such as the original CE6 Control
+Panel receive a Close button at the right of their existing command bar. A
+release outside the button cancels the press; a completed click sends the normal
+`WM_CLOSE` to the guest, which retains responsibility for saving and shutdown.
+The command bar and list keep their original work-area geometry, preserving
+File/View and the first row of applet icons. Other windows that request caption
+buttons keep their classic title bars.
+
+Desktop shortcuts use their CE text commands, including quoted executable names
+and arguments. Document launches respect the registered default verb and expand
+association placeholders once, preserving literal percent sequences in paths.
+Shortcut reads are bounded by both the declared length and the actual VFS file;
+some extracted ROM links omit the two trailing bytes counted in their header.
+`LVIF_DI_SETITEM` retains only the display fields/subitems cached by the native
+shell, avoiding repeated icon metadata callbacks on selection repaints.
+
+Native in-process COM classes selected by the device registry can attach their
+application DLL, obtain `IClassFactory` and create the requested interface. ARM
+and Thumb callbacks preserve their thread, stack and continuation; the class
+factory is released before activation returns. The existing HLE XML, media and
+DirectShow providers retain their ownership rules. `CreateBindCtx` stores bind
+options and named/bound objects with real IUnknown reference ownership; running
+object-table and parameter enumeration are not implemented.
+
+The original PegHelp and IESample can create their native `shdocvw.dll` browser
+objects and application toolbars. WinINet option queries expose actual internet
+handle types/parents and the local transport access state. That state does not
+prove Internet reachability; complete HTML rendering and navigation remain
+unverified. Pocket Word's private defaults supply the image's `\Windows`
+template directory once, preserving existing registry values and subsequent
+user deletions. These are application compatibility additions, not complete
+Windows CE or browser conformance.
+
 Original CE6 application DLLs such as `ceshell.dll` may have no relocation
 table. The application loader reserves their preferred address and places import
 thunks in a separate module slot. Existing mappings, including cold and

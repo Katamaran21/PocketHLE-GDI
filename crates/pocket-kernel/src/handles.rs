@@ -50,6 +50,7 @@ struct Domain {
     next: u32,
     next_pid: u32,
     active: HashSet<u32>,
+    process_versions: HashMap<u32, u32>,
     exits: HashMap<(u32, Option<usize>), u32>,
     deferred_process_exits: HashSet<u32>,
     child_ids: HashMap<u32, u32>,
@@ -154,6 +155,21 @@ impl HandleTable {
     }
     pub fn process_id(&self) -> u32 {
         self.pid
+    }
+    pub fn set_process_version(&self, version: u32) {
+        self.domain
+            .lock()
+            .unwrap()
+            .process_versions
+            .insert(self.pid, version);
+    }
+    pub fn process_version(&self, pid: u32) -> Option<u32> {
+        let domain = self.domain.lock().unwrap();
+        domain
+            .active
+            .contains(&pid)
+            .then(|| domain.process_versions.get(&pid).copied())
+            .flatten()
     }
     /// The closure must not access guest memory or reenter the handle domain.
     pub fn with_clipboard<T>(
@@ -541,6 +557,7 @@ impl HandleTable {
         d.clipboard.release(self.pid, None);
         d.api_sets.release(self.pid);
         d.active.remove(&self.pid);
+        d.process_versions.remove(&self.pid);
         d.held_start.remove(&self.pid);
         d.process_kills.remove(&self.pid);
         d.updates.retain(|(pid, _), _| *pid != self.pid);
