@@ -105,6 +105,12 @@ impl KernelState {
     }
 
     fn discard_one_window_metadata(&mut self, hwnd: &u32) {
+        if self.ce.shell.desktop == Some(*hwnd) {
+            self.ce.shell.desktop = None;
+        }
+        if self.ce.shell.taskbar.is_some_and(|(h, _)| h == *hwnd) {
+            self.ce.shell.taskbar = None;
+        }
         if self
             .controls
             .file_dialog

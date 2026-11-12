@@ -352,6 +352,20 @@ pub fn prepare_runtime_module(
     Ok(())
 }
 
+/// ROM application DLLs have no relocation table. Their instructions may only
+/// run at the preferred address; the runtime loader must reserve it first.
+pub fn runtime_module_has_relocations(bytes: &[u8]) -> Result<bool, LoadError> {
+    let pe = parse_wince_pe(bytes)?;
+    let oh = pe
+        .header
+        .optional_header
+        .ok_or_else(|| LoadError::NotPe("missing optional header".into()))?;
+    Ok(oh
+        .data_directories
+        .get_base_relocation_table()
+        .is_some_and(|directory| directory.virtual_address != 0 && directory.size != 0))
+}
+
 /// Read forwarder metadata without mapping or executing the supplied DLL.
 pub fn export_forwarders(bytes: &[u8]) -> Result<BTreeMap<String, ExportForwarder>, LoadError> {
     let pe = parse_wince_pe(bytes)?;

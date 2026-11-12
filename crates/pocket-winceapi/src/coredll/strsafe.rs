@@ -13,7 +13,9 @@ pub(super) fn register(dispatcher: &mut WinCeDispatcher, dll: &str) {
     dispatcher.register_handler(dll, "StringCchCatNW", cat_n);
     dispatcher.register_handler(dll, "StringCchLengthW", length);
     dispatcher.register_handler(dll, "StringCchCopyExW", copy_ex);
+    dispatcher.register_handler(dll, "StringCchCopyNExW", copy_n_ex);
     dispatcher.register_handler(dll, "StringCchCatExW", cat_ex);
+    dispatcher.register_handler(dll, "StringCchCatNExW", cat_n_ex);
     dispatcher.register_handler(dll, "StringCchPrintfExW", printf_ex);
     dispatcher.register_handler(dll, "StringCchVPrintfExW", vprintf_ex);
     dispatcher.register_handler(dll, "StringCchPrintfW", printf);
@@ -25,7 +27,9 @@ pub(super) fn register(dispatcher: &mut WinCeDispatcher, dll: &str) {
         ("StringCbCatNW", cb_cat_n),
         ("StringCbLengthW", cb_length),
         ("StringCbCopyExW", cb_copy_ex),
+        ("StringCbCopyNExW", cb_copy_n_ex),
         ("StringCbCatExW", cb_cat_ex),
+        ("StringCbCatNExW", cb_cat_n_ex),
         ("StringCbPrintfW", cb_printf),
         ("StringCbVPrintfW", cb_vprintf),
         ("StringCbPrintfExW", cb_printf_ex),
@@ -357,28 +361,49 @@ fn length_impl(ctx: &mut CallCtx<'_>, bytes: bool) -> Result<DispatchOutcome, Ke
 }
 
 fn copy_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    ex_impl(ctx, false, false)
+    ex_impl(ctx, false, false, false)
 }
 fn cat_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    ex_impl(ctx, true, false)
+    ex_impl(ctx, true, false, false)
 }
 fn cb_copy_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    ex_impl(ctx, false, true)
+    ex_impl(ctx, false, true, false)
 }
 fn cb_cat_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    ex_impl(ctx, true, true)
+    ex_impl(ctx, true, true, false)
+}
+fn copy_n_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ex_impl(ctx, false, false, true)
+}
+fn cat_n_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ex_impl(ctx, true, false, true)
+}
+fn cb_copy_n_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ex_impl(ctx, false, true, true)
+}
+fn cb_cat_n_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ex_impl(ctx, true, true, true)
 }
 fn ex_impl(
     ctx: &mut CallCtx<'_>,
     append: bool,
     byte_counted: bool,
+    limited: bool,
 ) -> Result<DispatchOutcome, KernelError> {
     let dst = ctx.arg_u32(0)?;
     let (capacity, tail) = count(ctx.arg_u32(1)?, byte_counted);
     let src = ctx.arg_u32(2)?;
-    let end = ctx.arg_u32(3)?;
-    let remaining = ctx.arg_u32(4)?;
-    let flags = ctx.arg_u32(5)?;
+    // Original CE6 ceshell.dll imports CopyNEx for bounded path components.
+    // Its extra source count shifts all three output/flags arguments.
+    let maximum = if limited {
+        Some(count(ctx.arg_u32(3)?, byte_counted).0)
+    } else {
+        None
+    };
+    let first_output = if limited { 4 } else { 3 };
+    let end = ctx.arg_u32(first_output)?;
+    let remaining = ctx.arg_u32(first_output + 1)?;
+    let flags = ctx.arg_u32(first_output + 2)?;
     if [end, remaining]
         .iter()
         .any(|&p| p != 0 && ctx.cpu.check_guest_access(p, 4, Prot::WRITE).is_err())
@@ -387,6 +412,7 @@ fn ex_impl(
     }
     let ignore_nulls = flags & 0x100 != 0;
     if capacity > MAX_CCH
+        || maximum.is_some_and(|n| n > MAX_CCH)
         || (dst == 0 && (capacity != 0 || !ignore_nulls))
         || (capacity == 0 && !ignore_nulls)
     {
@@ -416,7 +442,8 @@ fn ex_impl(
         let source = if src == 0 {
             Vec::new()
         } else {
-            read_wstr(ctx, src, (capacity - original).max(1))?
+            let available = (capacity - original).max(1);
+            read_wstr(ctx, src, maximum.unwrap_or(available).min(available))?
         };
         if capacity == 0 {
             status = if source.is_empty() {
@@ -491,6 +518,67 @@ fn ex_impl(
 mod tests {
     use super::*;
     use pocket_cpu::{stub::StubCpu, Cpu};
+
+    #[test]
+    fn bounded_ex_reads_only_the_requested_source_and_uses_seven_argument_abi() {
+        let mut cpu = super::super::tests::scanf_cpu();
+        let mut state = super::super::tests::fresh_kernel();
+        let thunk = super::super::tests::dummy_thunk();
+        cpu.map_region(0x6000, 0x1000, Prot::READ).unwrap();
+        // One character at the last readable address, deliberately no NUL.
+        cpu.write_mem(0x6ffe, &u16::from(b'Q').to_le_bytes())
+            .unwrap();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut state,
+            thunk: &thunk,
+        };
+        for (handler, append, bytes) in [
+            (copy_n_ex as crate::Handler, false, false),
+            (cat_n_ex, true, false),
+            (cb_copy_n_ex, false, true),
+            (cb_cat_n_ex, true, true),
+        ] {
+            ctx.cpu.write_mem(0x1200, &[0xcc; 12]).unwrap();
+            ctx.cpu.write_mem(0x1200, &[b'A', 0, 0, 0]).unwrap();
+            let capacity = if bytes { 9 } else { 4 };
+            let limit = if bytes { 3 } else { 1 };
+            arguments(
+                &mut ctx,
+                &[0x1200, capacity, 0x6ffe, limit, 0x1800, 0x1804, 0x2a5],
+            );
+            assert_eq!(handler(&mut ctx).unwrap(), DispatchOutcome::ReturnedR0(0));
+            let expected = if append { "AQ\0" } else { "Q\0" };
+            let expected: Vec<_> = expected.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            assert_eq!(
+                ctx.cpu.read_mem(0x1200, expected.len() as u32).unwrap(),
+                expected
+            );
+            let used = if append { 2 } else { 1 };
+            assert_eq!(ctx.cpu.read_u32_le(0x1800).unwrap(), 0x1200 + used * 2);
+            assert_eq!(
+                ctx.cpu.read_u32_le(0x1804).unwrap(),
+                if bytes { 9 - used * 2 } else { 4 - used }
+            );
+            let end = if bytes { 9 } else { 8 };
+            assert_eq!(
+                ctx.cpu.read_mem(0x1200 + end, 12 - end).unwrap(),
+                vec![0xcc; (12 - end) as usize]
+            );
+            assert_eq!(
+                ctx.cpu
+                    .read_mem(0x1200 + (used + 1) * 2, end - (used + 1) * 2)
+                    .unwrap(),
+                vec![0xa5; (end - (used + 1) * 2) as usize]
+            );
+        }
+        // A zero source count does not require any source bytes.
+        arguments(&mut ctx, &[0x1200, 4, 0xffff0000, 0, 0x1800, 0x1804, 0]);
+        assert_eq!(copy_n_ex(&mut ctx).unwrap(), DispatchOutcome::ReturnedR0(0));
+        assert_eq!(ctx.cpu.read_mem(0x1200, 2).unwrap(), vec![0, 0]);
+        assert_eq!(ctx.cpu.read_u32_le(0x1800).unwrap(), 0x1200);
+        assert_eq!(ctx.cpu.read_u32_le(0x1804).unwrap(), 4);
+    }
 
     #[test]
     fn byte_counted_formatting_preserves_odd_byte_bounds_and_reports_byte_lengths() {

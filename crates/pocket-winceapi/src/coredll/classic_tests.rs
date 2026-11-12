@@ -146,6 +146,7 @@ fn ce_resource_pointers_terminate_standard_strings_and_expire_with_their_module(
         attached: false,
         satellites: Vec::new(),
         resident_regions: vec![(base, 0x1000)],
+        module_slot: Some(base),
         handle: base,
         name: "strings.dll".into(),
         base,

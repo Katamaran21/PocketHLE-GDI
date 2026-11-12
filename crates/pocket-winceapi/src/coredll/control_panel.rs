@@ -479,6 +479,7 @@ fn begin(ctx: &mut CallCtx<'_>, index: usize, info: Applet) -> Result<ControlPan
     })
 }
 fn apply(k: &mut KernelState, state: &ControlPanel) -> Result<(), String> {
+    let old_device_name = text(k, r"HKLM\Ident", "Name", "");
     let values: Vec<_> = state
         .fields
         .iter()
@@ -591,6 +592,9 @@ fn apply(k: &mut KernelState, state: &ControlPanel) -> Result<(), String> {
         .map_err(|error| format!("Cannot save settings: {error}"))?;
     k.sync_backlight();
     k.sync_ce_settings();
+    if state.applet == 4 && text(k, r"HKLM\Ident", "Name", "") != old_device_name {
+        k.object_handles.emit_app_event(13);
+    }
     Ok(())
 }
 fn finish(ctx: &mut CallCtx<'_>, state: ControlPanel) -> Result<DispatchOutcome, KernelError> {

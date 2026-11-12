@@ -10,6 +10,12 @@ contract; changing an Android setting must not discard unrelated or unknown
 fields. Device/platform settings, renderer choice and frame limits apply at the
 next launch unless an individual live control explicitly says otherwise.
 
+Windows CE profiles can retain additional application folders in their `mounts`
+list. Each `guest_prefix` maps to a `host_dir`, resolved relative to the profile
+file or library root. Desktop and Android native runners use the same validation
+and private writable overlays; child sessions inherit the complete namespace.
+See [Windows CE profiles](WINDOWS-CE.md) for original/Portable Explorer layouts.
+
 Host optimizations are permanently active; no user optimization switches remain.
 See [OPTIMIZATIONS.md](OPTIMIZATIONS.md). GPU/software renderer selection is a
 separate supported choice. Frame-limit inheritance and filters are defined in

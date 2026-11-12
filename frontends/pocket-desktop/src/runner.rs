@@ -740,6 +740,17 @@ impl Runner {
                 }
             }
             let module = guest_path.map(str::to_owned).unwrap_or_else(||format!("{prefix}{}",exe.file_name().unwrap_or_default().to_string_lossy()));
+            let mounts = match ce.resolved_mounts(library_root) {
+                Ok(mounts) => mounts,
+                Err(error) => return (RunOutcome { summary: format!("Invalid CE folders: {error:#}"), framebuffer: None },87),
+            };
+            if let Some(data) = &device_data {
+                for (prefix, host) in mounts {
+                    if let Err(error) = pocket_core::ce_image::mount_application(&mut emu.process_mut().unwrap().state.vfs, data, &prefix, &host) {
+                        return (RunOutcome { summary: format!("Cannot mount CE folder {prefix}: {error:#}"), framebuffer: None },29);
+                    }
+                }
+            }
             emu.set_module_path(&module);
             if let Some((directory,_)) = module.rsplit_once('\\') { emu.set_default_dir(&format!("{directory}\\")); }
             if let Some(namespace) = &hook.inherited_namespace {

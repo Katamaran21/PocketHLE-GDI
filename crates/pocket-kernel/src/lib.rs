@@ -33,6 +33,8 @@ use pocket_cpu::{
 };
 use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
+pub mod api_sets;
+mod app_events;
 pub mod async_keys;
 pub mod audio;
 pub mod bluetooth;
@@ -41,6 +43,7 @@ pub mod ce;
 pub mod ce_hive;
 pub mod cedb;
 pub mod classic_sip;
+pub mod clipboard;
 pub mod colors;
 pub mod controls;
 pub mod crypto;
@@ -1108,6 +1111,9 @@ pub struct LoadedModule {
     pub satellites: Vec<u32>,
     /// Exact mapped ranges, including import thunks, for teardown and RAM accounting.
     pub resident_regions: Vec<(u32, u32)>,
+    /// Allocator slot for the image or its separate import-thunk pool. ROM
+    /// images keep their preferred address and must not enter the free list.
+    pub module_slot: Option<u32>,
     /// `HMODULE` handed back to the guest. Equal to [`Self::base`],
     /// which is what the real CE loader returns.
     pub handle: u32,
@@ -1854,10 +1860,37 @@ impl KernelState {
         if self.pending_process_launch.is_some() {
             return self.pending_process_launch.take();
         }
+        while self.process_launch_enabled {
+            let Some((guest_path, command_line)) = self.object_handles.take_app_event() else {
+                break;
+            };
+            let Some(executable) = self.vfs.resolve(&guest_path).filter(|path| path.is_file())
+            else {
+                log::debug!("CeRunAppAtEvent: registered executable unavailable: {guest_path:?}");
+                continue;
+            };
+            let Some((process_handle, table)) = self.object_handles.new_child() else {
+                log::warn!(
+                    "CeRunAppAtEvent: could not allocate a guest process for {guest_path:?}"
+                );
+                break;
+            };
+            table.hold_start();
+            return Some(ProcessLaunch {
+                concurrent: true,
+                command_line,
+                creation_flags: 0,
+                call_key: None,
+                executable,
+                guest_path,
+                process_handle,
+                thread_handle: process_handle + 1,
+            });
+        }
         if self.scheduled_process_launches.is_empty() {
             return None;
         }
-        self.take_scheduled_process_launch(std::time::SystemTime::now())
+        self.take_scheduled_process_launch(self.object_handles.utc_now())
     }
 
     /// Drain one expired notification through the same guest process runner.
@@ -1922,6 +1955,23 @@ impl KernelState {
             .retain(|frame| !finished(frame.thread));
         let heap = &mut self.heap;
         self.gdi.font_enum_frames.retain(|frame| {
+            if finished(frame.thread) {
+                heap.free(frame.scratch);
+                false
+            } else {
+                true
+            }
+        });
+        self.ce.sip_enumerations.retain(|frame| {
+            if finished(frame.thread) {
+                heap.free(frame.scratch);
+                false
+            } else {
+                true
+            }
+        });
+        self.ce.api_waits.retain(|key, _| !finished(key.0));
+        self.controls.common_control_frames.retain(|frame| {
             if finished(frame.thread) {
                 heap.free(frame.scratch);
                 false
@@ -2164,6 +2214,13 @@ impl KernelState {
         for frame in self.gdi.font_enum_frames.drain(..) {
             self.heap.free(frame.scratch);
         }
+        for frame in self.ce.sip_enumerations.drain(..) {
+            self.heap.free(frame.scratch);
+        }
+        self.ce.api_waits.clear();
+        for frame in self.controls.common_control_frames.drain(..) {
+            self.heap.free(frame.scratch);
+        }
         self.gdi.clear_guest_fonts();
         self.gdi.owner_draw_frames.clear();
         self.gdi.list_paint_frames.clear();
@@ -2335,6 +2392,18 @@ impl KernelState {
         self.gapi_action_key == gapi::VK_RETURN
             && !self.gdi.shell_menus.taskbar_hidden
             && !self.gdi.shell_menus.gx_fullscreen
+            && self.ce.shell.taskbar.is_none()
+    }
+
+    pub fn is_desktop_window(&self, hwnd: u32) -> bool {
+        self.ce.shell.desktop == Some(hwnd)
+            || self.native_window_screen_rect(hwnd).is_some_and(|bounds| {
+                windowing::is_desktop_layer(
+                    self.window_styles.get(&hwnd).map_or(0, |s| s.0),
+                    bounds,
+                    (self.framebuffer.width, self.framebuffer.height),
+                )
+            })
     }
 
     pub fn window_client_origin(&self, mut hwnd: u32) -> Option<(i32, i32)> {
@@ -6261,6 +6330,99 @@ mod tests {
         bar.set_parts(vec![70, -1]);
         assert_eq!(bar.part_span(0, 240), (0, 70));
         assert_eq!(bar.part_span(1, 240), (70, 240));
+    }
+
+    #[test]
+    fn native_tab_pages_compose_controls_clip_and_follow_parent_visibility() {
+        use controls::ControlClass;
+        use gdi::Surface;
+        const WS_VISIBLE: u32 = 0x1000_0000;
+        let mut cpu = StubCpu::new();
+        let mut process = Process::map_into(
+            image_based_at(0x10000, 0x1000),
+            &mut cpu,
+            &|_, _| None,
+            &NullDispatcher,
+        )
+        .unwrap();
+        let k = &mut process.state;
+        k.ce.windows.enabled = true;
+        k.framebuffer.resize(320, 240);
+        let main = 0xdead0001;
+        let page = 0xdead0002;
+        k.window_rects.insert(main, (10, 10, 260, 190));
+        k.window_styles.insert(
+            main,
+            (
+                WS_VISIBLE | windowing::WS_CAPTION | windowing::WS_SYSMENU,
+                0,
+            ),
+        );
+        k.active_window = main;
+        let tab = k.controls.create(
+            main,
+            ControlClass::Tab,
+            1,
+            String::new(),
+            WS_VISIBLE | 0x40000000,
+            6,
+            6,
+            220,
+            120,
+        );
+        // SampleApp's native page has a built-in control as its parent.
+        // An oversized page also verifies clipping at that mixed boundary.
+        k.window_rects.insert(page, (2, 22, 250, 140));
+        k.window_styles.insert(page, (WS_VISIBLE | 0x40000000, 0));
+        k.window_parents.insert(page, tab);
+        let dc = k.gdi.create_memory_dc();
+        let bitmap = k.gdi.create_compatible_bitmap(250, 140);
+        k.gdi.dc_mut(dc).unwrap().selected_bitmap = Some(bitmap);
+        Surface::Bitmap(k.gdi.bitmap_mut(bitmap).unwrap()).fill_rect(0, 0, 250, 140, 0x07e0);
+        k.window_dcs.insert(page, dc);
+        let button = k.controls.create(
+            page,
+            ControlClass::Button,
+            2,
+            "Page button".into(),
+            WS_VISIBLE | 0x40000000,
+            10,
+            10,
+            100,
+            24,
+        );
+        k.composite_controls();
+        let (px, py) = k.window_client_origin(page).unwrap();
+        let (tx, ty) = k.window_client_origin(tab).unwrap();
+        let pixel = |k: &KernelState, x: i32, y: i32| {
+            let offset = (y as usize * 320 + x as usize) * 2;
+            u16::from_le_bytes(
+                k.framebuffer.resident_cpu().unwrap().pixels[offset..offset + 2]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(pixel(k, px + 4, py + 4), 0x07e0);
+        let button_origin = k.window_client_origin(button).unwrap();
+        assert_ne!(pixel(k, button_origin.0 + 4, button_origin.1 + 4), 0x07e0);
+        assert_ne!(pixel(k, tx + 224, py + 4), 0x07e0);
+        assert_ne!(pixel(k, px + 4, ty + 124), 0x07e0);
+        let revision = k.framebuffer.frame_counter;
+        k.composite_controls();
+        assert_eq!(k.framebuffer.frame_counter, revision);
+        k.window_visibility.insert(page, false);
+        k.composite_controls();
+        assert_ne!(pixel(k, px + 4, py + 4), 0x07e0);
+        assert_eq!(k.controls.is_visible(button), Some(false));
+        k.window_visibility.insert(page, true);
+        k.window_visibility.insert(main, false);
+        k.composite_controls();
+        assert_eq!(k.controls.is_visible(tab), Some(false));
+        assert_eq!(k.controls.is_visible(button), Some(false));
+        assert_eq!(
+            pixel(k, px + 4, py + 4),
+            framebuffer::colorref_to_rgb565(windowing::system_color(1)),
+        );
     }
 
     /// An unset trailing edge behaves like -1 rather than collapsing

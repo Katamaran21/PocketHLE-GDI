@@ -20,13 +20,7 @@ pub(super) fn window_at(kernel: &KernelState, x: i32, y: i32) -> Option<u32> {
         .collect();
     missing.sort_unstable();
     order.extend(missing);
-    order.sort_by_key(|hwnd| {
-        !windowing::is_desktop_layer(
-            kernel.window_styles.get(hwnd).map_or(0, |s| s.0),
-            kernel.window_rects.get(hwnd).copied().unwrap_or_default(),
-            (kernel.framebuffer.width, kernel.framebuffer.height),
-        )
-    });
+    order.sort_by_key(|hwnd| !kernel.is_desktop_window(*hwnd));
     order.into_iter().rev().find(|&hwnd| {
         // Explorer's taskbar still receives input when classic frames are
         // disabled; decoration policy must not select the mouse recipient.

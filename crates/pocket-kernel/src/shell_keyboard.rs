@@ -8,6 +8,8 @@ pub struct ShellKeyboard {
     pub visible: bool,
     /// WinCE SIP request, independent of the Gizmondo shell protocol.
     pub sip: bool,
+    /// Original CE6 Explorer reserves a panel rectangle above its taskbar.
+    pub default_sip_rect: Option<[i32; 4]>,
     pub pointer_captured: bool,
     /// Touch highlight, independent of the controller selection.
     pub pressed_key: Option<usize>,
@@ -27,6 +29,7 @@ impl Default for ShellKeyboard {
         Self {
             visible: false,
             sip: false,
+            default_sip_rect: None,
             pointer_captured: false,
             pressed_key: None,
             rotation: 0,
@@ -117,8 +120,12 @@ impl ShellKeyboard {
         let (_, _, dw, dh) = self.display_point(0, 0, w as i32, h as i32);
         let mut bitmap = crate::gdi::Bitmap::new(dw as u32, dh as u32);
         self.render_panel(&mut Surface::Bitmap(&mut bitmap));
-        for y in crate::classic_sip::top(dw, dh)..dh {
-            for x in 0..dw {
+        let [left, top, right, mut bottom] = crate::classic_sip::rect(self, dw, dh);
+        if self.default_sip_rect.is_none() {
+            bottom = dh;
+        }
+        for y in top..bottom {
+            for x in left..right {
                 let (gx, gy) = match self.rotation % 4 {
                     1 => (y, h as i32 - 1 - x),
                     2 => (w as i32 - 1 - x, h as i32 - 1 - y),

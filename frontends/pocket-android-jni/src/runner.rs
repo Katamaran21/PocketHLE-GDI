@@ -945,6 +945,22 @@ fn run_process_inner(
                 exe.file_name().unwrap_or_default().to_string_lossy()
             )
         });
+        let mounts = match ce.resolved_mounts(library_root) {
+            Ok(mounts) => mounts,
+            Err(error) => return (format!("Invalid CE folders: {error:#}"), 87),
+        };
+        if let Some(data) = &device_data {
+            for (prefix, host) in mounts {
+                if let Err(error) = pocket_core::ce_image::mount_application(
+                    &mut emu.process_mut().unwrap().state.vfs,
+                    data,
+                    &prefix,
+                    &host,
+                ) {
+                    return (format!("Cannot mount CE folder {prefix}: {error:#}"), 29);
+                }
+            }
+        }
         emu.set_module_path(&module);
         if let Some((directory, _)) = module.rsplit_once('\\') {
             emu.set_default_dir(&format!("{directory}\\"));

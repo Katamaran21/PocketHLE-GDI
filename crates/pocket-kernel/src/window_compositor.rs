@@ -14,6 +14,7 @@ use std::{
 #[derive(Clone)]
 struct Window {
     hwnd: u32,
+    parent: Option<u32>,
     rect: (i32, i32, i32, i32),
     origin: (i32, i32),
     size: (i32, i32),
@@ -169,6 +170,9 @@ impl KernelState {
                 hwnd,
                 Window {
                     hwnd,
+                    parent: (style & 0x4000_0000 != 0)
+                        .then(|| self.window_parents.get(&hwnd).copied())
+                        .flatten(),
                     rect,
                     origin,
                     size: metrics.client_size(rect.2, rect.3),
@@ -198,13 +202,7 @@ impl KernelState {
             .collect();
         extra.sort_unstable();
         order.extend(extra);
-        order.sort_by_key(|hwnd| {
-            !windowing::is_desktop_layer(
-                windows[hwnd].style,
-                windows[hwnd].rect,
-                (self.framebuffer.width, self.framebuffer.height),
-            )
-        });
+        order.sort_by_key(|hwnd| !self.is_desktop_window(*hwnd));
         let controls = self.controls.clone();
         let control_layers: HashMap<u32, Bitmap> = self
             .window_dcs
@@ -236,7 +234,7 @@ impl KernelState {
         ids.sort_unstable();
         for id in ids {
             let w = &windows[&id];
-            (w.rect, w.origin, w.style, &w.title, &w.menu).hash(&mut hash);
+            (w.parent, w.rect, w.origin, w.style, &w.title, &w.menu).hash(&mut hash);
             if let Some(icon) = &w.icon {
                 (
                     icon.width,
@@ -487,15 +485,59 @@ fn render_window(
         {
             gdi.shell_menus.render(child, s, gdi, menus, states);
         }
+        // CERF SampleApp hosts its native page windows inside a built-in tab.
+        // Neither the native-only traversal nor the control-only traversal can
+        // cross that boundary without visiting the page at its parent's layer.
+        let mut hosted: Vec<_> = windows
+            .values()
+            .filter(|window| window.parent == Some(child))
+            .map(|window| window.hwnd)
+            .collect();
+        hosted.sort_unstable();
+        if !hosted.is_empty() {
+            if let Some((x, y, cw, ch)) = controls.screen_rect(child) {
+                let before = s.pixels().to_vec();
+                for hwnd in hosted {
+                    render_window(
+                        hwnd,
+                        windows,
+                        control_layers,
+                        controls,
+                        gdi,
+                        menus,
+                        states,
+                        font,
+                        active,
+                        pressed,
+                        s,
+                        depth + 1,
+                    );
+                }
+                restore_outside_clip(
+                    s,
+                    &before,
+                    [
+                        x,
+                        y,
+                        x.saturating_add(cw.max(0)),
+                        y.saturating_add(ch.max(0)),
+                    ],
+                );
+            }
+        }
     });
     // Children cannot paint over their parent's caption or outside its client.
-    let (sw, sh) = s.dimensions();
     let clip = [
         w.origin.0,
         w.origin.1,
         w.origin.0.saturating_add(w.size.0),
         w.origin.1.saturating_add(w.size.1),
     ];
+    restore_outside_clip(s, &before, clip);
+}
+
+fn restore_outside_clip(s: &mut Surface<'_>, before: &[u8], clip: [i32; 4]) {
+    let (sw, sh) = s.dimensions();
     for y in 0..sh as i32 {
         let row = y as usize * sw as usize * 2;
         if y < clip[1] || y >= clip[3] {

@@ -71,12 +71,14 @@ impl ProcessFrame {
                 .get(&hwnd)
                 .map(String::as_str)
                 .unwrap_or("");
-            let kind = if class.eq_ignore_ascii_case("PortableCEExplorerDesktop")
+            let kind = if state.ce.shell.desktop == Some(hwnd)
+                || class.eq_ignore_ascii_case("PortableCEExplorerDesktop")
                 || class.eq_ignore_ascii_case("DesktopExplorerWindow")
                 || windowing::is_desktop_layer(style, bounds, (logical[0], logical[1]))
             {
                 LayerKind::Desktop
-            } else if extended & 8 != 0
+            } else if state.ce.shell.taskbar.is_some_and(|(h, _)| h == hwnd)
+                || extended & 8 != 0
                 || style & 0x8000_0000 != 0
                     && style & windowing::WS_CAPTION == 0
                     && bounds.0 <= 0

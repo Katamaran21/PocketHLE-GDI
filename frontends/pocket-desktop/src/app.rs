@@ -5586,6 +5586,7 @@ impl PocketLauncher {
                 command_line: ce.command_line.clone(),
                 screen: game.settings.screen,
                 classic_windows: ce.classic_windows,
+                mounts: ce.mounts.clone(),
             };
             if !self.ce_launch.profile_name.is_empty() {
                 if let Err(error) = self.ce_profiles.remember(self.library.root(), &mut self.ce_launch)

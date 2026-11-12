@@ -324,6 +324,11 @@ impl WindowsCeImage {
             .into_iter()
             .map(str::to_owned),
         );
+        state.ce.system_modules.extend(
+            pocket_kernel::ce::CPL_MODULES
+                .iter()
+                .map(|(name, _)| (*name).to_owned()),
+        );
         for (path, bytes) in &self.fonts {
             if let Some(fonts) = pocket_kernel::text::parse_resources((**bytes).clone()) {
                 state.gdi.install_fonts(path.clone(), fonts, bytes.len());
@@ -338,6 +343,52 @@ impl WindowsCeImage {
 mod tests {
     use super::*;
     use pocket_kernel::vfs::Vfs;
+
+    #[test]
+    fn image_control_panel_modules_use_the_registered_hle_provider() {
+        let image = WindowsCeImage {
+            filesystem: PathBuf::from("image/fs"),
+            windows: PathBuf::from("image/fs/Windows"),
+            version: (6, 0, 0),
+            ordinals: HashMap::new(),
+            hives: Vec::new(),
+            fonts: Vec::new(),
+        };
+        let mut cpu = pocket_cpu::stub::StubCpu::new();
+        let loaded = pocket_pe::LoadedImage {
+            source_path: "control-fixture.exe".into(),
+            machine: pocket_pe::machine::ARM,
+            subsystem: pocket_pe::subsystem::WINDOWS_CE_GUI,
+            image_base: 0x10000,
+            size_of_image: 0x2000,
+            stack_reserve: 0x4000,
+            entry_point: 0x1000,
+            sections: vec![pocket_pe::LoadedSection {
+                name: ".text".into(),
+                virtual_address: 0x1000,
+                virtual_size: 0x1000,
+                characteristics: 0x60000020,
+                data: 0xe12fff1eu32.to_le_bytes().to_vec(),
+            }],
+            imports: Vec::new(),
+            exports: Default::default(),
+            resources: Vec::new(),
+            managed_runtime: None,
+        };
+        let dispatcher = pocket_winceapi::WinCeDispatcher::new();
+        let mut process = pocket_kernel::Process::map_into(
+            loaded,
+            &mut cpu,
+            &pocket_winceapi::resolve_ordinal,
+            &dispatcher,
+        )
+        .unwrap();
+        image.configure_process(&mut process.state);
+        for &(name, handle) in pocket_kernel::ce::CPL_MODULES {
+            assert!(process.state.ce.system_modules.contains(name));
+            assert!(process.state.dynamic_exports[&handle].contains_key("CPlApplet"));
+        }
+    }
 
     #[test]
     fn portable_application_writes_are_private_and_inherited_by_children() {

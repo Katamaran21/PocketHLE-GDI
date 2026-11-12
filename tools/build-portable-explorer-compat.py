@@ -23,7 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=DEFAULT_SOURCE)
     parser.add_argument('--output', type=Path, default=REPO / 'ce-data/portable-explorer')
-    parser.add_argument('--profile', type=Path, default=REPO / 'profiles/wince6.json')
+    parser.add_argument('--profile', type=Path, default=REPO / 'profiles/wince6-portable-local.json')
     args = parser.parse_args()
     source = args.source.resolve(strict=True)
     output = args.output.resolve()
