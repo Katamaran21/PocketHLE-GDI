@@ -1,0 +1,16 @@
+{
+  "profile_name": "wince6-original-explorer",
+  "executable": "C:\\Users\\Админ\\Documents\\PocketHLE\\ce-images\\wince6\\fs\\Windows\\explorer.exe",
+  "image_root": "C:\\Users\\Админ\\Documents\\PocketHLE\\ce-images\\wince6\\fs",
+  "data_dir": "C:\\Users\\Админ\\Documents\\PocketHLE\\ce-data\\wince6-original-explorer",
+  "app_prefix": "\\Windows\\",
+  "command_line": "",
+  "screen": "vga_landscape",
+  "classic_windows": true,
+  "mounts": [
+    {
+      "guest_prefix": "\\CERF\\",
+      "host_dir": "D:\\DownloadNEW\\CERF-7.0.0-3af10d1-Release-Win32\\ce_apps\\arm"
+    }
+  ]
+}

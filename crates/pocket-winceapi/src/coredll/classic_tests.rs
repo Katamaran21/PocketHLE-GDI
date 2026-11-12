@@ -881,6 +881,349 @@ fn parked_taskbar_receives_raw_input_without_a_primary_thread_message_pump() {
     assert!(!worker_is_ready(&state, 0, &state.threads[0], 0));
 }
 
+fn park_combined_message_wait(
+    mask: u32,
+    all: bool,
+    timeout: u32,
+) -> (StubCpu, KernelState, pocket_kernel::Thunk, [u32; 2]) {
+    let mut cpu = tests::scanf_cpu();
+    let mut state = framed_kernel();
+    state.window_threads.insert(HWND, 1);
+    state.active_window = HWND;
+    let mut main = [0; 17];
+    main[0] = 0x2000;
+    main[1] = 0x1234;
+    main[13] = 0x8700;
+    main[14] = 0x2700;
+    main[15] = 0x2800;
+    let mut worker = GuestThread::new(0x2100, 0, 0x9000, 0x1000, 0x2200, 0, 0xdead7c00, main);
+    worker.started = true;
+    state.threads.push(worker);
+    state.current_thread = 1;
+    let handles = [0xdead7001u32, 0xdead7002];
+    for handle in handles {
+        state.events.insert(
+            handle,
+            pocket_kernel::EventObject {
+                manual_reset: false,
+                signalled: false,
+            },
+        );
+    }
+    cpu.write_mem(
+        0x1400,
+        &handles
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    for (reg, value) in [
+        (ArmReg::R0, 2),
+        (ArmReg::R1, 0x1400),
+        (ArmReg::R2, timeout),
+        (ArmReg::R3, mask),
+        (ArmReg::Sp, 0x8800),
+        (ArmReg::Lr, 0x2600),
+    ] {
+        cpu.write_reg(reg, value).unwrap();
+    }
+    cpu.write_mem(0x8800, &u32::from(all).to_le_bytes())
+        .unwrap();
+    let wait = tests::dummy_thunk();
+    assert_eq!(
+        msg_wait_for_multiple_objects(&mut CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut state,
+            thunk: &wait,
+        })
+        .unwrap(),
+        DispatchOutcome::JumpTo(0x2800)
+    );
+    assert_eq!(state.current_thread, 0);
+    (cpu, state, wait, handles)
+}
+
+#[test]
+fn unsatisfied_combined_wait_stays_parked_until_an_object_is_signalled() {
+    let (mut cpu, mut state, wait, handles) = park_combined_message_wait(4, false, u32::MAX);
+    let mut main = tests::dummy_thunk();
+    main.thunk_va += 32;
+    assert_eq!(
+        resume_worker_reenter(&mut CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut state,
+            thunk: &main
+        })
+        .unwrap(),
+        None
+    );
+    state.threads[0].messages.push_back((WM_KEYDOWN, 0x41, 0)); // excluded mask
+    state.posted_messages.push_back((0, WM_LBUTTONDOWN, 1, 0)); // another owner
+    assert_eq!(
+        resume_worker_reenter(&mut CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut state,
+            thunk: &main
+        })
+        .unwrap(),
+        None
+    );
+    state.events.get_mut(&handles[0]).unwrap().signalled = true;
+    assert_eq!(
+        resume_worker_reenter(&mut CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut state,
+            thunk: &main
+        })
+        .unwrap(),
+        Some(DispatchOutcome::JumpTo(wait.thunk_va))
+    );
+    assert!(state.events.get(&handles[0]).unwrap().signalled); // readiness does not acquire
+    assert_eq!(cpu.read_reg(ArmReg::R0).unwrap(), 2);
+    assert_eq!(cpu.read_reg(ArmReg::R1).unwrap(), 0x1400);
+    assert_eq!(cpu.read_reg(ArmReg::R2).unwrap(), u32::MAX);
+    assert_eq!(cpu.read_reg(ArmReg::R3).unwrap(), 4);
+    assert_eq!(cpu.read_reg(ArmReg::Sp).unwrap(), 0x8800);
+    assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), 0x2600);
+    assert_eq!(
+        msg_wait_for_multiple_objects(&mut CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut state,
+            thunk: &wait
+        })
+        .unwrap(),
+        DispatchOutcome::JumpTo(main.thunk_va)
+    );
+    assert!(!state.events.get(&handles[0]).unwrap().signalled);
+    assert_eq!(state.threads[0].worker_regs[0], 0);
+    assert_eq!(state.threads[0].worker_regs[15], 0x2600);
+}
+
+#[test]
+fn combined_wait_wakes_on_owned_raw_input_without_consuming_the_click() {
+    let (mut cpu, mut state, wait, handles) = park_combined_message_wait(4, false, u32::MAX);
+    state
+        .pending_input
+        .push_back(InputEvent::PointerMove { x: 60, y: 100 });
+    assert!(!worker_is_ready(
+        &state,
+        0,
+        &state.threads[0],
+        monotonic_ms()
+    ));
+    state
+        .pending_input
+        .push_back(InputEvent::PointerDown { x: 60, y: 100 });
+    assert!(worker_is_ready(
+        &state,
+        0,
+        &state.threads[0],
+        monotonic_ms()
+    ));
+    let main = tests::dummy_thunk();
+    assert!(resume_worker_reenter(&mut CallCtx {
+        cpu: &mut cpu,
+        kernel: &mut state,
+        thunk: &main
+    })
+    .unwrap()
+    .is_some());
+    assert_eq!(
+        msg_wait_for_multiple_objects(&mut CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut state,
+            thunk: &wait
+        })
+        .unwrap(),
+        DispatchOutcome::JumpTo(main.thunk_va)
+    );
+    assert_eq!(state.threads[0].worker_regs[0], 2);
+    assert_eq!(state.pending_input.len(), 2);
+    assert!(handles
+        .iter()
+        .all(|h| !state.events.get(h).unwrap().signalled));
+}
+
+#[test]
+fn combined_wait_all_requires_matching_traffic_and_every_object() {
+    let (mut cpu, mut state, wait, handles) = park_combined_message_wait(8, true, u32::MAX);
+    state.threads[0].messages.push_back((0x401, 0, 0));
+    state.events.get_mut(&handles[0]).unwrap().signalled = true;
+    assert!(!worker_is_ready(
+        &state,
+        0,
+        &state.threads[0],
+        monotonic_ms()
+    ));
+    state.events.get_mut(&handles[1]).unwrap().signalled = true;
+    let message = state.threads[0].messages.pop_front().unwrap();
+    assert!(!worker_is_ready(
+        &state,
+        0,
+        &state.threads[0],
+        monotonic_ms()
+    ));
+    state.threads[0].messages.push_back(message);
+    let main = tests::dummy_thunk();
+    assert!(resume_worker_reenter(&mut CallCtx {
+        cpu: &mut cpu,
+        kernel: &mut state,
+        thunk: &main
+    })
+    .unwrap()
+    .is_some());
+    assert!(handles
+        .iter()
+        .all(|h| state.events.get(h).unwrap().signalled));
+    msg_wait_for_multiple_objects(&mut CallCtx {
+        cpu: &mut cpu,
+        kernel: &mut state,
+        thunk: &wait,
+    })
+    .unwrap();
+    assert_eq!(state.threads[0].worker_regs[0], 2);
+    assert!(handles
+        .iter()
+        .all(|h| !state.events.get(h).unwrap().signalled));
+    assert_eq!(state.threads[0].messages.front(), Some(&message));
+}
+
+#[test]
+fn combined_wait_deadline_and_owned_timer_wake_without_polling_idle_objects() {
+    let (mut cpu, mut state, wait, _) = park_combined_message_wait(0, false, 60000);
+    let key = (1, wait.thunk_va, 0x8800);
+    let deadline = state.wait_deadlines[&key];
+    state.threads[0].messages.push_back((0x401, 0, 0));
+    assert!(!worker_is_ready(&state, 0, &state.threads[0], deadline - 1));
+    assert!(worker_is_ready(&state, 0, &state.threads[0], deadline));
+    state.wait_deadlines.insert(key, 0);
+    let main = tests::dummy_thunk();
+    assert!(resume_worker_reenter(&mut CallCtx {
+        cpu: &mut cpu,
+        kernel: &mut state,
+        thunk: &main
+    })
+    .unwrap()
+    .is_some());
+    msg_wait_for_multiple_objects(&mut CallCtx {
+        cpu: &mut cpu,
+        kernel: &mut state,
+        thunk: &wait,
+    })
+    .unwrap();
+    assert_eq!(state.threads[0].worker_regs[0], 0x102);
+    assert!(!state.wait_deadlines.contains_key(&key));
+
+    let (_, mut state, _, _) = park_combined_message_wait(0x10, false, u32::MAX);
+    state.timers.insert((0, HWND, 1), (50, 0, 0));
+    assert!(!worker_is_ready(&state, 0, &state.threads[0], 1));
+    state.timers.insert((1, HWND, 2), (50, 10, 0));
+    assert!(!worker_is_ready(&state, 0, &state.threads[0], 9));
+    assert!(worker_is_ready(&state, 0, &state.threads[0], 10));
+    assert_eq!(state.timers[&(1, HWND, 2)].1, 10); // preview does not reschedule
+}
+
+#[test]
+fn messagebox_caption_drag_keeps_the_call_open_and_clears_both_covered_regions() {
+    use pocket_kernel::msgbox::{id, mb};
+    let mut cpu = tests::scanf_cpu();
+    let mut state = framed_kernel();
+    let thunk = tests::dummy_thunk();
+    let mut ctx = CallCtx {
+        cpu: &mut cpu,
+        kernel: &mut state,
+        thunk: &thunk,
+    };
+    let dc = window_dc(&mut ctx, HWND);
+    paint(ctx.kernel, dc, 0x07e0);
+    ctx.kernel.composite_controls();
+    let backdrop = ctx
+        .kernel
+        .framebuffer
+        .resident_cpu()
+        .unwrap()
+        .pixels
+        .clone();
+    for (addr, text) in [(0x1000, "Move this box"), (0x1100, "MessageBox")] {
+        ctx.cpu
+            .write_mem(
+                addr,
+                &text
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+    }
+    message(&mut ctx, HWND, 0x1000, 0x1100, mb::YESNO);
+    assert_eq!(
+        message_box_w(&mut ctx).unwrap(),
+        DispatchOutcome::JumpTo(thunk.thunk_va)
+    );
+    let modal = ctx.kernel.modal.as_ref().unwrap();
+    let (x, y) = (modal.x, modal.y);
+    ctx.kernel.composite_controls();
+    assert_eq!(
+        pixel(ctx.kernel, (x + 2) as usize, (y + 2) as usize),
+        0x0010
+    );
+    for event in [
+        InputEvent::PointerDown {
+            x: (x + 10) as u16,
+            y: (y + 5) as u16,
+        },
+        InputEvent::PointerMove {
+            x: (x + 150) as u16,
+            y: (y + 85) as u16,
+        },
+        InputEvent::PointerUp {
+            x: (x + 150) as u16,
+            y: (y + 85) as u16,
+        },
+    ] {
+        ctx.kernel.pending_input.push_back(event);
+    }
+    assert_eq!(
+        message_box_w(&mut ctx).unwrap(),
+        DispatchOutcome::JumpTo(thunk.thunk_va)
+    );
+    let modal = ctx.kernel.modal.as_ref().unwrap();
+    assert_eq!((modal.x, modal.y, modal.result), (x + 140, y + 80, None));
+    let no = modal.buttons[1].clone();
+    ctx.kernel.composite_controls();
+    let original_at = ((y + 2) as usize * 640 + (x + 2) as usize) * 2;
+    assert_eq!(
+        pixel(ctx.kernel, (x + 2) as usize, (y + 2) as usize),
+        u16::from_le_bytes(backdrop[original_at..original_at + 2].try_into().unwrap())
+    );
+    for event in [
+        InputEvent::PointerDown {
+            x: (no.x + no.w / 2) as u16,
+            y: (no.y + no.h / 2) as u16,
+        },
+        InputEvent::PointerUp {
+            x: (no.x + no.w / 2) as u16,
+            y: (no.y + no.h / 2) as u16,
+        },
+    ] {
+        ctx.kernel.pending_input.push_back(event);
+    }
+    assert_eq!(
+        message_box_w(&mut ctx).unwrap(),
+        DispatchOutcome::ReturnedR0(id::NO)
+    );
+    assert!(ctx.kernel.modal.is_none());
+    ctx.kernel.composite_controls();
+    assert_eq!(
+        ctx.kernel.framebuffer.resident_cpu().unwrap().pixels,
+        backdrop
+    );
+    assert!(ctx.kernel.pending_input.is_empty());
+    assert!(!ctx.kernel.pressed_keys[1]);
+}
+
 #[test]
 fn filtered_worker_mouse_preview_preserves_events_and_client_coordinates() {
     let mut cpu = tests::scanf_cpu();

@@ -3001,6 +3001,10 @@ pub struct GuestThread {
     pub parked_wait_handles: Vec<u32>,
     /// `true` for WaitForMultipleObjects(..., TRUE, ...).
     pub parked_wait_all: bool,
+    /// Queue wake mask for MsgWaitForMultipleObjects[Ex]. Some(0) still
+    /// denotes a combined wait, but messages cannot satisfy that mask.
+    /// None retains the ordinary object-wait/GetMessage scheduling contract.
+    pub parked_wait_message_mask: Option<u32>,
 }
 #[allow(clippy::too_many_arguments)]
 impl GuestThread {
@@ -3039,6 +3043,7 @@ impl GuestThread {
             parked_in_pump: false,
             parked_wait_handles: Vec::new(),
             parked_wait_all: false,
+            parked_wait_message_mask: None,
         }
     }
 }

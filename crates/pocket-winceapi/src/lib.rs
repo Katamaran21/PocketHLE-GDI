@@ -31,6 +31,7 @@ mod ce_app_events;
 mod ce_crypto;
 mod ce_database;
 mod ce_fonts;
+mod ce_indirect;
 #[cfg(all(test, feature = "unicorn-tests"))]
 mod ce_native_tests;
 mod ce_notify;
@@ -301,6 +302,7 @@ impl WinCeDispatcher {
         wininet::register(&mut d);
         ce_phonebook::register(&mut d);
         ce_shortcut::register(&mut d);
+        ce_indirect::register(&mut d);
         ce_fonts::register(&mut d);
         ce_crypto::register(&mut d);
         ce_database::register(&mut d);
