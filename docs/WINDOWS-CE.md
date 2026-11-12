@@ -30,6 +30,12 @@ while library settings resolve them against the library root. Windows and
 Android share this contract, and children inherit the parent's live namespace.
 Extra application folders use writable device overlays, preserving their sources.
 
+`profiles/wince6-original-local.json` provides a separate workstation profile,
+`wince6-original-explorer`, for that untouched EXE. It uses its own
+`ce-data/wince6-original-explorer` directory and can be launched through
+`tools/run-wince6-original-gui.cmd`. Existing saved Portable Explorer profiles
+retain their own selections and data.
+
 Portable Explorer remains a separate profile and `run-wince6-portable.cmd`
 launcher. Its optional files belong in `portable-explorer/bin`; its old local
 configuration is preserved in `profiles/wince6-portable-local.json`.
@@ -64,6 +70,9 @@ or firmware and is not a complete Android library backup.
 Classic windows have caption buttons and can be moved by dragging their title
 bar. The desktop background is `#3A6EA5`. Explorer remains behind child processes
 such as BlankApp; closing a child removes its pixels and exposes the desktop.
+In classic CE profiles, MessageBox captions also support dragging; their buttons
+move with the dialog, and a drag release does not dismiss it. The box stays
+within the logical screen and reveals the current windows beneath it.
 Pointer releases and key releases return to the process that received the press.
 The taskbar and active shell menus retain their own layers.
 Native child windows hosted inside built-in controls participate in the same
@@ -120,6 +129,14 @@ the requested source component. The original shell uses these for paths.
 Unsigned CE long-to-text conversions preserve all 32 bits for shell file sizes.
 Both FILETIME/local-FILETIME directions preserve 100-ns precision in the virtual
 UTC timezone.
+
+Original Explorer also resolves shell display names through
+`SHLoadIndirectString` while opening Start. Literal UTF-16 strings and
+`@module,-resourceID` strings (including quoted paths and `;vN` modifiers) support
+overlapping source/output buffers and bounded, terminated output. Resource reads
+use only the named PE file, without attaching its DLL or searching unrelated
+modules for the same ID. Missing or malformed resources return HRESULT failures;
+resource-index locators and later Windows PRI formats remain unsupported.
 
 The session clipboard stores Unicode/ANSI text, DIBs and memory-backed custom
 formats such as Explorer's file-copy packets. Children share owned snapshots,

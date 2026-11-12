@@ -179,21 +179,44 @@ fn parse_wince_pe(bytes: &[u8]) -> Result<PE<'_>, LoadError> {
 
 /// Read the version resource without constructing or loading a guest image.
 pub fn file_version_resource(bytes: &[u8]) -> Option<&[u8]> {
-    let pe = parse_wince_pe(bytes).ok()?;
-    let entry = resources::collect_resources(bytes, &pe)
-        .ok()?
+    file_resource(bytes, &ResourceKey::Id(16), &ResourceKey::Id(1))
+        .ok()
+        .flatten()
+}
+
+/// Read a resource from a PE file without mapping code, resolving imports or
+/// running an entry point. The returned bytes belong only to this file.
+pub fn file_resource<'a>(
+    bytes: &'a [u8],
+    ty: &ResourceKey,
+    name: &ResourceKey,
+) -> Result<Option<&'a [u8]>, LoadError> {
+    let pe = parse_wince_pe(bytes)?;
+    let Some(entry) = resources::collect_resources(bytes, &pe)?
         .into_iter()
-        .find(|entry| entry.ty == ResourceKey::Id(16) && entry.name == ResourceKey::Id(1))?;
-    let section = pe.sections.iter().find(|section| {
-        entry.data_rva >= section.virtual_address
-            && entry.data_rva - section.virtual_address < section.size_of_raw_data
-    })?;
+        .find(|entry| entry.ty == *ty && entry.name == *name)
+    else {
+        return Ok(None);
+    };
+    let invalid = || LoadError::SectionOob("resource outside file section".into());
+    let section = pe
+        .sections
+        .iter()
+        .find(|section| {
+            entry.data_rva >= section.virtual_address
+                && entry.data_rva - section.virtual_address < section.size_of_raw_data
+        })
+        .ok_or_else(invalid)?;
     let offset = entry.data_rva - section.virtual_address;
     if entry.size > section.size_of_raw_data - offset {
-        return None;
+        return Err(invalid());
     }
-    let start = section.pointer_to_raw_data.checked_add(offset)? as usize;
-    bytes.get(start..start.checked_add(entry.size as usize)?)
+    let start = section
+        .pointer_to_raw_data
+        .checked_add(offset)
+        .ok_or_else(invalid)? as usize;
+    let end = start.checked_add(entry.size as usize).ok_or_else(invalid)?;
+    bytes.get(start..end).map(Some).ok_or_else(invalid)
 }
 
 /// Parse and lay out a PE32 image from raw bytes.

@@ -2245,6 +2245,7 @@ fn park_worker_at(
         thread.parked_in_pump = resume_at.is_some();
         thread.parked_wait_handles.clear();
         thread.parked_wait_all = false;
+        thread.parked_wait_message_mask = None;
     }
     switch_guest_fp(ctx, 0)?;
     ctx.kernel.current_thread = 0;
@@ -2404,22 +2405,50 @@ fn worker_is_ready(
     // Explorer's folder and taskbar pumps can be the only UI threads. Real
     // mouse input wakes a parked pump even when its next timer is far away;
     // it must not depend on the primary thread calling GetMessage first.
-    let message_ready = thread.parked_wait_handles.is_empty()
-        && (send_timeout::ready(kernel, index + 1)
-            || !thread.messages.is_empty()
-            || kernel
-                .posted_messages
-                .iter()
-                .any(|m| window_thread(kernel, m.0) == index + 1)
-            || kernel.pending_input.iter().any(|&event| {
-                addressed_input(kernel, event)
-                    .is_some_and(|m| window_thread(kernel, m.0) == index + 1)
-            }));
+    let message_ready = if let Some(mask) = thread.parked_wait_message_mask {
+        queued_message_ready(kernel, index + 1, mask, thread.worker_regs[15], now)
+    } else {
+        thread.parked_wait_handles.is_empty()
+            && (send_timeout::ready(kernel, index + 1)
+                || !thread.messages.is_empty()
+                || kernel
+                    .posted_messages
+                    .iter()
+                    .any(|m| window_thread(kernel, m.0) == index + 1)
+                || kernel.pending_input.iter().any(|&event| {
+                    addressed_input(kernel, event)
+                        .is_some_and(|m| window_thread(kernel, m.0) == index + 1)
+                }))
+    };
     if thread.sleep_until_ms > now && !(thread.parked_in_pump && message_ready) {
         return false;
     }
     if !thread.parked_in_pump || worker_wait_expired(kernel, index, thread, now) {
         return true;
+    }
+    if thread.parked_wait_message_mask.is_some() {
+        // Original CE6 Explorer's shell worker combines two events and input.
+        // Do not continually schedule its unsatisfied infinite wait. Sent
+        // messages still need their recipient's pump before checking this wait.
+        if send_timeout::ready(kernel, index + 1) {
+            return true;
+        }
+        let objects_ready = if thread.parked_wait_all {
+            thread
+                .parked_wait_handles
+                .iter()
+                .all(|&h| waitable_is_signalled_for(kernel, h, index + 1))
+        } else {
+            thread
+                .parked_wait_handles
+                .iter()
+                .any(|&h| waitable_is_signalled_for(kernel, h, index + 1))
+        };
+        return if thread.parked_wait_all {
+            message_ready && objects_ready
+        } else {
+            message_ready || objects_ready
+        };
     }
     if thread.parked_wait_handles.is_empty() {
         return message_ready;
@@ -2490,6 +2519,7 @@ fn resume_worker(
         thread.parked_in_pump = false;
         thread.parked_wait_handles.clear();
         thread.parked_wait_all = false;
+        thread.parked_wait_message_mask = None;
     }
     switch_guest_fp(ctx, thread_index + 1)?;
     write_guest_regs(ctx.cpu, &worker_regs)?;
@@ -2573,6 +2603,9 @@ fn resume_worker_reenter(ctx: &mut CallCtx<'_>) -> Result<Option<DispatchOutcome
         thread.worker_saved = false;
         thread.sleep_until_ms = 0;
         thread.parked_in_pump = false;
+        thread.parked_wait_handles.clear();
+        thread.parked_wait_all = false;
+        thread.parked_wait_message_mask = None;
     }
     switch_guest_fp(ctx, thread_index + 1)?;
     write_guest_regs(ctx.cpu, &worker_regs)?;
@@ -2636,6 +2669,10 @@ fn resume_ready_worker_after_sleep(
     thread.resume_pc = main_regs[15];
     thread.worker_saved = false;
     thread.sleep_until_ms = 0;
+    thread.parked_in_pump = false;
+    thread.parked_wait_handles.clear();
+    thread.parked_wait_all = false;
+    thread.parked_wait_message_mask = None;
     ctx.kernel.worker_round_seen.push(index);
     ctx.kernel.worker_schedule_cursor = (index + 1) % count;
     switch_guest_fp(ctx, index + 1)?;
@@ -15475,31 +15512,37 @@ fn addressed_input(kernel: &KernelState, event: InputEvent) -> Option<(u32, u32,
 /// game can use the GAPI direction table and still bind Enter explicitly
 /// (COD2 binds it to Fire). Apply the same device choice in both queue paths.
 fn pending_input_is_available(ctx: &CallCtx<'_>) -> bool {
-    if ctx.kernel.ce.control_panel.as_ref().is_some_and(|panel| {
-        panel.thread != ctx.kernel.current_thread || panel.thunk != ctx.thunk.thunk_va
-    }) {
+    pending_input_is_available_for(ctx.kernel, ctx.kernel.current_thread, ctx.thunk.thunk_va)
+}
+
+fn pending_input_is_available_for(kernel: &KernelState, owner: usize, thunk: u32) -> bool {
+    if kernel
+        .ce
+        .control_panel
+        .as_ref()
+        .is_some_and(|panel| panel.thread != owner || panel.thunk != thunk)
+    {
         return false;
     }
     // Run starts Browse on a second UI thread. Its common dialog owns input
     // until it returns; the still-running Run modal pump must not consume it.
-    if ctx
-        .kernel
+    if kernel
         .controls
         .file_dialog
         .as_ref()
-        .is_some_and(|d| d.thread != ctx.kernel.current_thread)
+        .is_some_and(|d| d.thread != owner)
     {
         return false;
     }
     // Explorer's folder pump stays alive while the taskbar tracks Start.
     // Only the tracking call may consume those events, including during
     // owner-draw callbacks that temporarily enter another message pump.
-    ctx.kernel
+    kernel
         .gdi
         .shell_menus
         .tracking
         .as_ref()
-        .is_none_or(|t| t.thread == ctx.kernel.current_thread && t.thunk == ctx.thunk.thunk_va)
+        .is_none_or(|t| t.thread == owner && t.thunk == thunk)
 }
 
 fn take_pending_input(ctx: &mut CallCtx<'_>) -> Option<InputEvent> {
@@ -16244,6 +16287,47 @@ fn message_wake_class(message: u32) -> u32 {
         _ => 8,
     }
 }
+
+/// Inspect owned traffic without removing input, changing timer deadlines, or
+/// consuming an event. The handler and scheduler must agree on a wake mask.
+fn queued_message_ready(
+    kernel: &KernelState,
+    owner: usize,
+    mask: u32,
+    thunk: u32,
+    now: u64,
+) -> bool {
+    kernel
+        .posted_messages
+        .iter()
+        .any(|m| posted_message_belongs_to(kernel, m, owner) && message_wake_class(m.1) & mask != 0)
+        || if owner == 0 {
+            kernel
+                .pending_message
+                .is_some_and(|m| message_wake_class(m.1) & mask != 0)
+                || kernel
+                    .pending_startup
+                    .iter()
+                    .any(|m| message_wake_class(m.0) & mask != 0)
+        } else {
+            kernel.threads.get(owner - 1).is_some_and(|t| {
+                t.messages
+                    .iter()
+                    .any(|m| message_wake_class(m.0) & mask != 0)
+            })
+        }
+        || (pending_input_is_available_for(kernel, owner, thunk)
+            && kernel.pending_input.iter().any(|&event| {
+                addressed_input(kernel, event).is_some_and(|m| {
+                    window_thread(kernel, m.0) == owner && message_wake_class(m.1) & mask != 0
+                })
+            }))
+        || (mask & 0x10 != 0
+            && kernel
+                .timers
+                .iter()
+                .any(|(key, timer)| key.0 == owner && timer.1 <= now))
+}
 fn msg_wait(
     ctx: &mut CallCtx<'_>,
     count: u32,
@@ -16283,24 +16367,7 @@ fn msg_wait(
             ctx.kernel.pending_message = Some(message);
         }
     }
-    let queued = ctx.kernel.posted_messages.iter().any(|m| {
-        posted_message_belongs_to(ctx.kernel, m, owner) && message_wake_class(m.1) & mask != 0
-    }) || if owner == 0 {
-        ctx.kernel
-            .pending_message
-            .is_some_and(|m| message_wake_class(m.1) & mask != 0)
-            || ctx
-                .kernel
-                .pending_startup
-                .iter()
-                .any(|m| message_wake_class(m.0) & mask != 0)
-    } else {
-        ctx.kernel.threads.get(owner - 1).is_some_and(|t| {
-            t.messages
-                .iter()
-                .any(|m| message_wake_class(m.0) & mask != 0)
-        })
-    };
+    let queued = queued_message_ready(ctx.kernel, owner, mask, ctx.thunk.thunk_va, monotonic_ms());
     if !all {
         if let Some(index) = handles
             .iter()
@@ -16341,11 +16408,14 @@ fn msg_wait(
             return finish_wait(ctx, 0x102);
         }
     }
-    // Reevaluate both the queue and handles after each cooperative handoff.
-    // Parking solely on handles would miss a message arriving first.
+    // Keep both dependencies: messages or objects wake ANY, while ALL needs
+    // matching queued traffic and every object. Retrying at this same thunk
+    // preserves the original registers, stack arguments and finite deadline.
     if let Some(outcome) = park_worker_and_reevaluate(ctx)? {
-        // This combined wait polls both sources when scheduled again.
-        ctx.kernel.threads[owner - 1].parked_in_pump = false;
+        let thread = &mut ctx.kernel.threads[owner - 1];
+        thread.parked_wait_handles = handles;
+        thread.parked_wait_all = all;
+        thread.parked_wait_message_mask = Some(mask);
         return Ok(outcome);
     }
     if let Some(outcome) = resume_worker_reenter(ctx)? {
@@ -21234,7 +21304,9 @@ fn message_box_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
             ctx.kernel.framebuffer.height as i32,
         );
         log::debug!("MessageBoxW(text={text:?}, caption={caption:?}, type=0x{u_type:08x})");
-        ctx.kernel.modal = Some(MessageBox::new(&text, &caption, u_type, sw, sh));
+        let mut modal = MessageBox::new(&text, &caption, u_type, sw, sh);
+        modal.set_movable(ctx.kernel.ce.windows.enabled);
+        ctx.kernel.modal = Some(modal);
         ctx.kernel.message_box_spins = 0;
         ctx.kernel.framebuffer.mark_dirty();
     }
@@ -21250,6 +21322,9 @@ fn message_box_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         match ev {
             InputEvent::PointerDown { x, y } => modal.pointer_down(x as i32, y as i32),
             InputEvent::PointerUp { x, y } => modal.pointer_up(x as i32, y as i32),
+            InputEvent::PointerMove { x, y } => {
+                modal.pointer_move(x as i32, y as i32);
+            }
             InputEvent::KeyDown { vk } => modal.key_down(vk),
             _ => {}
         }

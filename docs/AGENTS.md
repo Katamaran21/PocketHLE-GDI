@@ -1203,6 +1203,13 @@ processing and normal handoff. Existing single-thread behavior remains separate.
 The original experiment and its limited headless measurements are retained in
 [implementation notes](IMPLEMENTATION-NOTES.md#history-message-pump).
 
+Combined `MsgWaitForMultipleObjects[Ex]` waits retain their object handles,
+WAITALL policy and queue wake mask while parked. ANY wakes for either a ready
+object or owned traffic in that mask; ALL requires both matching traffic and all
+objects. A zero mask still denotes a combined wait. Readiness previews preserve
+input, timer deadlines and auto-reset events; the resumed call acquires results
+at its original thunk with its registers, stack arguments and timeout intact.
+
 ## PocketPC Preset ID
 
 
