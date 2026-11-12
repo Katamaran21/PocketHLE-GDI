@@ -281,7 +281,7 @@ mod tests {
             pixel.copy_from_slice(&untouched.to_le_bytes());
         }
         k.render(&mut Surface::Bitmap(&mut image));
-        let pixel = |x, y| {
+        let pixel = |x: usize, y: usize| {
             u16::from_le_bytes(
                 image.pixels[(y * 240 + x) * 2..(y * 240 + x) * 2 + 2]
                     .try_into()

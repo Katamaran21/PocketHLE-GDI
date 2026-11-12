@@ -6334,8 +6334,9 @@ mod tests {
 
     #[test]
     fn native_tab_pages_compose_controls_clip_and_follow_parent_visibility() {
-        use controls::{ControlClass, WS_VISIBLE};
+        use controls::ControlClass;
         use gdi::Surface;
+        const WS_VISIBLE: u32 = 0x1000_0000;
         let mut cpu = StubCpu::new();
         let mut process = Process::map_into(
             image_based_at(0x10000, 0x1000),
