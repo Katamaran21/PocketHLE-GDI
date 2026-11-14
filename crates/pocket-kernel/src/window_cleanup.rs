@@ -105,6 +105,18 @@ impl KernelState {
     }
 
     fn discard_one_window_metadata(&mut self, hwnd: &u32) {
+        if self.console.view.as_ref().is_some_and(|v| v.hwnd == *hwnd) {
+            self.release_console_window();
+        }
+        self.ce
+            .window_aux
+            .properties
+            .retain(|(window, _), _| window != hwnd);
+        self.ce.window_aux.dialog_units.remove(hwnd);
+        self.ce
+            .carets
+            .threads
+            .retain(|_, caret| caret.hwnd != *hwnd);
         if self.ce.shell.desktop == Some(*hwnd) {
             self.ce.shell.desktop = None;
         }

@@ -37,14 +37,18 @@ pub mod api_sets;
 mod app_events;
 pub mod async_keys;
 pub mod audio;
+pub mod automation;
 pub mod bluetooth;
 pub mod camera;
+pub mod caret;
 pub mod ce;
 pub mod ce_hive;
 pub mod cedb;
 pub mod classic_sip;
 pub mod clipboard;
 pub mod colors;
+pub mod com_stream;
+pub mod console;
 pub mod controls;
 pub mod crypto;
 pub mod desktop_services;
@@ -79,7 +83,9 @@ pub mod shared_objects;
 pub mod shell_keyboard;
 pub mod shell_menu;
 pub mod stylus_stick;
+pub mod system_sound;
 pub mod text;
+mod text_input;
 mod tls;
 pub mod touch_steering;
 pub mod tracker;
@@ -1176,11 +1182,13 @@ pub struct ChildProcess {
 #[derive(Clone)]
 pub struct ProcessHandleContext {
     pub table: handles::HandleTable,
+    ce_device: ce::device::Context,
     vfs_shared: vfs::VfsShared,
     registry_store: std::sync::Arc<std::sync::Mutex<registry::RegistryStore>>,
     events: shared_objects::SharedObjects<EventObject>,
     semaphores: shared_objects::SharedObjects<SemaphoreObject>,
     mutexes: shared_objects::SharedObjects<MutexObject>,
+    console: console::Context,
 }
 #[derive(Debug, Default)]
 pub struct MutexObject {
@@ -1227,6 +1235,7 @@ pub struct KernelState {
     pub framebuffer: framebuffer::deferred::DeferredFramebuffer,
     /// Tracked GDI objects (DCs, bitmaps, brushes, pens, fonts).
     pub gdi: GdiState,
+    pub console: console::State,
     pub ce: ce::State,
     /// Flat resource table for `FindResourceW` / `LoadResource`.
     pub resources: Vec<ResourceEntry>,
@@ -1371,7 +1380,7 @@ pub struct KernelState {
     pub pending_startup: std::collections::VecDeque<(u32, u32, u32)>,
     /// Open `FindFirstFileW` enumerations: handle -> remaining
     /// `(name, size, is_dir)` entries.
-    pub find_handles: HashMap<u32, std::collections::VecDeque<(String, u64, bool, u32)>>,
+    pub find_handles: HashMap<u32, std::collections::VecDeque<vfs::FindEntry>>,
     /// Next `FindFirstFileW` handle to hand out.
     pub next_find_handle: u32,
     /// In-memory Windows CE registry. Seeded from the CAB's
@@ -1834,11 +1843,29 @@ impl KernelState {
             u64::from(number(r"HKCU\ControlPanel\Keyboard", "RepeatRate", 33).clamp(10, 1000));
         let audio = (
             number(r"HKCU\ControlPanel\Volume", "Volume", u32::MAX),
-            number(r"HKCU\ControlPanel\Volume", "Mute", 2) & 2 != 0,
+            number(r"HKCU\ControlPanel\Volume", "Mute", 7),
         );
         if self.ce.settings.audio != Some(audio) {
-            self.audio
-                .set_wave_volume(0, if audio.1 { audio.0 } else { 0 });
+            // Changing Explorer's event checkbox must not reset ceplayer's
+            // per-stream volume. Device volume follows only its own enable bit.
+            if self
+                .ce
+                .settings
+                .audio
+                .map(|(volume, mute)| (volume, mute & 2))
+                != Some((audio.0, audio.1 & 2))
+            {
+                self.audio
+                    .set_wave_volume(0, if audio.1 & 2 != 0 { audio.0 } else { 0 });
+            }
+            self.audio.set_wave_volume(
+                system_sound::EVENT_SOUND_STREAM,
+                system_sound::SoundCategory::Event.volume(&self.registry),
+            );
+            self.audio.set_wave_volume(
+                system_sound::PLAY_SOUND_STREAM,
+                self.ce.sounds.category.volume(&self.registry),
+            );
             self.ce.settings.audio = Some(audio);
         }
         if let Some(crate::registry::RegistryValue::Dword(visible)) =
@@ -1931,11 +1958,13 @@ impl KernelState {
         self.publish_handles();
         Some(ProcessHandleContext {
             table: self.object_handles.child(handle)?,
+            ce_device: self.ce.device.clone(),
             vfs_shared: self.vfs.shared_context(),
             registry_store: self.registry.store.clone(),
             events: self.events.clone(),
             semaphores: self.semaphores.clone(),
             mutexes: self.mutexes.clone(),
+            console: self.console_context(),
         })
     }
     pub fn reclaim_finished_stacks(&mut self, cpu: &mut dyn Cpu) -> Result<(), KernelError> {
@@ -1971,7 +2000,23 @@ impl KernelState {
                 true
             }
         });
+        self.ce.shell_folder_calls.retain(|frame| {
+            if finished(frame.thread) {
+                heap.free(frame.scratch);
+                false
+            } else {
+                true
+            }
+        });
         self.ce.api_waits.retain(|key, _| !finished(key.0));
+        self.ce.power_calls.retain(|key, _| !finished(key.0));
+        self.ce
+            .carets
+            .threads
+            .retain(|thread, _| !finished(*thread));
+        self.ce
+            .focus_changes
+            .retain(|frame| !finished(frame.thread));
         self.controls.common_control_frames.retain(|frame| {
             if finished(frame.thread) {
                 heap.free(frame.scratch);
@@ -2065,6 +2110,7 @@ impl KernelState {
         Ok(())
     }
     pub fn attach_handle_context(&mut self, context: ProcessHandleContext) {
+        self.ce.device = context.ce_device;
         self.vfs.attach_shared_context(context.vfs_shared);
         // Registry values belong to the device; handles and overrides stay local.
         self.registry.store = context.registry_store;
@@ -2074,6 +2120,7 @@ impl KernelState {
         self.semaphores = context.semaphores;
         self.mutexes = context.mutexes;
         self.sync_transferred_handles();
+        self.attach_console_context(context.console);
     }
     /// Publish primary handles before the parent is suspended. Resources keep
     /// their open description; only the receiving process gets the new alias.
@@ -2191,9 +2238,58 @@ impl KernelState {
         true
     }
 
+    fn ce_wake_input_count(&self) -> usize {
+        self.pending_input
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    InputEvent::KeyDown { .. }
+                        | InputEvent::PointerDown { .. }
+                        | InputEvent::Text { .. }
+                )
+            })
+            .count()
+    }
+
+    pub fn begin_ce_suspend(&mut self) -> u64 {
+        let generation = self.ce.device.suspend(self.object_handles.process_id());
+        self.ce.suspend_observation = Some((generation, self.ce_wake_input_count()));
+        generation
+    }
+
+    /// PowerOffSystem returns after new guest input, not an already queued
+    /// key or a timeout. The frontend remains active while guest CPUs pause.
+    fn poll_ce_suspend_input(&mut self) -> bool {
+        let Some(generation) = self.ce.device.suspended_generation() else {
+            self.ce.suspend_observation = None;
+            return false;
+        };
+        let count = self.ce_wake_input_count();
+        if self
+            .ce
+            .suspend_observation
+            .is_some_and(|(observed, before)| observed == generation && count > before)
+        {
+            if self.ce.device.resume_generation(generation) {
+                self.object_handles.emit_app_event(11);
+                log::info!("emulated CE device resumed by guest input");
+            }
+            self.ce.suspend_observation = None;
+        } else {
+            self.ce.suspend_observation = Some((generation, count));
+        }
+        self.ce.device.suspended_generation().is_some()
+    }
+
     /// Record process termination without changing the suspended parent process.
     pub fn record_process_exit(&mut self, code: u32) {
         self.process_exit_code = Some(code);
+        self.ce
+            .device
+            .release_process(self.object_handles.process_id());
+        self.ce.power_calls.clear();
+        self.ce.suspend_observation = None;
         for (_, p) in self.legacy_winsock.hostent_buffers.drain() {
             self.heap.free(p);
         }
@@ -2417,6 +2513,22 @@ impl KernelState {
                 return Some((x, y));
             }
             if let Some(p) = self.controls.panel(hwnd) {
+                if let Some(rect) = self.window_rects.get(&hwnd).filter(|_| {
+                    self.window_styles
+                        .get(&hwnd)
+                        .is_some_and(|style| style.0 & 0x4000_0000 != 0)
+                }) {
+                    // CE6 Remote Desktop embeds nested options pages. Their
+                    // USER rectangles are relative to the parent's client;
+                    // DialogPanel's rendering coordinates remain screen-based.
+                    let border = i32::from(p.border);
+                    x = x.saturating_add(rect.0).saturating_add(border);
+                    y = y
+                        .saturating_add(rect.1)
+                        .saturating_add(border + p.caption_h());
+                    hwnd = *self.window_parents.get(&hwnd)?;
+                    continue;
+                }
                 let (a, b) = p.client_origin();
                 return Some((x.saturating_add(a), y.saturating_add(b)));
             }
@@ -2448,6 +2560,24 @@ impl KernelState {
         None
     }
     pub fn refresh_control_visibility(&mut self) {
+        let panels: Vec<_> = self
+            .controls
+            .panel_handles()
+            .filter(|hwnd| {
+                self.window_styles
+                    .get(hwnd)
+                    .is_some_and(|style| style.0 & 0x4000_0000 != 0)
+            })
+            .filter_map(|hwnd| {
+                self.native_window_screen_rect(hwnd)
+                    .map(|rect| (hwnd, rect))
+            })
+            .collect();
+        for (hwnd, rect) in panels {
+            let panel = self.controls.panel_mut(hwnd).unwrap();
+            panel.x = rect.0;
+            panel.y = rect.1;
+        }
         let origins = self
             .window_rects
             .keys()
@@ -2489,6 +2619,7 @@ impl KernelState {
     }
 
     fn composite_window_layers(&mut self, present_windows: bool) {
+        self.refresh_console_window();
         self.refresh_control_visibility();
         if !self.ce.windows.enabled
             && !present_windows
@@ -3984,6 +4115,9 @@ impl Heap {
 /// Fake `HMODULE` for the resident `ole32.dll` compatibility module.
 pub const SDLAUNCH_MODULE_HANDLE: u32 = 0x1000_0009;
 pub const OLE32_MODULE_HANDLE: u32 = 0x1000_0007;
+pub const IPHLPAPI_MODULE_HANDLE: u32 = 0x1000_000e;
+pub const CRYPT32_MODULE_HANDLE: u32 = 0x1000_000f;
+pub const SECUR32_MODULE_HANDLE: u32 = 0x1000_0010;
 pub const WININET_MODULE_HANDLE: u32 = 0x1000_000b;
 pub const WS2_MODULE_HANDLE: u32 = 0x1000_000a;
 pub const NOTE_PRJ_MODULE_HANDLE: u32 = 0x1000_000c;
@@ -4080,6 +4214,21 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
                 .entry(*handle)
                 .or_insert_with(HashMap::new)
                 .insert(name, thunk.thunk_va);
+        } else if thunk.dll.eq_ignore_ascii_case("iphlpapi.dll") {
+            exports
+                .entry(IPHLPAPI_MODULE_HANDLE)
+                .or_default()
+                .insert(name, thunk.thunk_va);
+        } else if thunk.dll.eq_ignore_ascii_case("crypt32.dll") {
+            exports
+                .entry(CRYPT32_MODULE_HANDLE)
+                .or_default()
+                .insert(name, thunk.thunk_va);
+        } else if thunk.dll.eq_ignore_ascii_case("secur32.dll") {
+            exports
+                .entry(SECUR32_MODULE_HANDLE)
+                .or_default()
+                .insert(name, thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("ole32.dll") {
             ole32.insert(name.clone(), thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("libegl.dll") {
@@ -4130,6 +4279,9 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
 }
 pub struct Process {
     pub image: LoadedImage,
+    /// Selected before section payloads are released. CalNot's CE function
+    /// table must remain authoritative when the main loop starts later.
+    entry_uses_thumb: bool,
     pub thunks: Vec<Thunk>,
     pub thunk_by_va: HashMap<u32, usize>,
     pub stack_top: u32,
@@ -4375,6 +4527,9 @@ impl Process {
 
         let mut dynamic_exports_to_add = Vec::new();
         for dll in [
+            "iphlpapi.dll",
+            "crypt32.dll",
+            "secur32.dll",
             "aygshell.dll",
             "coredll.dll",
             "commctrl.dll",
@@ -4473,10 +4628,8 @@ impl Process {
         )?;
         cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
         cpu.write_reg(ArmReg::Lr, PROCESS_EXIT_TRAMPOLINE_VA)?;
-        if image.machine != machine::MIPS_R3000
-            && image.machine != machine::MIPS_R4000
-            && image_uses_thumb_entry(cpu, &image)?
-        {
+        let entry_uses_thumb = image_uses_thumb_entry(cpu, &image)?;
+        if entry_uses_thumb {
             let cpsr = cpu.read_reg(ArmReg::Cpsr)? | (1 << 5);
             cpu.write_reg(ArmReg::Cpsr, cpsr)?;
             log::debug!("starting Thumb-mode entry with CPSR.T set");
@@ -4620,6 +4773,7 @@ impl Process {
         }
         Ok(Process {
             image,
+            entry_uses_thumb,
             thunks,
             thunk_by_va,
             stack_top,
@@ -4651,6 +4805,7 @@ impl Process {
                 random_seed: 0x1234_abcd,
                 framebuffer: framebuffer::deferred::DeferredFramebuffer::default(),
                 gdi: GdiState::new(),
+                console: console::State::default(),
                 ce: ce::State::default(),
                 resources,
                 image_base: img_base,
@@ -4987,6 +5142,13 @@ pub fn image_uses_thumb_entry(cpu: &mut dyn Cpu, image: &LoadedImage) -> Result<
     if image.machine != machine::THUMB && image.machine != machine::ARMNT {
         return Ok(false);
     }
+    if let Some(thumb) = image.ce_pdata_entry_uses_thumb() {
+        log::debug!(
+            "CE function table selects {} entry mode",
+            if thumb { "Thumb" } else { "ARM" }
+        );
+        return Ok(thumb);
+    }
     let entry = image.entry_va() & !1;
     let bytes = cpu.read_mem(entry, 4)?;
     let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -5021,7 +5183,7 @@ pub fn run_main_loop_with_hook(
     max_slices: u64,
     mut frame_hook: Option<&mut dyn FrameHook>,
 ) -> Result<(), KernelError> {
-    let thumb_mode = image_uses_thumb_entry(cpu, &process.image)?;
+    let thumb_mode = process.entry_uses_thumb;
     let entry = process.image.entry_va() & !1;
     let mut pc = if thumb_mode { entry | 1 } else { entry };
     log::info!(
@@ -5057,6 +5219,31 @@ pub fn run_main_loop_with_hook(
             let _guard = process_gate.lock().unwrap_or_else(|e| e.into_inner());
             if process.state.apply_process_controls(cpu, &mut pc)? {
                 return Ok(());
+            }
+        }
+        if process.state.ce.device.suspended_generation().is_some()
+            && process.state.poll_ce_suspend_input()
+        {
+            let now = Instant::now();
+            if last_frontend_poll
+                .is_none_or(|then| now.duration_since(then) >= FRONTEND_POLL_INTERVAL)
+            {
+                last_frontend_poll = Some(now);
+                if let Some(hook) = frame_hook.as_deref_mut() {
+                    if hook.on_frame(&mut process.state) == FrameAction::Stop {
+                        log::info!("frame hook requested stop during CE suspend");
+                        return Ok(());
+                    }
+                }
+            }
+            if process.state.should_stop {
+                return Ok(());
+            }
+            if process.state.poll_ce_suspend_input() {
+                // No execution gate is held, so another process can stop
+                // this caller. Do not execute guest code while suspended.
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
             }
         }
         // Switch TLS before any guest code, including DllMain notifications.
@@ -6734,6 +6921,101 @@ mod tests {
     }
 
     #[test]
+    fn ce_suspend_keeps_stop_available_without_executing_guest_code_or_using_stale_input() {
+        let mut loader_cpu = StubCpu::new();
+        let mut process = Process::map_into(
+            image_based_at(0x10000, 0x1000),
+            &mut loader_cpu,
+            &|_, _| None,
+            &NullDispatcher,
+        )
+        .unwrap();
+        process
+            .state
+            .pending_input
+            .push_back(InputEvent::KeyDown { vk: 0x0d });
+        process.state.begin_ce_suspend();
+        // Deliberately unmapped: executing even one CPU slice must fail.
+        let mut cpu = StrictMapCpu::new();
+        let gate = process.state.object_handles.execution_gate();
+        let mut calls = 0;
+        let mut hook = |state: &mut KernelState| {
+            assert!(
+                gate.try_lock().is_ok(),
+                "suspend must release the process gate"
+            );
+            assert!(state.ce.device.suspended_generation().is_some());
+            calls += 1;
+            match calls {
+                1 => state
+                    .pending_input
+                    .push_back(InputEvent::PointerMove { x: 10, y: 10 }),
+                2 => state
+                    .pending_input
+                    .push_back(InputEvent::KeyUp { vk: 0x0d }),
+                _ => return FrameAction::Stop,
+            }
+            FrameAction::Continue
+        };
+        run_main_loop_with_hook(
+            &mut cpu,
+            &mut process,
+            &mut NullDispatcher,
+            100,
+            0,
+            Some(&mut hook),
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(cpu.last_slice_timeout, None);
+        assert_eq!(process.state.process_exit_code, None);
+    }
+
+    #[test]
+    fn ce_suspend_resumes_on_new_input_and_preserves_the_event_for_the_guest() {
+        let mut loader_cpu = StubCpu::new();
+        let mut process = Process::map_into(
+            image_based_at(0x10000, 0x1000),
+            &mut loader_cpu,
+            &|_, _| None,
+            &NullDispatcher,
+        )
+        .unwrap();
+        let mut cpu = StrictMapCpu::new();
+        cpu.map_region(0x11000, 4096, Prot::READ | Prot::WRITE | Prot::EXEC)
+            .unwrap();
+        cpu.write_mem(0x11000, &0xeaff_fffeu32.to_le_bytes())
+            .unwrap();
+        process.state.begin_ce_suspend();
+        let mut calls = 0;
+        let mut hook = |state: &mut KernelState| {
+            calls += 1;
+            if calls == 1 {
+                assert!(state.ce.device.suspended_generation().is_some());
+                state
+                    .pending_input
+                    .push_back(InputEvent::KeyDown { vk: 0x0d });
+            }
+            FrameAction::Continue
+        };
+        run_main_loop_with_hook(
+            &mut cpu,
+            &mut process,
+            &mut NullDispatcher,
+            100,
+            1,
+            Some(&mut hook),
+        )
+        .unwrap();
+        assert_eq!(process.state.ce.device.suspended_generation(), None);
+        assert_eq!(cpu.last_slice_timeout, Some(20_000));
+        assert_eq!(
+            process.state.pending_input.front(),
+            Some(&InputEvent::KeyDown { vk: 0x0d })
+        );
+    }
+
+    #[test]
     fn instruction_limit_still_services_host_hook() {
         let mut loader_cpu = StubCpu::new();
         let mut process = Process::map_into(
@@ -6909,6 +7191,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ce_function_table_selects_arm_dll_leaf_and_overrides_ambiguous_entry_bytes() {
+        for (words, packed, thumb) in [
+            // CalNot's pimres DllMain starts with cmp r1,#0; beq detach.
+            ([0xe351_0000u32, 0x0a00_0005], 0x4000_0e00u32, false),
+            // Metadata must also preserve a real Thumb function when its
+            // first two halfwords happen to match the old ARM heuristic.
+            ([0xe1a0_0000, 0x4770_2001], 0x0000_0800, true),
+        ] {
+            let mut image = image_based_at(0x10000, 0x1000);
+            image.machine = machine::THUMB;
+            image.size_of_image = 0x3000;
+            image.subsystem = pocket_pe::subsystem::WINDOWS_CE_GUI;
+            for (slot, word) in image.sections[0].data[..8].chunks_exact_mut(4).zip(words) {
+                slot.copy_from_slice(&word.to_le_bytes());
+            }
+            let mut data = 0x11000u32.to_le_bytes().to_vec();
+            data.extend_from_slice(&packed.to_le_bytes());
+            image.sections.push(pocket_pe::LoadedSection {
+                name: ".pdata".into(),
+                virtual_address: 0x2000,
+                virtual_size: 8,
+                characteristics: 0x4000_0040,
+                data,
+            });
+            assert_eq!(image.ce_pdata_entry_uses_thumb(), Some(thumb));
+            let mut cpu = StubCpu::new();
+            let process =
+                Process::map_into(image, &mut cpu, &|_, _| None, &NullDispatcher).unwrap();
+            assert!(process
+                .image
+                .sections
+                .iter()
+                .all(|section| section.data.is_empty()));
+            assert_eq!(process.entry_uses_thumb, thumb);
+            assert_eq!(cpu.read_reg(ArmReg::Cpsr).unwrap() & 0x20 != 0, thumb);
+        }
+    }
+
+    #[test]
+    fn ce_function_table_ignores_invalid_records_and_armnt_unwind_format() {
+        for (machine_tag, start, packed) in [
+            (machine::THUMB, 0x11000u32, 0x4000_0000u32),
+            (machine::THUMB, 0xffff_fff0, 0x403f_ff00),
+            (machine::THUMB, 0x14000, 0x4000_0800),
+            (machine::ARMNT, 0x11000, 0x4000_0800),
+        ] {
+            let mut image = image_based_at(0x10000, 0x1000);
+            image.machine = machine_tag;
+            image.size_of_image = 0x3000;
+            image.subsystem = pocket_pe::subsystem::WINDOWS_CE_GUI;
+            image.sections[0].data[..4].copy_from_slice(&[0x01, 0x20, 0x70, 0x47]);
+            let mut data = start.to_le_bytes().to_vec();
+            data.extend_from_slice(&packed.to_le_bytes());
+            image.sections.push(pocket_pe::LoadedSection {
+                name: ".pdata".into(),
+                virtual_address: 0x2000,
+                virtual_size: 8,
+                characteristics: 0x4000_0040,
+                data,
+            });
+            let mut cpu = StubCpu::new();
+            let process =
+                Process::map_into(image, &mut cpu, &|_, _| None, &NullDispatcher).unwrap();
+            assert!(image_uses_thumb_entry(&mut cpu, &process.image).unwrap());
+        }
+    }
+
     /// An image based *above* slot 0 still gets the alias window, since
     /// its CRT startup addresses itself through slot-relative pointers
     /// and nothing is mapped at `0x10000` to collide with.
@@ -6988,6 +7338,7 @@ impl Drop for KernelState {
         if self.process_exit_code.is_none() {
             self.record_process_exit(0xc0000001);
         }
+        self.release_console_window();
         for (handle, _) in self.object_handles.owned() {
             if let Some((object, last)) = self.object_handles.close(handle) {
                 self.clean_object(object, last);

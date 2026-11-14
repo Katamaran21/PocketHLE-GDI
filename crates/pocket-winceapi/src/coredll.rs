@@ -24,19 +24,24 @@
 #[path = "shell_execute.rs"]
 mod shell_execute;
 
+mod caret;
 mod ce_gdi;
 #[path = "coredll/choice_controls.rs"]
 mod choice_controls;
 mod clipboard;
 pub(crate) mod command_bar;
 mod common_controls;
+pub(crate) mod console;
 #[path = "coredll/control_color.rs"]
 mod control_color;
 #[path = "coredll/coordinates.rs"]
 mod coordinates;
+mod dialog_units;
 mod file_dialog;
 #[path = "coredll/file_mapping.rs"]
 mod file_mapping;
+mod focus;
+mod format_message;
 mod image_drag;
 #[path = "coredll/list_paint.rs"]
 mod list_paint;
@@ -125,17 +130,31 @@ mod classic_gdi;
 #[cfg(test)]
 mod classic_tests;
 mod classic_window;
+#[cfg(test)]
+mod combo_edit_tests;
 mod control_panel;
+#[cfg(test)]
+mod dialog_geometry_tests;
+#[cfg(test)]
+mod file_replace_tests;
 #[cfg(test)]
 mod graphics_tests;
 pub(crate) mod images;
 mod message_queue;
+#[cfg(test)]
+mod module_lifecycle_tests;
+mod secure_crt;
 mod send_timeout;
 mod strsafe;
+pub(crate) mod system_sound;
 mod text_draw;
+mod window_aux;
 mod window_graphics;
 
 pub fn register(d: &mut WinCeDispatcher) {
+    format_message::register(d);
+    console::register(d);
+    caret::register(d);
     shell_registration::register(d);
     control_panel::register(d);
     d.register_handler("coredll.dll", "EqualRect", equal_rect);
@@ -348,6 +367,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "printf", printf);
     d.register_handler(dll, "fprintf", crt_fprintf);
     d.register_handler(dll, "fwprintf", crt_fwprintf);
+    d.register_handler(dll, "vfwprintf", crt_vfwprintf);
     d.register_handler(dll, "wprintf", crt_wprintf);
     d.register_handler(dll, "fputwc", crt_fputwc);
     d.register_handler(dll, "putwchar", crt_putwchar);
@@ -387,6 +407,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "StringCbVPrintfW", string_cb_vprintf_w);
     d.register_handler(dll, "StringCchVPrintfW", string_cch_vprintf_w);
     strsafe::register(d, dll);
+    secure_crt::register(d, dll);
+    window_aux::register(d, dll);
+    dialog_units::register(d, dll);
     // `NKDbgPrintfW` is the kernel debug printer. It has no observable
     // effect for the guest, but it is variadic, so a stub that returns
     // without consuming its arguments is fine while an unimplemented
@@ -441,9 +464,11 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "RemoveDirectoryW", remove_directory_w);
     d.register_handler(dll, "CopyFileW", copy_file_w);
     d.register_handler(dll, "MoveFileW", move_file_w);
+    d.register_handler(dll, "DeleteAndRenameFile", delete_and_rename_file);
     d.register_handler(dll, "SetEndOfFile", set_end_of_file);
     d.register_constant(dll, "GetFileInformationByHandle", 0, zero_returning);
     d.register_handler(dll, "OpenProcess", open_process);
+    d.register_handler(dll, "OpenThread", open_thread);
     d.register_handler(dll, "GetExitCodeProcess", get_exit_code_process);
 
     // ---- C-runtime style file I/O on top of the same VFS ----
@@ -679,7 +704,7 @@ pub fn register(d: &mut WinCeDispatcher) {
         msg_wait_for_multiple_objects_legacy,
     );
     d.register_constant(dll, "EnableWindow", 1, one_returning);
-    d.register_constant(dll, "MessageBeep", 1, one_returning);
+    d.register_handler(dll, "MessageBeep", system_sound::message_beep);
     d.register_handler(dll, "PlaySoundW", play_sound_w);
     d.register_handler(dll, "PlaySoundA", play_sound_a);
     d.register_handler(dll, "sndPlaySoundW", snd_play_sound_w);
@@ -739,6 +764,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     );
     d.register_handler(dll, "SetDlgItemTextW", set_dlg_item_text_w);
     d.register_handler(dll, "IsWindow", is_window);
+    d.register_handler(dll, "IsChild", is_child);
     d.register_handler(dll, "CreateMutexW", create_mutex_w);
     d.register_handler(dll, "CreateSemaphoreW", create_semaphore_w);
     d.register_handler(dll, "OpenSemaphoreW", open_semaphore_w);
@@ -806,10 +832,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "DrawTextW", draw_text_w);
     d.register_handler(dll, "GetTextExtentExPointW", get_text_extent_ex_point_w);
     d.register_handler(dll, "GetTextMetricsW", get_text_metrics_w);
+    d.register_handler(dll, "GetTextFaceW", get_text_face_w);
     d.register_handler(dll, "DrawFrameControl", classic_gdi::frame_control);
     d.register_handler(dll, "DrawEdge", classic_gdi::edge);
     d.register_handler(dll, "DrawFocusRect", classic_gdi::focus_rect);
     d.register_handler(dll, "SetBkMode", set_bk_mode);
+    d.register_handler(dll, "GetBkMode", get_bk_mode);
     d.register_handler(dll, "SetBkColor", set_bk_color);
     d.register_handler(dll, "GetBkColor", get_bk_color);
     d.register_handler(dll, "SetTextColor", set_text_color);
@@ -950,6 +978,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "ImmGetOpenStatus", imm_get_open_status);
     d.register_handler(dll, "ImmSetOpenStatus", imm_set_open_status);
     d.register_handler(dll, "ImmReleaseContext", imm_release_context);
+    d.register_handler(dll, "ImmNotifyIME", imm_notify_ime);
     d.register_constant(dll, "ImmSetCompositionWindow", 1, one_returning);
     d.register_handler(dll, "SystemParametersInfoW", system_parameters_info_w);
     d.register_handler(dll, "SetPowerRequirement", set_power_requirement);
@@ -4346,6 +4375,9 @@ fn submit_mas_buffer(ctx: &mut CallCtx<'_>, handle: u32, data: &[u8]) {
 }
 
 fn device_io_control(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let Some(outcome) = console::control(ctx)? {
+        return Ok(outcome);
+    }
     /// `CTL_CODE(FILE_DEVICE_DISK, 0x709, METHOD_BUFFERED, FILE_READ_ACCESS)`
     const IOCTL_DISK_GET_STORAGEID: u32 = 0x0007_1c24;
     let handle = ctx.arg_u32(0)?;
@@ -4777,6 +4809,15 @@ fn get_module_handle_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     } else {
         hle_module_handle(&key)
             .filter(|handle| ctx.kernel.dynamic_exports.contains_key(handle))
+            .filter(|handle| {
+                ctx.kernel
+                    .ce
+                    .hle_module_refs
+                    .get(handle)
+                    .copied()
+                    .unwrap_or(1)
+                    != 0
+            })
             .unwrap_or(0)
     };
     if handle == 0 {
@@ -4895,6 +4936,24 @@ pub(crate) fn load_library_named(
     ctx: &mut CallCtx<'_>,
     request: &str,
 ) -> Result<DispatchOutcome, KernelError> {
+    let outcome = load_library_named_inner(ctx, request)?;
+    if let DispatchOutcome::ReturnedR0(handle) = outcome {
+        if handle != 0
+            && handle != FAKE_MODULE_HANDLE
+            && ctx.kernel.dynamic_exports.contains_key(&handle)
+            && ctx.kernel.module_by_handle(handle).is_none()
+        {
+            let references = ctx.kernel.ce.hle_module_refs.entry(handle).or_insert(1);
+            *references = references.saturating_add(1);
+        }
+    }
+    Ok(outcome)
+}
+
+fn load_library_named_inner(
+    ctx: &mut CallCtx<'_>,
+    request: &str,
+) -> Result<DispatchOutcome, KernelError> {
     if let Some(result) = finish_module_attach(ctx)? {
         return Ok(result);
     }
@@ -5005,6 +5064,18 @@ pub(crate) fn load_library_named(
             set_thread_error(ctx, 126);
         }
         return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    if let Some(handle) = match module_file_name(&name).as_str() {
+        "iphlpapi.dll" | "iphlpapi" => Some(pocket_kernel::IPHLPAPI_MODULE_HANDLE),
+        "crypt32.dll" | "crypt32" => Some(pocket_kernel::CRYPT32_MODULE_HANDLE),
+        "secur32.dll" | "secur32" => Some(pocket_kernel::SECUR32_MODULE_HANDLE),
+        _ => None,
+    } {
+        if ctx.kernel.dynamic_exports.contains_key(&handle) {
+            return Ok(DispatchOutcome::ReturnedR0(handle));
+        }
+        set_thread_error(ctx, 126);
+        return Ok(DispatchOutcome::ReturnedR0(0));
     }
     if name.ends_with("imgdecmp.dll") || name == "imgdecmp" {
         let handle = if ctx.kernel.dynamic_exports.contains_key(&FAKE_MODULE_HANDLE) {
@@ -5170,6 +5241,9 @@ pub(crate) fn runtime_hle_dll(dll: &str) -> bool {
             | "sdlaunch.dll"
             | "hss.dll"
             | "oleaut32.dll"
+            | "iphlpapi.dll"
+            | "crypt32.dll"
+            | "secur32.dll"
             | "winsock.dll"
             | "ws2.dll"
             | "wininet.dll"
@@ -5241,6 +5315,14 @@ fn free_library(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         .find(|module| module.base == base)
     else {
         if base != ctx.kernel.image_base && ctx.kernel.dynamic_exports.contains_key(&base) {
+            if base != FAKE_MODULE_HANDLE {
+                let references = ctx.kernel.ce.hle_module_refs.entry(base).or_insert(1);
+                if *references == 0 {
+                    set_thread_error(ctx, ERROR_INVALID_HANDLE);
+                    return Ok(DispatchOutcome::ReturnedR0(0));
+                }
+                *references -= 1;
+            }
             return Ok(DispatchOutcome::ReturnedR0(1));
         }
         set_thread_error(ctx, ERROR_INVALID_HANDLE);
@@ -5580,6 +5662,9 @@ fn hle_module_handle(dll: &str) -> Option<u32> {
         "ddraw.dll" => 0x1000_0003,
         "hss.dll" => pocket_kernel::HSS_MODULE_HANDLE,
         "ole32.dll" => pocket_kernel::OLE32_MODULE_HANDLE,
+        "iphlpapi.dll" => pocket_kernel::IPHLPAPI_MODULE_HANDLE,
+        "crypt32.dll" => pocket_kernel::CRYPT32_MODULE_HANDLE,
+        "secur32.dll" => pocket_kernel::SECUR32_MODULE_HANDLE,
         "aygshell.dll" => pocket_kernel::AYGSHELL_MODULE_HANDLE,
         "sdlaunch.dll" => pocket_kernel::SDLAUNCH_MODULE_HANDLE,
         "ws2.dll" => pocket_kernel::WS2_MODULE_HANDLE,
@@ -7946,8 +8031,8 @@ fn read_vararg_u32(ctx: &mut CallCtx<'_>, idx: u32) -> Result<u32, KernelError> 
 /// result, and concluded the card had been ejected. `w` is the Windows
 /// spelling of `l` for strings.
 ///
-/// `hh` and `ll` collapse onto `h` and `l`: they differ only in integer
-/// width, and every integer in both renderers is read as 32 bits.
+/// Both printf renderers recognize `ll` and Microsoft's `I64` before reaching
+/// this scanner for the remaining character/string length modifiers.
 fn scan_length_mods(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (bool, bool) {
     let mut long = false;
     let mut short = false;
@@ -7965,6 +8050,21 @@ fn scan_length_mods(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (bo
         }
     }
     (long, short)
+}
+
+fn scan_printf_length(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (bool, bool, bool) {
+    // Pocket CMD's DIR uses %I64d for totals and free space. CE's Microsoft
+    // varargs are word aligned, including an integer crossing R3 and [SP].
+    for (prefix, wide) in [("I64", true), ("I32", false), ("ll", true)] {
+        if chars.clone().take(prefix.len()).eq(prefix.chars()) {
+            for _ in 0..prefix.len() {
+                chars.next();
+            }
+            return (true, false, wide);
+        }
+    }
+    let (long, short) = scan_length_mods(chars);
+    (long, short, false)
 }
 
 /// Whether a `%s` / `%c` conversion pulls a wide argument: a wide format
@@ -8095,7 +8195,7 @@ fn render_printf(
                 precision = Some(digits.min(0x10000));
             }
         }
-        let (long, short) = scan_length_mods(&mut chars);
+        let (long, short, integer64) = scan_printf_length(&mut chars);
         let conv = match chars.next() {
             Some(c) => c,
             None => break,
@@ -8103,6 +8203,18 @@ fn render_printf(
         let mut piece = String::new();
         match conv {
             '%' => piece.push('%'),
+            'd' | 'i' | 'u' | 'x' | 'X' if integer64 => {
+                let low = read_vararg_u32(ctx, next_arg)?;
+                let high = read_vararg_u32(ctx, next_arg + 1)?;
+                next_arg += 2;
+                let value = u64::from(low) | (u64::from(high) << 32);
+                piece = match conv {
+                    'd' | 'i' => (value as i64).to_string(),
+                    'x' => format!("{value:x}"),
+                    'X' => format!("{value:X}"),
+                    _ => value.to_string(),
+                };
+            }
             'd' | 'i' => {
                 let v = read_vararg_u32(ctx, next_arg)? as i32;
                 next_arg += 1;
@@ -8243,6 +8355,9 @@ fn printf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let fmt = crate::crt_ansi::decode(&read_crt_cstr(ctx, fmt_p)?);
     let s = render_printf(ctx, &fmt, false, 1)?;
     log::debug!("guest printf: {s}");
+    if !console::write_text(ctx, STD_FILE_BASE + 1, &s, false) {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
     Ok(DispatchOutcome::ReturnedR0(
         crate::crt_ansi::encode(&s).len() as u32,
     ))
@@ -8275,22 +8390,16 @@ fn get_std_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 /// `FILE *_wfreopen(const wchar_t *path, const wchar_t *mode, FILE *stream)`
 ///
-/// Games redirect `stdout` into a log file on the device. We keep the
-/// stream identity (so later `fprintf`s still land in the emulator
-/// log) but also open the file so the log is written where the game
-/// expects it.
+/// Pocket CMD and games keep their FILE identity while redirecting the
+/// underlying stream to a device or VFS file, with real access and offsets.
 fn reopen_common(
     ctx: &mut CallCtx<'_>,
     path: &str,
     mode: &str,
     stream: u32,
 ) -> Result<DispatchOutcome, KernelError> {
-    if std_file_label(stream).is_some() {
-        log::debug!(
-            "freopen({path:?}, {mode:?}) on {} stream",
-            std_file_label(stream).unwrap_or("")
-        );
-        return Ok(DispatchOutcome::ReturnedR0(stream));
+    if let Some(result) = console::reopen(ctx, path, mode, stream) {
+        return Ok(DispatchOutcome::ReturnedR0(result));
     }
     let h = open_cstr_path(ctx, path, mode);
     Ok(DispatchOutcome::ReturnedR0(h))
@@ -8335,11 +8444,25 @@ fn crt_fwprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     let fmt = String::from_utf16_lossy(&read_wstr(ctx, fmt_ptr, 0x4000)?);
     let text = render_printf(ctx, &fmt, true, 2)?;
-    if std_file_label(stream).is_some() {
-        emit_stream_text(ctx, stream, &text)?;
-    } else if !ctx.kernel.vfs.is_open(stream)
-        || write_stdio_raw(ctx, stream, text.as_bytes()) != Some(text.len())
-    {
+    if !console::write_text(ctx, stream, &text, true) {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    Ok(DispatchOutcome::ReturnedR0(
+        text.encode_utf16().count() as u32
+    ))
+}
+
+/// Pocket CMD uses the va_list form for command errors and directory listings.
+fn crt_vfwprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let stream = ctx.arg_u32(0)?;
+    let fmt_ptr = ctx.arg_u32(1)?;
+    let arguments = ctx.arg_u32(2)?;
+    if fmt_ptr == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    let fmt = String::from_utf16_lossy(&read_wstr(ctx, fmt_ptr, 0x4000)?);
+    let text = render_printf_va(ctx, &fmt, true, arguments)?;
+    if !console::write_text(ctx, stream, &text, true) {
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
     }
     Ok(DispatchOutcome::ReturnedR0(
@@ -8354,7 +8477,9 @@ fn crt_wprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     let format = String::from_utf16_lossy(&read_wstr(ctx, pointer, 0x4000)?);
     let text = render_printf(ctx, &format, true, 1)?;
-    emit_stream_text(ctx, STD_FILE_BASE + 1, &text)?;
+    if !console::write_text(ctx, STD_FILE_BASE + 1, &text, true) {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
     Ok(DispatchOutcome::ReturnedR0(
         text.encode_utf16().count() as u32
     ))
@@ -8371,11 +8496,7 @@ fn write_wide_character(
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
     };
     let text = character.to_string();
-    if matches!(std_file_label(stream), Some("stdout" | "stderr")) {
-        emit_stream_text(ctx, stream, &text)?;
-    } else if !ctx.kernel.vfs.is_open(stream)
-        || write_stdio_raw(ctx, stream, text.as_bytes()) != Some(text.len())
-    {
+    if !console::write_text(ctx, stream, &text, true) {
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
     }
     Ok(DispatchOutcome::ReturnedR0(character as u32))
@@ -8403,9 +8524,13 @@ fn get_stdio_path_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
         set_thread_error(ctx, 87);
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    // The CE command-line tools query their console device before printing.
-    // Keep this in the guest namespace, independent of host paths/handles.
-    let path = wide_to_bytes(&"CON:".encode_utf16().chain(Some(0)).collect::<Vec<_>>());
+    // SetStdioPathW is process-local; child launch snapshots these guest paths.
+    let path = wide_to_bytes(
+        &ctx.kernel.console.paths[id as usize]
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>(),
+    );
     let capacity = ctx.cpu.read_u32_le(length)?;
     let required = path.len() as u32 / 2;
     if output == 0 || capacity < required {
@@ -8442,12 +8567,8 @@ fn crt_vfprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// Route text produced by `fprintf` / `vfprintf` either into the
 /// emulator log (std streams) or into the backing VFS file.
 fn emit_stream_text(ctx: &mut CallCtx<'_>, stream: u32, text: &str) -> Result<(), KernelError> {
-    if let Some(label) = std_file_label(stream) {
-        log::debug!("guest {label}: {}", text.trim_end_matches(['\r', '\n']));
-        return Ok(());
-    }
-    if ctx.kernel.vfs.is_open(stream) {
-        write_stdio_raw(ctx, stream, &crate::crt_ansi::encode(text));
+    if std_file_label(stream).is_some() || console::stream_is_open(ctx.kernel, stream) {
+        console::write_text(ctx, stream, text, false);
     } else {
         log::debug!("guest fprintf to unknown stream 0x{stream:08x}: {text}");
     }
@@ -9346,7 +9467,7 @@ fn render_printf_va(
                 precision = Some(digits.min(0x10000));
             }
         }
-        let (long, short) = scan_length_mods(&mut chars);
+        let (long, short, integer64) = scan_printf_length(&mut chars);
         let conv = match chars.next() {
             Some(c) => c,
             None => break,
@@ -9354,6 +9475,18 @@ fn render_printf_va(
         let mut piece = String::new();
         match conv {
             '%' => piece.push('%'),
+            'd' | 'i' | 'u' | 'x' | 'X' if integer64 => {
+                let low = read_va(ctx, next_off)?;
+                let high = read_va(ctx, next_off + 4)?;
+                next_off += 8;
+                let value = u64::from(low) | (u64::from(high) << 32);
+                piece = match conv {
+                    'd' | 'i' => (value as i64).to_string(),
+                    'x' => format!("{value:x}"),
+                    'X' => format!("{value:X}"),
+                    _ => value.to_string(),
+                };
+            }
             'd' | 'i' => {
                 let v = read_va(ctx, next_off)? as i32;
                 next_off += 4;
@@ -9654,6 +9787,9 @@ fn create_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     });
     match result {
         Ok(r) => {
+            if ctx.kernel.vfs.console_open(r.handle).is_some() {
+                ctx.kernel.ensure_console_window();
+            }
             if disposition == 2 || disposition == 4 {
                 set_thread_error(ctx, if r.existed { 183 } else { 0 });
             }
@@ -9686,11 +9822,12 @@ fn read_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if ctx.kernel.vfs.bluetooth_open(bt_handle).is_some() {
         return crate::bluetooth::read_file(ctx);
     }
-    let handle = ctx.arg_u32(0)?;
+    let original = ctx.arg_u32(0)?;
+    let handle = console::file_handle(ctx, original).unwrap_or(INVALID_HANDLE_VALUE);
     let buf_p = ctx.arg_u32(1)?;
     let count = ctx.arg_u32(2)?;
     let out_read_p = ctx.arg_u32(3)?;
-    if !ctx.kernel.vfs.is_open(handle) {
+    if !console::stream_is_open(ctx.kernel, handle) {
         set_thread_error(ctx, ERROR_INVALID_HANDLE);
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
@@ -9700,13 +9837,23 @@ fn read_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         set_thread_error(ctx, 87);
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
+    if count != 0 {
+        if let Some(outcome) = console::wait_input(ctx, handle)? {
+            return Ok(outcome);
+        }
+    }
     let mut buf = Vec::new();
     if buf.try_reserve_exact(count as usize).is_err() {
         set_thread_error(ctx, 8);
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     buf.resize(count as usize, 0);
-    let Some(n) = ctx.kernel.vfs.read(handle, &mut buf) else {
+    let read = if ctx.kernel.vfs.console_open(handle).is_some() {
+        console::read_bytes(ctx, handle, &mut buf)
+    } else {
+        ctx.kernel.vfs.read(handle, &mut buf)
+    };
+    let Some(n) = read else {
         set_thread_error(ctx, ctx.kernel.vfs.read_failure_error(handle));
         return Ok(DispatchOutcome::ReturnedR0(0));
     };
@@ -9768,7 +9915,8 @@ fn write_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if ctx.kernel.vfs.bluetooth_open(bt_handle).is_some() {
         return crate::bluetooth::write_file(ctx);
     }
-    let handle = ctx.arg_u32(0)?;
+    let original = ctx.arg_u32(0)?;
+    let handle = console::file_handle(ctx, original).unwrap_or(INVALID_HANDLE_VALUE);
     let buf_p = ctx.arg_u32(1)?;
     let count = ctx.arg_u32(2)?;
     let out_written_p = ctx.arg_u32(3)?;
@@ -9782,7 +9930,7 @@ fn write_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         }
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    if !ctx.kernel.vfs.is_open(handle) {
+    if !console::stream_is_open(ctx.kernel, handle) {
         set_thread_error(ctx, ERROR_INVALID_HANDLE);
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
@@ -9817,7 +9965,12 @@ fn write_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             return Ok(DispatchOutcome::ReturnedR0(0));
         }
     };
-    let Some(n) = ctx.kernel.vfs.write(handle, &bytes) else {
+    let written = if ctx.kernel.vfs.console_open(handle).is_some() {
+        console::write_bytes(ctx, handle, &bytes)
+    } else {
+        ctx.kernel.vfs.write(handle, &bytes)
+    };
+    let Some(n) = written else {
         let error = ctx.kernel.vfs.write_failure_error(handle);
         set_thread_error(ctx, error);
         return Ok(DispatchOutcome::ReturnedR0(0));
@@ -9836,8 +9989,9 @@ fn write_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn flush_file_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let handle = ctx.arg_u32(0)?;
-    if !ctx.kernel.vfs.is_open(handle) {
+    let original = ctx.arg_u32(0)?;
+    let handle = console::file_handle(ctx, original).unwrap_or(INVALID_HANDLE_VALUE);
+    if !console::stream_is_open(ctx.kernel, handle) {
         set_thread_error(ctx, ERROR_INVALID_HANDLE);
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
@@ -9969,6 +10123,14 @@ fn delete_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 fn move_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let result = vfs_api_path(ctx, 0)
         .and_then(|from| vfs_api_path(ctx, 1).and_then(|to| ctx.kernel.vfs.rename(&from, &to)));
+    vfs_api_bool(ctx, result)
+}
+
+fn delete_and_rename_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // CE's first argument is the old destination; the second is the new file.
+    let result = vfs_api_path(ctx, 0).and_then(|destination| {
+        vfs_api_path(ctx, 1).and_then(|source| ctx.kernel.vfs.replace_file(&destination, &source))
+    });
     vfs_api_bool(ctx, result)
 }
 
@@ -10253,12 +10415,17 @@ fn crt_wfopen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn crt_fclose(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let h = ctx.arg_u32(0)?;
+    let stream = ctx.arg_u32(0)?;
+    let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
     let result = if ctx.kernel.vfs.flush(h).is_ok() && close_owned_handle(ctx.kernel, h) {
         0
     } else {
         u32::MAX
     };
+    if let Some(id) = console::standard_id(stream) {
+        ctx.kernel.console.closed[id] = true;
+        ctx.kernel.console.streams[id] = None;
+    }
     Ok(DispatchOutcome::ReturnedR0(result))
 }
 
@@ -10299,10 +10466,27 @@ fn crt_fpreset(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn crt_fflush(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let h = ctx.arg_u32(0)?;
+    let stream = ctx.arg_u32(0)?;
+    if stream == 0 {
+        let success = ctx
+            .kernel
+            .vfs
+            .open_handles()
+            .into_iter()
+            .filter(|h| console::stream_is_open(ctx.kernel, *h))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .all(|h| ctx.kernel.vfs.flush(h).is_ok());
+        return Ok(DispatchOutcome::ReturnedR0(if success {
+            0
+        } else {
+            u32::MAX
+        }));
+    }
+    let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
     let success = ctx.kernel.vfs.flush(h).is_ok();
     if !success {
-        ctx.kernel.crt_stream_errors.insert(h);
+        ctx.kernel.crt_stream_errors.insert(stream);
     }
     Ok(DispatchOutcome::ReturnedR0(if success {
         0
@@ -10313,14 +10497,36 @@ fn crt_fflush(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 /// Sticky FILE error state is independent of EOF and Win32 LastError.
 fn read_stdio_raw(ctx: &mut CallCtx<'_>, stream: u32, bytes: &mut [u8]) -> Option<usize> {
-    let result = ctx.kernel.vfs.read(stream, bytes);
+    let handle = console::stream_handle(ctx, stream)?;
+    let result = if let Some(console) = ctx.kernel.vfs.console_open(handle) {
+        if console.access & 1 != 0
+            && !console
+                .device
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .input_available()
+        {
+            // A short console read is not an I/O error or EOF. The next CRT
+            // call waits at its own thunk when no committed input remains.
+            Some(0)
+        } else {
+            console::read_bytes(ctx, handle, bytes)
+        }
+    } else {
+        ctx.kernel.vfs.read(handle, bytes)
+    };
     if result.is_none() {
         ctx.kernel.crt_stream_errors.insert(stream);
     }
     result
 }
 fn write_stdio_raw(ctx: &mut CallCtx<'_>, stream: u32, bytes: &[u8]) -> Option<usize> {
-    let result = ctx.kernel.vfs.write(stream, bytes);
+    let handle = console::stream_handle(ctx, stream)?;
+    let result = if ctx.kernel.vfs.console_open(handle).is_some() {
+        console::write_bytes(ctx, handle, bytes)
+    } else {
+        ctx.kernel.vfs.write(handle, bytes)
+    };
     if result.is_none_or(|written| written < bytes.len()) {
         ctx.kernel.crt_stream_errors.insert(stream);
     }
@@ -10328,8 +10534,10 @@ fn write_stdio_raw(ctx: &mut CallCtx<'_>, stream: u32, bytes: &[u8]) -> Option<u
 }
 fn crt_ferror(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let stream = ctx.arg_u32(0)?;
+    let target = console::standard_id(stream).and_then(|i| ctx.kernel.console.streams[i]);
     Ok(DispatchOutcome::ReturnedR0(u32::from(
-        ctx.kernel.crt_stream_errors.contains(&stream),
+        ctx.kernel.crt_stream_errors.contains(&stream)
+            || target.is_some_and(|h| ctx.kernel.crt_stream_errors.contains(&h)),
     )))
 }
 
@@ -10390,10 +10598,21 @@ fn crt_fread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let buf = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
     let count = ctx.arg_u32(2)?;
-    let h = ctx.arg_u32(3)?;
-    let total = size.saturating_mul(count);
-    if !ctx.kernel.vfs.is_open(h) || total == 0 {
+    let stream = ctx.arg_u32(3)?;
+    let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
+    let Some(total) = size.checked_mul(count) else {
+        ctx.kernel.crt_stream_errors.insert(stream);
         return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if !console::stream_is_open(ctx.kernel, h) || total == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if !vfs_probe_output(ctx, buf, total) {
+        ctx.kernel.crt_stream_errors.insert(stream);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if let Some(outcome) = console::wait_input(ctx, h)? {
+        return Ok(outcome);
     }
     let mut tmp = vec![0u8; total as usize];
     let n = read_stdio_bytes(ctx, h, &mut tmp);
@@ -10419,9 +10638,17 @@ fn crt_fwrite(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let buf = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
     let count = ctx.arg_u32(2)?;
-    let h = ctx.arg_u32(3)?;
-    let total = size.saturating_mul(count);
-    if !ctx.kernel.vfs.is_open(h) || total == 0 {
+    let stream = ctx.arg_u32(3)?;
+    let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
+    let Some(total) = size.checked_mul(count) else {
+        ctx.kernel.crt_stream_errors.insert(stream);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if !console::stream_is_open(ctx.kernel, h) || total == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if buf == 0 || ctx.cpu.check_guest_access(buf, total, Prot::READ).is_err() {
+        ctx.kernel.crt_stream_errors.insert(stream);
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     let bytes = ctx.cpu.read_mem(buf, total)?;
@@ -10432,7 +10659,8 @@ fn crt_fwrite(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn crt_fseek(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     use pocket_kernel::vfs::SeekKind;
-    let h = ctx.arg_u32(0)?;
+    let stream = ctx.arg_u32(0)?;
+    let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
     let off = ctx.arg_u32(1)? as i32 as i64;
     let whence = ctx.arg_u32(2)?;
     let kind = match whence {
@@ -10515,7 +10743,18 @@ fn crt_fsetpos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn crt_feof(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     use pocket_kernel::vfs::SeekKind;
-    let h = ctx.arg_u32(0)?;
+    let stream = ctx.arg_u32(0)?;
+    let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
+    if let Some(console) = ctx.kernel.vfs.console_open(h) {
+        return Ok(DispatchOutcome::ReturnedR0(u32::from(
+            console
+                .device
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .at_eof()
+                && !ctx.kernel.crt_pushback.contains_key(&h),
+        )));
+    }
     let size = ctx.kernel.vfs.size(h).unwrap_or(0);
     let pos = ctx.kernel.vfs.seek(h, 0, SeekKind::Current).unwrap_or(0);
     Ok(DispatchOutcome::ReturnedR0(
@@ -10540,9 +10779,10 @@ fn crt_rewind(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// One byte of FILE pushback, independent of the underlying file contents.
 /// EOF and a second outstanding pushback fail without altering stream state.
 fn crt_ungetc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let (character, handle) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
+    let (character, stream) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
+    let handle = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
     if character == u32::MAX
-        || !ctx.kernel.vfs.is_open(handle)
+        || !console::stream_is_open(ctx.kernel, handle)
         || ctx.kernel.crt_pushback.contains_key(&handle)
     {
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
@@ -10552,9 +10792,15 @@ fn crt_ungetc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn crt_fgetc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let h = ctx.arg_u32(0)?;
-    if !ctx.kernel.vfs.is_open(h) {
+    let stream = ctx.arg_u32(0)?;
+    let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
+    if !console::stream_is_open(ctx.kernel, h) {
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    if !ctx.kernel.crt_pushback.contains_key(&h) {
+        if let Some(outcome) = console::wait_input(ctx, h)? {
+            return Ok(outcome);
+        }
     }
     let mut buf = [0u8; 1];
     let n = read_stdio_bytes(ctx, h, &mut buf);
@@ -10567,8 +10813,9 @@ fn crt_fgetc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn crt_fputc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let c = ctx.arg_u32(0)?;
-    let h = ctx.arg_u32(1)?;
-    if !ctx.kernel.vfs.is_open(h) {
+    let stream = ctx.arg_u32(1)?;
+    let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
+    if !console::stream_is_open(ctx.kernel, h) {
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
     }
     let result = write_stdio_raw(ctx, h, &[c as u8]);
@@ -10625,9 +10872,19 @@ fn read_stdio_line(ctx: &mut CallCtx<'_>, h: u32, max: usize, text_mode: bool) -
 fn crt_fgets(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let buf = ctx.arg_u32(0)?;
     let n = ctx.arg_u32(1)?;
-    let h = ctx.arg_u32(2)?;
-    if buf == 0 || n <= 1 || !ctx.kernel.vfs.is_open(h) {
+    let stream = ctx.arg_u32(2)?;
+    let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
+    if buf == 0 || n <= 1 || !console::stream_is_open(ctx.kernel, h) {
         return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if !vfs_probe_output(ctx, buf, n) {
+        ctx.kernel.crt_stream_errors.insert(stream);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if !ctx.kernel.crt_pushback.contains_key(&h) {
+        if let Some(outcome) = console::wait_input(ctx, h)? {
+            return Ok(outcome);
+        }
     }
     let text_mode = ctx.kernel.vfs.is_text_mode(h);
     let mut out = read_stdio_line(ctx, h, n as usize, text_mode);
@@ -10642,8 +10899,20 @@ fn crt_fgets(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn crt_fgetws(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let buf = ctx.arg_u32(0)?;
     let n = ctx.arg_u32(1)?;
-    let h = ctx.arg_u32(2)?;
+    let stream = ctx.arg_u32(2)?;
+    if let Some(outcome) = console::read_wide_line(ctx, stream, buf, n)? {
+        return Ok(outcome);
+    }
+    let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
     if buf == 0 || n <= 1 || !ctx.kernel.vfs.is_open(h) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let Some(bytes) = n.checked_mul(2) else {
+        ctx.kernel.crt_stream_errors.insert(stream);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if !vfs_probe_output(ctx, buf, bytes) {
+        ctx.kernel.crt_stream_errors.insert(stream);
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     let text_mode = ctx.kernel.vfs.is_text_mode(h);
@@ -10653,19 +10922,21 @@ fn crt_fgetws(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     // Like fgets, fgetws retains a newline when it fits in the buffer.
     // Dropping it joins lines when guest parsers rewrite property files.
-    let mut wide = Vec::with_capacity(out.len() + 1);
-    for byte in out {
-        wide.extend_from_slice(&(byte as u16).to_le_bytes());
-    }
-    wide.extend_from_slice(&0u16.to_le_bytes());
+    let wide = wide_to_bytes(
+        &crate::crt_ansi::decode(&out)
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>(),
+    );
     ctx.cpu.write_mem(buf, &wide)?;
     Ok(DispatchOutcome::ReturnedR0(buf))
 }
 
 fn crt_fputs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let s_p = ctx.arg_u32(0)?;
-    let h = ctx.arg_u32(1)?;
-    if !ctx.kernel.vfs.is_open(h) {
+    let stream = ctx.arg_u32(1)?;
+    let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
+    if !console::stream_is_open(ctx.kernel, h) {
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
     }
     let s = read_cstr(ctx, s_p, 4096)?;
@@ -10683,22 +10954,14 @@ fn crt_fputws(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if text_ptr == 0 {
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
     }
-    if std_file_label(stream).is_some() {
-        let text = String::from_utf16_lossy(&read_wstr(ctx, text_ptr, 4096)?);
-        emit_stream_text(ctx, stream, &text)?;
-        return Ok(DispatchOutcome::ReturnedR0(0));
-    }
-    if !ctx.kernel.vfs.is_open(stream) {
-        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
-    }
     let text = String::from_utf16_lossy(&read_wstr(ctx, text_ptr, 4096)?);
-    let bytes = text.as_bytes();
-    let written = write_stdio_raw(ctx, stream, bytes).unwrap_or(0);
-    Ok(DispatchOutcome::ReturnedR0(if written == bytes.len() {
-        0
-    } else {
-        u32::MAX
-    }))
+    Ok(DispatchOutcome::ReturnedR0(
+        if console::write_text(ctx, stream, &text, true) {
+            0
+        } else {
+            u32::MAX
+        },
+    ))
 }
 
 // ---------- ARM compiler integer division helpers ----------
@@ -11581,6 +11844,13 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
                     ctx.cpu.write_reg(ArmReg::Lr, frame.lr)?;
                     finish_window_callback(ctx.kernel);
                     queue_window_paint(ctx.kernel, hwnd);
+                    if window_is_visible(ctx.kernel, hwnd) {
+                        system_sound::window_event(
+                            ctx.kernel,
+                            hwnd,
+                            pocket_kernel::system_sound::SystemEvent::Open,
+                        );
+                    }
                     return Ok(DispatchOutcome::ReturnedR0(hwnd));
                 }
                 let result = ctx.cpu.read_reg(ArmReg::R0)?;
@@ -11633,6 +11903,13 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
                 // Visible children need their first paint even when the app
                 // never calls ShowWindow again after WS_VISIBLE creation.
                 queue_window_paint(ctx.kernel, hwnd);
+                if window_is_visible(ctx.kernel, hwnd) {
+                    system_sound::window_event(
+                        ctx.kernel,
+                        hwnd,
+                        pocket_kernel::system_sound::SystemEvent::Open,
+                    );
+                }
                 return Ok(DispatchOutcome::ReturnedR0(hwnd));
             }
         }
@@ -11944,6 +12221,13 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             ctx.kernel.pending_create = Some((hwnd, create_struct));
         }
     }
+    if window_is_visible(ctx.kernel, hwnd) {
+        system_sound::window_event(
+            ctx.kernel,
+            hwnd,
+            pocket_kernel::system_sound::SystemEvent::Open,
+        );
+    }
     Ok(DispatchOutcome::ReturnedR0(hwnd))
 }
 
@@ -12022,6 +12306,7 @@ fn show_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // dialog it built from a template. Solitaire shows and hides its
     // Time and Score readouts this way.
     let cmd_show = ctx.arg_u32(1).unwrap_or(1);
+    let was_visible = window_is_visible(ctx.kernel, hwnd);
     if ctx.kernel.ce.windows.enabled {
         match cmd_show {
             2 | 6 | 7 | 11 => {
@@ -12043,6 +12328,13 @@ fn show_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         }
     }
     let show = cmd_show != SW_HIDE;
+    if show && !was_visible {
+        system_sound::window_event(
+            ctx.kernel,
+            hwnd,
+            pocket_kernel::system_sound::SystemEvent::Open,
+        );
+    }
     if let Some((style, _)) = ctx.kernel.window_styles.get_mut(&hwnd) {
         if show {
             *style |= 0x1000_0000;
@@ -13426,7 +13718,9 @@ fn control_message(
             | ControlClass::Progress => 0x100,
             ControlClass::Header => 0x100,
             ControlClass::ComboBox => {
-                0x81 | if wparam == 0x0d || (wparam == 0x1b && c.choice_open) {
+                0x81 | if (wparam == 0x0d && (!c.has_combo_edit() || c.choice_open))
+                    || (wparam == 0x1b && c.choice_open)
+                {
                     4
                 } else {
                     0
@@ -13497,19 +13791,35 @@ fn control_message(
             .kernel
             .controls
             .get(hwnd)
-            .is_some_and(|c| c.class == ControlClass::Edit)
+            .is_some_and(|c| c.class == ControlClass::Edit || c.has_combo_edit())
     {
         let child = ctx.kernel.controls.get_mut(hwnd).unwrap();
         let mut changed = false;
-        if child.enabled && child.style & 0x800 == 0 {
+        if child.enabled && child.is_text_editable() {
             if wparam == 8 {
-                changed = child.text.pop().is_some();
+                let removed = child.text.pop();
+                changed = removed.is_some();
+                if removed == Some('\n')
+                    && child.class == ControlClass::Edit
+                    && child.style & 4 != 0
+                    && child.text.ends_with('\r')
+                {
+                    child.text.pop();
+                }
+            } else if wparam == 13 && child.class == ControlClass::Edit && child.style & 4 != 0 {
+                // Owner's Notes page uses a multiline edit. Preserve the CE
+                // CRLF representation without accepting Enter in single-line fields.
+                child.text.push_str("\r\n");
+                changed = true;
             } else if wparam >= 32 {
                 if let Some(ch) = char::from_u32(wparam) {
                     child.text.push(ch);
                     changed = true;
                 }
             }
+        }
+        if changed && child.has_combo_edit() {
+            child.list_selected = None;
         }
         if changed {
             repaint_controls(ctx);
@@ -14308,7 +14618,12 @@ fn control_action_message(
                 .get(hwnd)
                 .is_some_and(|c| matches!(c.class, ControlClass::ListBox | ControlClass::ComboBox))
             {
-                return Some(Some((parent, WM_COMMAND, (1 << 16) | (id & 0xffff), hwnd)));
+                return Some(Some((
+                    parent,
+                    WM_COMMAND,
+                    (code << 16) | (id & 0xffff),
+                    hwnd,
+                )));
             }
             let key = (hwnd, -1001);
             let ptr = if let Some(ptr) = ctx.kernel.window_extra.get(&key).copied() {
@@ -14574,40 +14889,17 @@ fn get_focus(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// field on `WM_INITDIALOG` depends on it landing somewhere real, or the
 /// caret sits on nothing and typed keys go to the application instead.
 fn set_focus(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let hwnd = ctx.arg_u32(0)?;
-    let previous = ctx.kernel.controls.focus;
-    if ctx
-        .kernel
-        .controls
-        .get(hwnd)
-        .is_some_and(|c| c.is_focusable())
-    {
-        ctx.kernel.controls.focus = hwnd;
-        repaint_controls(ctx);
-    } else if hwnd == 0 || is_live_hwnd(hwnd) {
-        // Focus moved off the controls onto the top-level window.
-        ctx.kernel.controls.focus = if ctx.kernel.window_procs.contains_key(&hwnd) {
-            hwnd
-        } else {
-            0
-        };
-        if previous != ctx.kernel.controls.focus {
-            repaint_controls(ctx);
-        }
-    }
-    remember_window_focus(ctx.kernel);
-    crate::shell_keyboard::service(ctx);
-    Ok(DispatchOutcome::ReturnedR0(if previous != 0 {
-        previous
-    } else {
-        FAKE_HWND
-    }))
+    focus::set(ctx)
 }
 
 // Ordinary Pocket PC dialogs are positioned within the work area. Dialogs
 // initialized by the shell already account for the navigation bar internally.
 fn dialog_work_area_top(kernel: &KernelState, hwnd: u32) -> Option<i32> {
     if kernel.pocket_pc_taskbar_visible()
+        && !kernel
+            .window_styles
+            .get(&hwnd)
+            .is_some_and(|style| style.0 & 0x4000_0000 != 0)
         && !kernel
             .controls
             .panel(hwnd)
@@ -14672,23 +14964,39 @@ fn move_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// route: the caller may ask for the move only, the resize only, or
 /// neither, via `SWP_NOMOVE` / `SWP_NOSIZE`.
 fn set_window_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let args = [
+        ctx.arg_u32(0)?,
+        ctx.arg_u32(1)?,
+        ctx.arg_u32(2)?,
+        ctx.arg_u32(3)?,
+        ctx.arg_u32(4)?,
+        ctx.arg_u32(5)?,
+        ctx.arg_u32(6)?,
+    ];
+    set_window_pos_values(ctx, args)
+}
+
+fn set_window_pos_values(
+    ctx: &mut CallCtx<'_>,
+    args: [u32; 7],
+) -> Result<DispatchOutcome, KernelError> {
     /// `SWP_NOSIZE`.
     const SWP_NOSIZE: u32 = 0x0001;
     /// `SWP_NOMOVE`.
     const SWP_NOMOVE: u32 = 0x0002;
 
-    let hwnd = ctx.arg_u32(0)?;
-    let insert_after = ctx.arg_u32(1)?;
-    let x = ctx.arg_u32(2)? as i32;
-    let y = ctx.arg_u32(3)? as i32;
+    let hwnd = args[0];
+    let insert_after = args[1];
+    let x = args[2] as i32;
+    let y = args[3] as i32;
     let y = if ctx.kernel.controls.panel(hwnd).is_some() {
         dialog_work_area_top(ctx.kernel, hwnd).map_or(y, |top| y.max(top))
     } else {
         y
     };
-    let w = ctx.arg_u32(4)? as i32;
-    let h = ctx.arg_u32(5)? as i32;
-    let flags = ctx.arg_u32(6).unwrap_or(0);
+    let w = args[4] as i32;
+    let h = args[5] as i32;
+    let flags = args[6];
     let old_rect = ctx
         .kernel
         .window_rects
@@ -17006,7 +17314,20 @@ fn advance_control_notify(
             .copied()
             .filter(|p| *p != 0)
         {
-            let code = if state.stage == 0 { 0x400 } else { 0x300 };
+            // The native Explorer Run dialog enables OK on CBN_EDITCHANGE.
+            // Reuse the per-thread notification continuation with combo codes,
+            // preserving EDIT's EN_UPDATE / EN_CHANGE notifications.
+            let combo = ctx
+                .kernel
+                .controls
+                .get(state.hwnd)
+                .is_some_and(|control| control.has_combo_edit());
+            let code = match (combo, state.stage) {
+                (true, 0) => 6,
+                (true, _) => 5,
+                (false, 0) => 0x400,
+                (false, _) => 0x300,
+            };
             state.stage += 1;
             ctx.cpu.write_reg(ArmReg::R0, state.parent)?;
             ctx.cpu.write_reg(ArmReg::R1, WM_COMMAND)?;
@@ -17378,9 +17699,10 @@ fn def_window_proc_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
         }
         let result = control_message(ctx, hwnd, message, wp, lp)?;
         let control = ctx.kernel.controls.get(hwnd).unwrap();
-        let notify = control.class == ControlClass::Edit
+        let notify = (control.class == ControlClass::Edit
             && ((message == 0xc && control.style & 4 == 0)
-                || (message == 0x102 && control.text != before));
+                || (message == 0x102 && control.text != before)))
+            || (control.has_combo_edit() && message == 0x102 && control.text != before);
         if notify {
             let state = pocket_kernel::ControlNotifyFrame {
                 thread: ctx.kernel.current_thread,
@@ -17969,19 +18291,38 @@ fn delete_dc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn set_bk_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dc = ctx.arg_u32(0)?;
     let mode = ctx.arg_u32(1)?;
-    if let Some(d) = ctx.kernel.gdi.dc_mut(dc) {
-        d.bk_transparent = mode == 1; // TRANSPARENT
+    if !matches!(mode, 1 | 2) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    Ok(DispatchOutcome::ReturnedR0(0))
+    // Pocket Word's native RichEdit abandons its offscreen text paint when
+    // this returns zero. Success returns the previous mode, never a BOOL.
+    let previous = ctx.kernel.gdi.dc_mut(dc).map_or(0, |d| {
+        let previous = if d.bk_transparent { 1 } else { 2 };
+        d.bk_transparent = mode == 1;
+        previous
+    });
+    Ok(DispatchOutcome::ReturnedR0(previous))
+}
+
+fn get_bk_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let mode = ctx
+        .kernel
+        .gdi
+        .dc(dc)
+        .map_or(0, |d| if d.bk_transparent { 1 } else { 2 });
+    Ok(DispatchOutcome::ReturnedR0(mode))
 }
 
 fn set_bk_color(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dc = ctx.arg_u32(0)?;
     let color = ctx.arg_u32(1)?;
-    if let Some(d) = ctx.kernel.gdi.dc_mut(dc) {
+    let previous = ctx.kernel.gdi.dc_mut(dc).map_or(u32::MAX, |d| {
+        let previous = d.bk_color;
         d.bk_color = color;
-    }
-    Ok(DispatchOutcome::ReturnedR0(0))
+        previous
+    });
+    Ok(DispatchOutcome::ReturnedR0(previous))
 }
 
 /// COLORREF GetBkColor(HDC hdc) — return the background color stored
@@ -19288,7 +19629,7 @@ fn sh_load_dibitmap(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     // and, for relative paths, mounted-card basenames. A direct VFS lookup
     // alone can fail for Skystriker's data\menu.bmp even when fopen can
     // open the same file. Keep the fast path, then reuse fopen's resolver.
-    let bytes = read_guest_file(ctx, &path).or_else(|| {
+    let bytes = read_guest_file_for(ctx, &path).or_else(|| {
         let handle = open_cstr_path(ctx, &path, "rb");
         if handle == 0 {
             return None;
@@ -19946,6 +20287,9 @@ fn output_debug_string_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
 /// and expects the `WM_DESTROY` that follows to reach its `WndProc`,
 /// which is where its `PostQuitMessage` lives.
 fn destroy_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let Some(outcome) = send_timeout::destroy_on_owner(ctx)? {
+        return Ok(outcome);
+    }
     let sp = ctx.cpu.read_reg(ArmReg::Sp)?;
     let mut pending = if let Some(index) = callback_frame_index(
         &ctx.kernel.window_destroy_frames,
@@ -19961,6 +20305,13 @@ fn destroy_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         {
             set_thread_error(ctx, 1400);
             return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        if window_is_visible(ctx.kernel, hwnd) {
+            system_sound::window_event(
+                ctx.kernel,
+                hwnd,
+                pocket_kernel::system_sound::SystemEvent::Close,
+            );
         }
         fn collect(
             kernel: &KernelState,
@@ -20427,99 +20778,30 @@ fn play_sound_impl(
     flags: u32,
     wide: bool,
 ) -> Result<DispatchOutcome, KernelError> {
-    const SND_ASYNC: u32 = 0x0001;
-    const SND_LOOP: u32 = 0x0008;
-    const SND_NOSTOP: u32 = 0x0010;
-    const SND_RESOURCE: u32 = 0x0004_0004;
-    const SND_MEMORY: u32 = 0x0004;
-
-    if sound == 0 {
-        // NULL is the stop request for both PlaySound and sndPlaySound.
-        // Playback flags (including SND_NODEFAULT) do not turn it into a no-op.
-        // Fade's script STOP command uses sndPlaySoundW(NULL, SND_NODEFAULT).
-        ctx.kernel.audio.flush();
-        log::debug!("PlaySoundW(NULL, flags=0x{flags:08x}) -> stopped");
-        return Ok(DispatchOutcome::ReturnedR0(1));
-    }
-    if flags & SND_RESOURCE == SND_RESOURCE {
-        let name = if wide {
-            read_wide_resource_key(ctx, sound)?
-        } else {
-            if sound <= 0xffff {
-                ResourceKey::Id(sound)
-            } else {
-                ResourceKey::Name(crate::crt_ansi::decode(&read_cstr(ctx, sound, 260)?))
-            }
-        };
-        if let Some((resource, base)) =
-            lookup_resource(ctx.kernel, module, &ResourceKey::Name("WAVE".into()), &name)
-                .or_else(|| lookup_resource(ctx.kernel, module, &ResourceKey::Id(10), &name))
-        {
-            let va = base.wrapping_add(resource.data_rva);
-            let bytes = ctx.cpu.read_mem(va, resource.size)?;
-            let ok = submit_wave_bytes(ctx, &bytes, flags, "resource")?;
-            log::debug!(
-                "PlaySoundW(resource={name:?}, bytes={}, async={}, loop={}) -> {ok}",
-                bytes.len(),
-                flags & SND_ASYNC != 0,
-                flags & SND_LOOP != 0
-            );
-            return Ok(DispatchOutcome::ReturnedR0(ok as u32));
-        }
-        log::debug!("PlaySoundW(resource={name:?}) -> missing");
-        return Ok(DispatchOutcome::ReturnedR0(0));
-    }
-    let bytes = if flags & SND_MEMORY != 0 {
-        // SND_MEMORY points at a RIFF/WAVE image, not a resource-table entry.
-        let header = ctx.cpu.read_mem(sound, 12)?;
-        if &header[..4] != b"RIFF" || &header[8..12] != b"WAVE" {
-            return Ok(DispatchOutcome::ReturnedR0(0));
-        }
-        let Some(size) = u32::from_le_bytes(header[4..8].try_into().unwrap())
-            .checked_add(8)
-            .filter(|n| (12..=64 * 1024 * 1024).contains(n))
-        else {
-            return Ok(DispatchOutcome::ReturnedR0(0));
-        };
-        ctx.cpu.read_mem(sound, size)?
-    } else {
-        let path = if wide {
-            String::from_utf16_lossy(&read_wstr(ctx, sound, 260)?)
-        } else {
-            crate::crt_ansi::decode(&read_cstr(ctx, sound, 260)?)
-        };
-        read_guest_file(ctx, &path).unwrap_or_default()
-    };
-    let ok = if bytes.is_empty() {
-        false
-    } else {
-        submit_wave_bytes(ctx, &bytes, flags, "file")?
-    };
-    log::debug!(
-        "PlaySoundW(sound=0x{sound:08x}, bytes={}, async={}, loop={}, nostop={}) -> {ok}",
-        bytes.len(),
-        flags & SND_ASYNC != 0,
-        flags & SND_LOOP != 0,
-        flags & SND_NOSTOP != 0
-    );
-    Ok(DispatchOutcome::ReturnedR0(ok as u32))
+    system_sound::play(ctx, sound, module, flags, wide)
 }
 
-fn read_guest_file(ctx: &mut CallCtx<'_>, path: &str) -> Option<Vec<u8>> {
+fn read_kernel_file(kernel: &mut KernelState, path: &str) -> Option<Vec<u8>> {
     use pocket_kernel::vfs::Access;
-    let handle = ctx.kernel.vfs.open(path, Access::Read, false)?;
-    let size = ctx.kernel.vfs.size(handle)? as usize;
-    let mut bytes = vec![0u8; size];
-    let n = ctx.kernel.vfs.read(handle, &mut bytes)?;
-    let _ = ctx.kernel.vfs.close(handle);
-    bytes.truncate(n);
-    Some(bytes)
+    let handle = kernel.vfs.open(path, Access::Read, false)?;
+    let result = (|| {
+        let size = usize::try_from(kernel.vfs.size(handle)?).ok()?;
+        if size > 64 * 1024 * 1024 {
+            return None;
+        }
+        let mut bytes = vec![0u8; size];
+        let n = kernel.vfs.read(handle, &mut bytes)?;
+        bytes.truncate(n);
+        Some(bytes)
+    })();
+    kernel.vfs.close(handle);
+    result
 }
 
 /// Read a guest file by path. Shared with `hss.dll`, which loads its
 /// clips the same way `PlaySound` does.
 pub(crate) fn read_guest_file_for(ctx: &mut CallCtx<'_>, path: &str) -> Option<Vec<u8>> {
-    read_guest_file(ctx, path)
+    read_kernel_file(ctx.kernel, path)
 }
 
 /// Read a NUL-terminated UTF-16 guest string as a `String`.
@@ -20533,7 +20815,7 @@ pub(crate) fn read_guest_wstr_lossy(
 
 /// Decode a PCM `.wav` into interleaved `i16` samples.
 ///
-/// Split out of [`submit_wave_bytes`] so `hss.dll` can reuse it: both
+/// Split out of [`play_sound_impl`] so `hss.dll` can reuse it: both
 /// paths accept exactly the formats [`parse_pcm_wave`] admits, and a
 /// second decoder would be a second set of rounding bugs.
 pub(crate) fn decode_pcm_wave(
@@ -20551,31 +20833,6 @@ pub(crate) fn decode_pcm_wave(
         _ => return None,
     };
     Some((fmt, samples))
-}
-
-fn submit_wave_bytes(
-    ctx: &mut CallCtx<'_>,
-    bytes: &[u8],
-    flags: u32,
-    source: &str,
-) -> Result<bool, KernelError> {
-    let Some((fmt, samples)) = decode_pcm_wave(bytes) else {
-        log::debug!(
-            "PlaySoundW {source}: unsupported/non-PCM WAV ({} bytes)",
-            bytes.len()
-        );
-        return Ok(false);
-    };
-    ctx.kernel.wave_out_format = fmt;
-    ctx.kernel.audio.set_guest_format(fmt);
-    if flags & 0x0040 != 0 {
-        ctx.kernel.audio.flush();
-    }
-    ctx.kernel
-        .audio
-        .play_voice(&samples, fmt, flags & 0x0008 != 0);
-    ctx.kernel.audio.start();
-    Ok(true)
 }
 
 fn parse_pcm_wave(bytes: &[u8]) -> Option<(pocket_kernel::audio::GuestFormat, &[u8])> {
@@ -21421,6 +21678,13 @@ fn message_box_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         let mut modal = MessageBox::new(&text, &caption, u_type, sw, sh);
         modal.set_movable(ctx.kernel.ce.windows.enabled);
         ctx.kernel.modal = Some(modal);
+        if ctx.kernel.ce.version.is_some() {
+            if let Some(event) =
+                pocket_kernel::system_sound::SystemEvent::from_message_beep(u_type & 0xf0)
+            {
+                system_sound::play_event(ctx.kernel, event);
+            }
+        }
         ctx.kernel.message_box_spins = 0;
         ctx.kernel.framebuffer.mark_dirty();
     }
@@ -22368,15 +22632,61 @@ fn stretch_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-/// `BOOL GetTextExtentExPointW(HDC hdc, LPCWSTR lpszStr, int cchString,
-///                   int nMaxExtent, LPINT lpnFit, LPINT alpDx,
-///                   LPSIZE lpSize)`
-///
-/// Measure UTF-16 with the selected LOGFONT and the same proportional
-/// advances as TextOut/DrawText. Unselected stock fonts retain 6x8 metrics.
-///
-/// `lpnFit` gets the number of chars that fit `nMaxExtent` and
-/// `alpDx` (when non-NULL) the cumulative advance per char.
+/// Query the selected font's UTF-16 face, including the terminating character
+/// in both size negotiation and a bounded copy. No drawing or readback occurs.
+fn get_text_face_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let capacity = ctx.arg_u32(1)? as i32;
+    let output = ctx.arg_u32(2)?;
+    let Some(dc) = ctx.kernel.gdi.dc(hdc) else {
+        set_thread_error(ctx, 6); // ERROR_INVALID_HANDLE
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let Some(pocket_kernel::gdi::GdiObject::Font(font)) = ctx.kernel.gdi.get(dc.selected_font)
+    else {
+        set_thread_error(ctx, 6);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    // Pocket Word queries the selected face while initializing its font combo.
+    // Stock System uses the bitmap renderer; unnamed explicit LOGFONTs use
+    // the same Arial-family default as text::resolve.
+    let mut name: Vec<u16> = font.logfont[28..]
+        .chunks_exact(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .take_while(|&unit| unit != 0)
+        .collect();
+    if name.is_empty() {
+        name.extend(
+            if dc.selected_font == STOCK_SYSTEM_FONT {
+                "System"
+            } else {
+                "Arial"
+            }
+            .encode_utf16(),
+        );
+    }
+    name.push(0);
+    if output == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(name.len() as u32));
+    }
+    if capacity <= 0 {
+        set_thread_error(ctx, 87); // ERROR_INVALID_PARAMETER
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let count = name.len().min(capacity as usize);
+    name[count - 1] = 0;
+    let bytes: Vec<u8> = name[..count]
+        .iter()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    if ctx.cpu.write_mem(output, &bytes).is_err() {
+        set_thread_error(ctx, 87);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    // GetTextFace counts the terminator, including in a truncated result.
+    Ok(DispatchOutcome::ReturnedR0(count as u32))
+}
+
 fn get_text_metrics_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let h = ctx.arg_u32(0)?;
     let p = ctx.arg_u32(1)?;
@@ -22389,6 +22699,15 @@ fn get_text_metrics_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         p != 0 && ctx.cpu.write_mem(p, &b).is_ok(),
     )))
 }
+/// `BOOL GetTextExtentExPointW(HDC hdc, LPCWSTR lpszStr, int cchString,
+///                   int nMaxExtent, LPINT lpnFit, LPINT alpDx,
+///                   LPSIZE lpSize)`
+///
+/// Measure UTF-16 with the selected LOGFONT and the same proportional
+/// advances as TextOut/DrawText. Unselected stock fonts retain 6x8 metrics.
+///
+/// `lpnFit` gets the number of chars that fit `nMaxExtent` and
+/// `alpDx` (when non-NULL) the cumulative advance per char.
 fn get_text_extent_ex_point_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hdc = ctx.arg_u32(0)?;
     let selected_font = selected_text_font(ctx.kernel, hdc);
@@ -23591,6 +23910,131 @@ fn open_process(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         return Ok(DispatchOutcome::ReturnedR0(0));
     };
     Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+fn open_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _access = ctx.arg_u32(0)?;
+    let inherit = ctx.arg_u32(1)?;
+    let tid = ctx.arg_u32(2)?;
+    if inherit != 0 {
+        set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let Some((pid, index)) = ctx.kernel.object_handles.thread_by_id(tid) else {
+        set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    // CE6 mstscax opens its own UI thread with SYNCHRONIZE before constructing
+    // the ActiveX object. A pseudo-handle would change identity on a worker.
+    let object = if pid == ctx.kernel.object_handles.process_id() {
+        HandleObject::Thread(index)
+    } else {
+        HandleObject::RemoteThread(pid, index)
+    };
+    let Some(handle) = ctx.kernel.object_handles.duplicate(object) else {
+        set_thread_error(ctx, 8);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+#[cfg(test)]
+mod open_thread_tests {
+    use super::*;
+    use crate::bluetooth::tests::{call, setup};
+    #[test]
+    fn opening_a_thread_id_returns_independent_handles_and_rejects_dead_ids() {
+        let (mut cpu, mut kernel, mut dispatcher) = setup();
+        let tid = kernel.object_handles.thread_id(0).unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let DispatchOutcome::ReturnedR0(handle) = call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "OpenThread",
+                &[0x100000, 0, tid],
+            ) else {
+                panic!("unexpected retry")
+            };
+            assert_ne!(handle, 0);
+            assert_ne!(handle, FAKE_CURRENT_THREAD_HANDLE);
+            assert_eq!(
+                kernel.object_handles.get(handle),
+                Some(HandleObject::Thread(0))
+            );
+            handles.push(handle);
+        }
+        assert_ne!(handles[0], handles[1]);
+        call(
+            &mut cpu,
+            &mut kernel,
+            &mut dispatcher,
+            "coredll.dll",
+            "CloseHandle",
+            &[handles[0]],
+        );
+        assert_eq!(kernel.object_handles.get(handles[0]), None);
+        assert_eq!(
+            kernel.object_handles.get(handles[1]),
+            Some(HandleObject::Thread(0))
+        );
+        call(
+            &mut cpu,
+            &mut kernel,
+            &mut dispatcher,
+            "coredll.dll",
+            "CloseHandle",
+            &[handles[1]],
+        );
+        kernel.object_handles.set_exit(Some(0), 0);
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "OpenThread",
+                &[0x100000, 0, tid]
+            ),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert_eq!(kernel.thread_last_errors[&0], ERROR_INVALID_PARAMETER);
+    }
+    #[test]
+    fn a_remote_thread_id_opens_the_shared_object_in_the_callers_namespace() {
+        let (mut cpu, mut kernel, mut dispatcher) = setup();
+        let (_, child) = kernel.object_handles.new_child().unwrap();
+        let tid = child.thread_id(0).unwrap();
+        let DispatchOutcome::ReturnedR0(handle) = call(
+            &mut cpu,
+            &mut kernel,
+            &mut dispatcher,
+            "coredll.dll",
+            "OpenThread",
+            &[0x100000, 0, tid],
+        ) else {
+            panic!("unexpected retry")
+        };
+        assert_ne!(handle, 0);
+        assert_eq!(
+            kernel.object_handles.get(handle),
+            Some(HandleObject::RemoteThread(child.process_id(), 0))
+        );
+        child.mark_inactive();
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "OpenThread",
+                &[0x100000, 0, tid]
+            ),
+            DispatchOutcome::ReturnedR0(0)
+        );
+    }
 }
 
 fn get_current_process(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -25042,6 +25486,11 @@ fn build_dialog_from_template_for(
                 base_y: line.height.max(1),
             }
         });
+    ctx.kernel
+        .ce
+        .window_aux
+        .dialog_units
+        .insert(owner_hwnd, [dlu.base_x, dlu.base_y]);
     let (px, py, pw, ph) = dlu.to_px(tmpl.x as i32, tmpl.y as i32, tmpl.cx as i32, tmpl.cy as i32);
     // Custom modal dialogs may deliberately omit the caption and draw
     // their own buttons. Modal ownership does not add window styles.
@@ -25068,7 +25517,11 @@ fn build_dialog_from_template_for(
     // if an app never does that.
     let (screen_w, screen_h) = screen_dims(ctx);
     let top = dialog_work_area_top(ctx.kernel, owner_hwnd).unwrap_or(0);
-    let (x, y) = if modal {
+    let (x, y) = if tmpl.style & 0x4000_0000 != 0 {
+        // Child-page coordinates belong to the parent client, including zero
+        // and negative offsets. The host renderer resolves their screen origin.
+        (px, py)
+    } else if modal {
         (
             ((screen_w as i32 - win_w) / 2).max(0),
             ((screen_h as i32 - win_h) / 2).max(top),
@@ -25104,11 +25557,9 @@ fn build_dialog_from_template_for(
     panel.set_caption_styles(tmpl.style, tmpl.ex_style);
     ctx.kernel.controls.add_panel(panel);
 
-    if modal {
-        ctx.kernel
-            .window_rects
-            .insert(owner_hwnd, (x, y, win_w, win_h));
-    }
+    ctx.kernel
+        .window_rects
+        .insert(owner_hwnd, (x, y, win_w, win_h));
     let instance = ctx.arg_u32(0).unwrap_or(FAKE_MODULE_HANDLE);
     for item in &tmpl.items {
         let class = match &item.class {
@@ -25466,8 +25917,32 @@ fn imm_release_context(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     Ok(DispatchOutcome::ReturnedR0(u32::from(valid)))
 }
 
+fn imm_notify_ime(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let context = ctx.arg_u32(0)?;
+    let action = ctx.arg_u32(1)?;
+    let index = ctx.arg_u32(2)?;
+    let value = ctx.arg_u32(3)?;
+    // Pocket Word completes composition when its document gains focus. The
+    // host keyboard delivers committed WM_CHAR text, so the default context
+    // has no pending composition to complete or cancel. Candidate conversion
+    // requires an actual IME provider and must not be reported as implemented.
+    let valid = Some(context) == imm_thread_context(ctx.kernel.current_thread)
+        && action == 0x15 // NI_COMPOSITIONSTR
+        && matches!(index, 1 | 4) // CPS_COMPLETE / CPS_CANCEL
+        && value == 0;
+    Ok(DispatchOutcome::ReturnedR0(u32::from(valid)))
+}
+
 fn is_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
+    if ctx.kernel.ce.windows.enabled {
+        return Ok(DispatchOutcome::ReturnedR0(u32::from(
+            ctx.kernel.window_rects.contains_key(&hwnd)
+                || ctx.kernel.window_classes.contains_key(&hwnd)
+                || ctx.kernel.controls.get(hwnd).is_some()
+                || ctx.kernel.controls.panel(hwnd).is_some(),
+        )));
+    }
     Ok(DispatchOutcome::ReturnedR0(u32::from(
         is_live_hwnd(hwnd) || ctx.kernel.window_classes.contains_key(&hwnd),
     )))
@@ -27018,6 +27493,46 @@ fn get_parent(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(parent))
 }
 
+fn is_child(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let parent = ctx.arg_u32(0)?;
+    let child = ctx.arg_u32(1)?;
+    let parent_exists = is_live_hwnd(parent)
+        || ctx.kernel.window_classes.contains_key(&parent)
+        || ctx.kernel.window_procs.contains_key(&parent)
+        || ctx.kernel.controls.get(parent).is_some()
+        || ctx.kernel.controls.panel(parent).is_some();
+    if !parent_exists || parent == 0 || child == 0 || parent == child {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    // Original Explorer asks whether focus is inside its native folder view.
+    // GetParent also follows popup owners; IsChild must follow WS_CHILD only.
+    let mut current = child;
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..64 {
+        if !visited.insert(current) {
+            break;
+        }
+        let next = if let Some(control) = ctx.kernel.controls.get(current) {
+            Some(control.parent)
+        } else if ctx
+            .kernel
+            .window_styles
+            .get(&current)
+            .is_some_and(|style| style.0 & 0x4000_0000 != 0)
+        {
+            ctx.kernel.window_parents.get(&current).copied()
+        } else {
+            None
+        };
+        match next {
+            Some(next) if next == parent => return Ok(DispatchOutcome::ReturnedR0(1)),
+            Some(next) if next != 0 => current = next,
+            _ => break,
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
 /// `HWND GetWindow(HWND, UINT)` — for synthetic windows we have no
 /// Z-order, so always say "no neighbour" (`NULL`).
 fn get_dlg_ctrl_id(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -27682,17 +28197,21 @@ fn split_search_pattern(path: &str) -> (String, String) {
 fn write_find_data(
     ctx: &mut CallCtx<'_>,
     out: u32,
-    entry: &(String, u64, bool, u32),
+    entry: &pocket_kernel::vfs::FindEntry,
 ) -> Result<(), KernelError> {
     if out == 0 {
         return Ok(());
     }
-    let (name, size, _is_dir, attrs) = entry;
+    let pocket_kernel::vfs::FindEntry { name, info } = entry;
     let mut buf = vec![0u8; FIND_DATA_BYTES];
     // Enumeration and GetFileAttributesW must describe the same object.
-    buf[0..4].copy_from_slice(&attrs.to_le_bytes());
-    buf[28..32].copy_from_slice(&((*size >> 32) as u32).to_le_bytes());
-    buf[32..36].copy_from_slice(&(*size as u32).to_le_bytes());
+    buf[0..4].copy_from_slice(&info.attributes.to_le_bytes());
+    for (index, time) in info.times.into_iter().enumerate() {
+        let at = 4 + index * 8;
+        buf[at..at + 8].copy_from_slice(&time.to_le_bytes());
+    }
+    buf[28..32].copy_from_slice(&((info.size >> 32) as u32).to_le_bytes());
+    buf[32..36].copy_from_slice(&(info.size as u32).to_le_bytes());
     let name_off = FIND_DATA_NAME_OFF as usize;
     for (index, unit) in name.encode_utf16().take(259).enumerate() {
         let at = name_off + index * 2;
@@ -27720,7 +28239,21 @@ fn find_first_flash_card(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
         .vfs
         .storage_cards()
         .into_iter()
-        .map(|name| (name, 0u64, true, 0x110u32))
+        .map(|name| {
+            let mut info = ctx
+                .kernel
+                .vfs
+                .file_information(&format!("\\{name}"))
+                .unwrap_or(pocket_kernel::vfs::FileInfo {
+                    attributes: 0x110,
+                    times: [0; 3],
+                    size: 0,
+                });
+            // FindFirstFlashCard reports a volume root as DIRECTORY|TEMPORARY.
+            // Preserve that contract even for a read-only host mount.
+            info.attributes = 0x110;
+            pocket_kernel::vfs::FindEntry { name, info }
+        })
         .collect();
     let Some(first) = entries.pop_front() else {
         set_thread_error(ctx, 18);
@@ -27747,28 +28280,21 @@ fn find_first_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
         return Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE));
     }
     if !pattern.contains('*') && !pattern.contains('?') {
-        if let Some(host) = ctx.kernel.vfs.resolve(&pattern) {
-            if let Ok(meta) = std::fs::metadata(&host) {
-                let name = pattern
-                    .rsplit(['\\', '/'])
-                    .next()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or(".")
-                    .to_string();
-                let attrs = ctx
-                    .kernel
-                    .vfs
-                    .attributes(&pattern)
-                    .unwrap_or(if meta.is_dir() { 0x10 } else { 0x80 });
-                let entry = (name, meta.len(), meta.is_dir(), attrs);
-                write_find_data(ctx, out, &entry)?;
-                let handle = FIND_HANDLE_BASE.saturating_add(ctx.kernel.next_find_handle);
-                ctx.kernel.next_find_handle = ctx.kernel.next_find_handle.wrapping_add(1);
-                ctx.kernel
-                    .find_handles
-                    .insert(handle, std::collections::VecDeque::new());
-                return Ok(DispatchOutcome::ReturnedR0(handle));
-            }
+        if let Ok(info) = ctx.kernel.vfs.file_information(&pattern) {
+            let name = pattern
+                .rsplit(['\\', '/'])
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(".")
+                .to_string();
+            let entry = pocket_kernel::vfs::FindEntry { name, info };
+            write_find_data(ctx, out, &entry)?;
+            let handle = FIND_HANDLE_BASE.saturating_add(ctx.kernel.next_find_handle);
+            ctx.kernel.next_find_handle = ctx.kernel.next_find_handle.wrapping_add(1);
+            ctx.kernel
+                .find_handles
+                .insert(handle, std::collections::VecDeque::new());
+            return Ok(DispatchOutcome::ReturnedR0(handle));
         }
     }
     let (dir, mask) = split_search_pattern(&pattern);
@@ -27779,16 +28305,20 @@ fn find_first_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
             return Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE));
         }
     };
-    let mut matches: std::collections::VecDeque<(String, u64, bool, u32)> = entries
+    let mut matches: std::collections::VecDeque<_> = entries
         .into_iter()
         .filter(|(name, _, _)| wildcard_match(&mask, name))
         .map(|(name, size, is_dir)| {
-            let attrs = ctx
+            let info = ctx
                 .kernel
                 .vfs
-                .attributes(&format!("{dir}\\{name}"))
-                .unwrap_or(if is_dir { 0x10 } else { 0x80 });
-            (name, size, is_dir, attrs)
+                .file_information(&format!("{dir}\\{name}"))
+                .unwrap_or(pocket_kernel::vfs::FileInfo {
+                    attributes: if is_dir { 0x10 } else { 0x80 },
+                    times: [0; 3],
+                    size,
+                });
+            pocket_kernel::vfs::FindEntry { name, info }
         })
         .collect();
     let Some(first) = matches.pop_front() else {
@@ -27801,7 +28331,7 @@ fn find_first_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     ctx.kernel.next_find_handle = ctx.kernel.next_find_handle.wrapping_add(1);
     log::debug!(
         "FindFirstFileW({pattern:?}) -> 0x{handle:08x} first={:?} ({} more)",
-        first.0,
+        first.name,
         matches.len()
     );
     ctx.kernel.find_handles.insert(handle, matches);
@@ -33319,6 +33849,7 @@ mod tests {
             pending_startup: std::collections::VecDeque::new(),
             framebuffer: pocket_kernel::framebuffer::deferred::DeferredFramebuffer::default(),
             gdi: GdiState::new(),
+            console: pocket_kernel::console::State::default(),
             ce: pocket_kernel::ce::State::default(),
             resources: vec![],
             image_base: 0,
@@ -34232,7 +34763,8 @@ mod tests {
             crt_fwprintf(&mut ctx).unwrap(),
             DispatchOutcome::ReturnedR0(4)
         );
-        assert_eq!(std::fs::read(&path).unwrap(), "é:42".as_bytes());
+        // Wide CRT file output uses GetACP's 1252 encoding, not host UTF-8.
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xe9:42");
         ctx.cpu.write_reg(ArmReg::R0, 0xdeadbeef).unwrap();
         assert_eq!(
             crt_fwprintf(&mut ctx).unwrap(),
@@ -42921,7 +43453,7 @@ fn crt_fileno(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let stream = ctx.arg_u32(0)?;
     let fd = if std_file_label(stream).is_some() {
         stream - STD_FILE_BASE
-    } else if ctx.kernel.vfs.is_open(stream) {
+    } else if console::stream_is_open(ctx.kernel, stream) {
         stream
     } else {
         u32::MAX
@@ -43136,7 +43668,11 @@ mod pointer_capture_tests {
         let (mut cpu, mut k, mut d) = setup();
         for api in ["sndPlaySoundW", "sndPlaySoundA", "PlaySoundW", "PlaySoundA"] {
             for flags in [0, 1, 2, 3, 0x0b, 0x40] {
-                k.audio.push_samples(&[1234; 8]);
+                let format = pocket_kernel::audio::GuestFormat::default();
+                k.audio
+                    .open_wave_stream(pocket_kernel::system_sound::PLAY_SOUND_STREAM, format);
+                k.audio
+                    .push_wave_samples(pocket_kernel::system_sound::PLAY_SOUND_STREAM, &[1234; 8]);
                 let args = if api.starts_with("snd") {
                     vec![0, flags, 0xdeadbeef]
                 } else {
@@ -43147,7 +43683,8 @@ mod pointer_capture_tests {
                     DispatchOutcome::ReturnedR0(1)
                 ));
                 assert_eq!(
-                    k.audio.tap().drain_into(&mut [0; 8]),
+                    k.audio
+                        .wave_written_samples(pocket_kernel::system_sound::PLAY_SOUND_STREAM),
                     0,
                     "{api}, flags={flags:#x}"
                 );
@@ -44454,6 +44991,50 @@ mod imm_context_tests {
     use super::tests::{dummy_thunk, fresh_kernel};
     use super::*;
     use pocket_cpu::stub::StubCpu;
+
+    #[test]
+    fn completing_committed_text_is_thread_local_and_keeps_queued_input_and_open_state() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let context = imm_thread_context(0).unwrap();
+        kernel.controls.ime_open_contexts.insert(context);
+        kernel
+            .pending_input
+            .push_back(InputEvent::Text { character: 'Я' });
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut kernel,
+            thunk: &thunk,
+        };
+        for (h, action, index, value, expected) in [
+            (context, 0x15, 1, 0, 1),
+            (context, 0x15, 4, 0, 1),
+            (context, 0x15, 2, 0, 0),
+            (context, 0x15, 3, 0, 0),
+            (context, 0x10, 1, 0, 0),
+            (context, 0x15, 1, 1, 0),
+            (0, 0x15, 1, 0, 0),
+            (context + 1, 0x15, 1, 0, 0),
+        ] {
+            for (i, v) in [h, action, index, value].into_iter().enumerate() {
+                ctx.cpu.write_arg(i as u8, v).unwrap();
+            }
+            assert_eq!(
+                imm_notify_ime(&mut ctx).unwrap(),
+                DispatchOutcome::ReturnedR0(expected)
+            );
+            assert!(ctx.kernel.controls.ime_open_contexts.contains(&context));
+            assert_eq!(ctx.kernel.pending_input.len(), 1);
+            assert!(ctx.kernel.posted_messages.is_empty());
+        }
+        ctx.kernel.current_thread = 1;
+        ctx.cpu.write_arg(0, context).unwrap();
+        assert_eq!(
+            imm_notify_ime(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+    }
 
     #[test]
     fn detach_restore_is_per_window_and_context_is_per_thread() {

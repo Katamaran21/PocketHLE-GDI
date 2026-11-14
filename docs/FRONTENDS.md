@@ -129,6 +129,10 @@ is applied once. Startup waits for native fullscreen/maximize restoration to end
 before sizing. Saved fullscreen/window geometry does not override this policy;
 an explicit CLI display argument of 0 can still request fullscreen. Later manual
 resizing and fullscreen controls remain available.
+`--minimized` starts the desktop launcher or a selected CE profile in an
+inactive, minimized window. The initial window stays hidden while its normal
+geometry is applied, so background validation does not take focus from another
+application. Restore it through the host taskbar when interaction is wanted.
 Ending a game while its options are visible uses the same session cleanup. A
 queued game-to-game launch retains the original library snapshot.
 

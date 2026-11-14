@@ -5,16 +5,17 @@
 use super::{CpuBackend, ScheduledInputHook};
 use anyhow::{Context, Result};
 use pocket_core::{
+    ce_desktop::{Desktop, ProcessFrame},
     kernel::{
         self, FrameAction, FrameHook, InputEvent, KernelState, ProcessHandleContext, ProcessLaunch,
     },
     Emulator,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -51,37 +52,22 @@ struct LaunchContext {
     trace: Option<PathBuf>,
 }
 
-struct Frame {
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
-    windows: Vec<(i32, i32, i32, i32)>,
-    background: bool,
-}
-
 #[derive(Default)]
 struct Shared {
     stop: AtomicBool,
     foreground: AtomicU32,
-    revision: AtomicU64,
-    frames: Mutex<HashMap<u32, Arc<Frame>>>,
-    input: Mutex<VecDeque<(u32, InputEvent)>>,
+    desktop: Mutex<Desktop>,
     errors: Mutex<Vec<String>>,
 }
 impl Shared {
     fn exited(&self, table: &kernel::handles::HandleTable, parent: u32) {
         let pid = table.process_id();
         table.mark_inactive();
-        self.frames.lock().unwrap().remove(&pid);
-        self.revision.fetch_add(1, Ordering::Release);
         let next = table.focus_after_exit(parent);
+        self.desktop.lock().unwrap().remove(pid, next);
         let _ = self
             .foreground
             .compare_exchange(pid, next, Ordering::AcqRel, Ordering::Acquire);
-        self.input
-            .lock()
-            .unwrap()
-            .retain(|(owner, _)| *owner != pid);
     }
 }
 
@@ -132,7 +118,7 @@ impl ProcessHook {
         }
         self.last_frame = counter;
         self.last_emit = Instant::now();
-        let frame = match state.presentation_framebuffer() {
+        let frame = match ProcessFrame::capture(state) {
             Ok(frame) => frame,
             Err(error) => {
                 self.shared.errors.lock().unwrap().push(error);
@@ -140,52 +126,10 @@ impl ProcessHook {
                 return;
             }
         };
-        let (width, height, pixels) = (frame.width, frame.height, frame.pixels.clone());
-        let mut background = false;
-        let mut windows = Vec::new();
-        for (&hwnd, &(x, y, w, h)) in &state.window_rects {
-            let style = state.window_styles.get(&hwnd).map_or(0, |s| s.0);
-            if style & 0x4000_0000 != 0
-                || !state.window_tree_visible(hwnd, |_| false)
-                || w <= 0
-                || h <= 0
-            {
-                continue;
-            }
-            // CerfDemo's fullscreen WS_POPUP desktop stays below application
-            // windows even when its animated background repaints or gets focus.
-            if state.ce.windows.enabled
-                && style & 0x8000_0000 != 0
-                && style & kernel::windowing::WS_CAPTION == 0
-                && x <= 0
-                && y <= 0
-                && x.saturating_add(w) >= width as i32
-                && y.saturating_add(h) >= height as i32
-            {
-                background = true;
-            } else {
-                windows.push((x, y, w, h));
-            }
+        if let Err(error) = self.shared.desktop.lock().unwrap().publish(self.pid, frame) {
+            self.shared.errors.lock().unwrap().push(error);
+            self.shared.stop.store(true, Ordering::Release);
         }
-        for hwnd in state.controls.panel_handles() {
-            if let Some(panel) = state.controls.panel(hwnd).filter(|p| p.visible) {
-                windows.push((panel.x, panel.y, panel.w, panel.h));
-            }
-        }
-        if state.modal.is_some() || windows.is_empty() && !background {
-            windows.push((0, 0, width as i32, height as i32));
-        }
-        self.shared.frames.lock().unwrap().insert(
-            self.pid,
-            Arc::new(Frame {
-                width,
-                height,
-                pixels,
-                windows,
-                background,
-            }),
-        );
-        self.shared.revision.fetch_add(1, Ordering::Release);
     }
 
     fn start_child(&mut self, state: &mut KernelState, request: ProcessLaunch) {
@@ -327,16 +271,11 @@ impl FrameHook for ProcessHook {
         }
         self.publish(state);
         self.poll_host();
-        let mut input = self.shared.input.lock().unwrap();
-        let mut remaining = VecDeque::new();
-        while let Some((owner, event)) = input.pop_front() {
-            if owner == self.pid {
-                state.pending_input.push_back(event);
-            } else {
-                remaining.push_back((owner, event));
-            }
-        }
-        *input = remaining;
+        self.shared
+            .desktop
+            .lock()
+            .unwrap()
+            .drain(self.pid, &mut state.pending_input);
         if self.shared.stop.load(Ordering::Acquire) {
             FrameAction::Stop
         } else {
@@ -455,18 +394,15 @@ fn run_child(
 }
 
 struct Host {
-    screen: (u32, u32),
     scheduled: ScheduledInputHook,
-    last_revision: u64,
     frames_seen: u64,
-    order: Vec<u32>,
-    foreground: u32,
-    pointer_owner: Option<u32>,
     dump_dir: Option<PathBuf>,
     dump_stride: u64,
     written: u64,
     max_frames: u64,
     last_pixels: Vec<u8>,
+    last_image_size: (u32, u32),
+    text_input: bool,
     input_file: Option<(PathBuf, usize)>,
     last_input_poll: Instant,
     #[cfg(feature = "display")]
@@ -492,18 +428,15 @@ impl Host {
             "--display requires the display Cargo feature"
         );
         Ok(Self {
-            screen: config.screen,
             scheduled: ScheduledInputHook::new(std::mem::take(&mut config.scheduled)),
-            last_revision: 0,
             frames_seen: 0,
-            order: Vec::new(),
-            foreground: 0,
-            pointer_owner: None,
             dump_dir: config.dump_dir.clone(),
             dump_stride: config.dump_stride.max(1),
             written: 0,
             max_frames: config.max_frames,
             last_pixels: Vec::new(),
+            last_image_size: config.screen,
+            text_input: false,
             input_file: std::env::var_os("POCKETHLE_INPUT_FILE").map(|p| (p.into(), 0)),
             last_input_poll: Instant::now() - Duration::from_secs(1),
             #[cfg(feature = "display")]
@@ -512,43 +445,11 @@ impl Host {
     }
 
     fn send(&mut self, shared: &Shared, event: InputEvent) {
-        let mut owner = shared.foreground.load(Ordering::Acquire);
-        if let InputEvent::PointerDown { x, y } = event {
-            let frames = shared.frames.lock().unwrap();
-            owner = self
-                .order
-                .iter()
-                .rev()
-                .find(|pid| {
-                    frames.get(pid).is_some_and(|f| {
-                        f.windows.iter().any(|r| {
-                            i32::from(x) >= r.0
-                                && i32::from(y) >= r.1
-                                && i32::from(x) < r.0.saturating_add(r.2)
-                                && i32::from(y) < r.1.saturating_add(r.3)
-                        })
-                    })
-                })
-                .copied()
-                .or_else(|| {
-                    self.order
-                        .iter()
-                        .find(|p| frames.get(p).is_some_and(|f| f.background))
-                        .copied()
-                })
-                .unwrap_or(owner);
-            self.pointer_owner = Some(owner);
-            shared.foreground.store(owner, Ordering::Release);
-        } else if matches!(
-            event,
-            InputEvent::PointerUp { .. } | InputEvent::PointerMove { .. }
-        ) {
-            owner = self.pointer_owner.unwrap_or(owner);
-            if matches!(event, InputEvent::PointerUp { .. }) {
-                self.pointer_owner = None;
-            }
-        }
-        shared.input.lock().unwrap().push_back((owner, event));
+        let mut desktop = shared.desktop.lock().unwrap();
+        desktop.queue(event, shared.foreground.load(Ordering::Acquire));
+        shared
+            .foreground
+            .store(desktop.focused_process(), Ordering::Release);
     }
 
     fn read_input_file(&mut self, shared: &Shared) {
@@ -586,6 +487,15 @@ impl Host {
                         InputEvent::KeyDown { vk: key },
                         InputEvent::KeyUp { vk: key },
                     ]);
+                } else if let Some(text) = line
+                    .strip_prefix("text ")
+                    .or_else(|| line.strip_prefix("command "))
+                {
+                    events.extend(text.chars().map(|character| InputEvent::Text { character }));
+                    if line.starts_with("command ") {
+                        events
+                            .extend([InputEvent::KeyDown { vk: 13 }, InputEvent::KeyUp { vk: 13 }]);
+                    }
                 } else if let Some((kind, point)) = line.split_once(' ') {
                     if let Some((x, y)) = point
                         .split_once(',')
@@ -611,64 +521,57 @@ impl Host {
     }
 
     fn poll(&mut self, shared: &Shared) -> Result<()> {
-        let revision = shared.revision.load(Ordering::Acquire);
-        let foreground = shared.foreground.load(Ordering::Acquire);
-        if revision != self.last_revision || foreground != self.foreground {
-            self.last_revision = revision;
-            self.foreground = foreground;
-            let frames = shared.frames.lock().unwrap().clone();
-            self.order.retain(|pid| frames.contains_key(pid));
-            let mut new: Vec<_> = frames
-                .keys()
-                .copied()
-                .filter(|p| !self.order.contains(p))
+        // Use the same window/overlay ordering and input owners as the GUI.
+        // The old per-process rectangle copier clipped CPL keyboards and sent
+        // their dismiss tap to Control Panel behind the still-open child form.
+        let composed = {
+            let mut desktop = shared.desktop.lock().unwrap();
+            desktop.activate(shared.foreground.load(Ordering::Acquire));
+            let frame = desktop.compose().map_err(anyhow::Error::msg)?;
+            shared
+                .foreground
+                .store(desktop.focused_process(), Ordering::Release);
+            frame
+        };
+        if let Some(frame) = composed {
+            self.text_input = frame.text_input;
+            let (w, h) = (frame.image[0], frame.image[1]);
+            let pixels: Vec<_> = frame
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|rgba| {
+                    kernel::framebuffer::colorref_to_rgb565(
+                        u32::from(rgba[0]) | u32::from(rgba[1]) << 8 | u32::from(rgba[2]) << 16,
+                    )
+                    .to_le_bytes()
+                })
                 .collect();
-            new.sort_unstable();
-            self.order.extend(new);
-            if self.order.contains(&foreground) {
-                self.order.retain(|p| *p != foreground);
-                self.order.push(foreground);
-            }
-            if !frames.is_empty() {
-                let (w, h) = self.screen;
-                let color =
-                    kernel::framebuffer::colorref_to_rgb565(kernel::windowing::system_color(1))
-                        .to_le_bytes();
-                let mut pixels: Vec<u8> = (0..w * h).flat_map(|_| color).collect();
-                for pid in &self.order {
-                    let frame = &frames[pid];
-                    if frame.background {
-                        composite(&mut pixels, w, h, frame, &[(0, 0, w as i32, h as i32)]);
+            // A state repaint with identical pixels is not a displayed image.
+            if pixels != self.last_pixels || (w, h) != self.last_image_size {
+                self.frames_seen += 1;
+                if let Some(dir) = &self.dump_dir {
+                    if (self.frames_seen - 1).is_multiple_of(self.dump_stride) {
+                        let path = dir.join(format!("frame_{:06}.ppm", self.written));
+                        std::fs::write(&path, ppm(w, h, &pixels))?;
+                        self.written += 1;
+                        log::info!("wrote {}", path.display());
                     }
                 }
-                for pid in &self.order {
-                    let frame = &frames[pid];
-                    composite(&mut pixels, w, h, frame, &frame.windows);
+                #[cfg(feature = "display")]
+                if let Some(display) = &mut self.display {
+                    display.present_pixels(w, h, &pixels)?;
                 }
-                // A state repaint with identical pixels is not a displayed image.
-                if pixels != self.last_pixels {
-                    self.frames_seen += 1;
-                    if let Some(dir) = &self.dump_dir {
-                        if (self.frames_seen - 1).is_multiple_of(self.dump_stride) {
-                            let path = dir.join(format!("frame_{:06}.ppm", self.written));
-                            std::fs::write(&path, ppm(w, h, &pixels))?;
-                            self.written += 1;
-                            log::info!("wrote {}", path.display());
-                        }
-                    }
-                    #[cfg(feature = "display")]
-                    if let Some(display) = &mut self.display {
-                        display.present_pixels(w, h, &pixels)?;
-                    }
-                    self.last_pixels = pixels;
-                    let count = if self.dump_dir.is_some() {
-                        self.written
-                    } else {
-                        self.frames_seen
-                    };
-                    if self.max_frames != 0 && count >= self.max_frames {
-                        shared.stop.store(true, Ordering::Release);
-                    }
+                self.last_pixels = pixels;
+                self.last_image_size = (w, h);
+                let count = if self.dump_dir.is_some() {
+                    self.written
+                } else {
+                    self.frames_seen
+                };
+                if self.max_frames != 0 && count >= self.max_frames {
+                    shared.stop.store(true, Ordering::Release);
                 }
             }
         }
@@ -680,6 +583,7 @@ impl Host {
         self.read_input_file(shared);
         #[cfg(feature = "display")]
         if let Some(display) = &mut self.display {
+            display.set_text_input(self.text_input);
             let (open, events) = display.poll_input();
             if !open {
                 shared.stop.store(true, Ordering::Release);
@@ -692,35 +596,6 @@ impl Host {
     }
 }
 
-fn composite(
-    output: &mut [u8],
-    width: u32,
-    height: u32,
-    frame: &Frame,
-    windows: &[(i32, i32, i32, i32)],
-) {
-    for &(x, y, w, h) in windows {
-        let left = x.max(0).min(width.min(frame.width) as i32) as usize;
-        let right = x
-            .saturating_add(w)
-            .max(0)
-            .min(width.min(frame.width) as i32) as usize;
-        let top = y.max(0).min(height.min(frame.height) as i32) as usize;
-        let bottom = y
-            .saturating_add(h)
-            .max(0)
-            .min(height.min(frame.height) as i32) as usize;
-        if left >= right || top >= bottom {
-            continue;
-        }
-        for row in top..bottom {
-            let dst = (row * width as usize + left) * 2;
-            let src = (row * frame.width as usize + left) * 2;
-            let len = (right - left) * 2;
-            output[dst..dst + len].copy_from_slice(&frame.pixels[src..src + len]);
-        }
-    }
-}
 fn ppm(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
     let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
     for bytes in pixels.chunks_exact(2) {
@@ -802,7 +677,11 @@ pub(super) fn run(mut emu: Emulator, mut config: Config) -> Result<()> {
                 .join("ce6-final.ppm");
             std::fs::write(
                 &path,
-                ppm(config.screen.0, config.screen.1, &host.last_pixels),
+                ppm(
+                    host.last_image_size.0,
+                    host.last_image_size.1,
+                    &host.last_pixels,
+                ),
             )?;
             println!(
                 "Final CE framebuffer: {} ({} displayed image changes)",
@@ -819,6 +698,10 @@ pub(super) fn run(mut emu: Emulator, mut config: Config) -> Result<()> {
         "CE session errors: {}",
         errors.join("; ")
     );
-    println!("CE session exited cleanly.");
+    if code == 0 {
+        println!("CE session exited cleanly.");
+    } else {
+        println!("CE session ended with guest exit code 0x{code:08x}.");
+    }
     Ok(())
 }

@@ -338,6 +338,10 @@ pub(super) fn track(ctx: &mut CallCtx<'_>, ex: bool) -> Result<DispatchOutcome, 
             },
             menu,
         );
+        system_sound::play_event(
+            ctx.kernel,
+            pocket_kernel::system_sound::SystemEvent::MenuPopup,
+        );
         ctx.kernel.framebuffer.mark_dirty();
         if proc != 0 && flags & 0x80 == 0 {
             return callback(ctx, 0x117, menu, 0, MenuCallback::Initialize);
@@ -365,13 +369,22 @@ pub(super) fn track(ctx: &mut CallCtx<'_>, ex: bool) -> Result<DispatchOutcome, 
         ctx.kernel.framebuffer.mark_dirty();
         match action {
             Some(Action::Command(_, id)) => {
+                system_sound::play_event(
+                    ctx.kernel,
+                    pocket_kernel::system_sound::SystemEvent::MenuSelect,
+                );
                 ctx.kernel.gdi.shell_menus.tracking.as_mut().unwrap().result = Some(id)
             }
-            Some(Action::Open(owner, menu))
+            Some(Action::Open(owner, menu)) => {
+                system_sound::play_event(
+                    ctx.kernel,
+                    pocket_kernel::system_sound::SystemEvent::MenuPopup,
+                );
                 if ctx.kernel.window_procs.get(&owner).copied().unwrap_or(0) != 0
-                    && ctx.kernel.gdi.shell_menus.tracking.as_ref().unwrap().flags & 0x80 == 0 =>
-            {
-                return callback(ctx, 0x117, menu, 0, MenuCallback::Initialize);
+                    && ctx.kernel.gdi.shell_menus.tracking.as_ref().unwrap().flags & 0x80 == 0
+                {
+                    return callback(ctx, 0x117, menu, 0, MenuCallback::Initialize);
+                }
             }
             _ => {}
         }

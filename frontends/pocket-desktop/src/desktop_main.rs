@@ -167,6 +167,7 @@ fn run_launcher() -> Result<()> {
     };
     let library_root = default_library_root();
     let log_path = init_logging(&library_root);
+    log::info!("PocketHLE GUI version {}", env!("CARGO_PKG_VERSION"));
     log::info!("Using library root: {}", library_root.display());
     if let Some(path) = log_path {
         log::info!("Logging to {}", path.display());
@@ -193,7 +194,8 @@ fn run_launcher() -> Result<()> {
         })
         .transpose()? };
     let explicit_fullscreen = startup.ce_fullscreen.or_else(||launch.as_ref().and_then(|a| a.fullscreen));
-    let fullscreen = launch_args::startup_fullscreen(explicit_fullscreen);
+    let minimized = startup.minimized;
+    let fullscreen = !minimized && launch_args::startup_fullscreen(explicit_fullscreen);
 
     let icon = image::load_from_memory(include_bytes!("../assets/pockethle_logo.png"))
         .context("decoding PocketHLE logo")?
@@ -216,6 +218,8 @@ fn run_launcher() -> Result<()> {
             .with_maximized(false)
             .with_min_inner_size([640.0, 420.0])
             .with_fullscreen(fullscreen)
+            .with_active(!minimized)
+            .with_visible(!minimized)
             .with_title(title),
         ..Default::default()
     };
@@ -231,7 +235,7 @@ fn run_launcher() -> Result<()> {
             }
             // Reapply after native window creation/restoration. Do this once;
             // the user can subsequently leave fullscreen using the normal controls.
-            app.request_startup_window(fullscreen);
+            app.request_startup_window(fullscreen, minimized);
             Box::new(app) as Box<dyn eframe::App>
         }),
     )

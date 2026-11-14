@@ -274,7 +274,7 @@ pub struct PocketLauncher {
     game_viewport_active: bool,
     menu_host_press: std::collections::HashMap<(usize, String), Instant>,
     display_fullscreen: bool,
-    startup_window: Option<bool>,
+    startup_window: Option<(bool, bool)>,
     fullscreen_window_size: Option<Vec2>,
     reconstruction: Option<std::sync::Arc<std::sync::Mutex<crate::reconstruction::Reconstruction>>>,
     screenshot: crate::screenshot::SharedScreenshot,
@@ -5250,11 +5250,36 @@ impl PocketLauncher {
                     }
                     continue;
                 }
-                if let egui::Event::Key { key, pressed, .. } = &event {
+                if let egui::Event::Key { key, pressed, repeat, modifiers, .. } = &event {
+                    // CE text controls and Pocket CMD use native editing keys,
+                    // independent of the game's configurable action bindings.
+                    if modifiers.ctrl && matches!(key, egui::Key::C | egui::Key::D | egui::Key::Z) {
+                        if *pressed && !repeat {
+                            let vk = match key { egui::Key::C => 0x43, egui::Key::D => 0x44, _ => 0x5a };
+                            for event in [InputEvent::KeyDown { vk: 0x11 }, InputEvent::KeyDown { vk },
+                                InputEvent::KeyUp { vk }, InputEvent::KeyUp { vk: 0x11 }] { self.send_input(event); }
+                        }
+                        continue;
+                    }
                     if matches!(key, egui::Key::Backspace) {
                         if *pressed {
                             self.send_input(InputEvent::Text { character: '\u{8}' });
                         }
+                        continue;
+                    }
+                    let native = match key {
+                        egui::Key::Tab => Some(9), egui::Key::Enter => Some(13),
+                        egui::Key::Escape if !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) => Some(27),
+                        egui::Key::Home => Some(0x24), egui::Key::End => Some(0x23), egui::Key::Delete => Some(0x2e),
+                        egui::Key::PageUp => Some(0x21), egui::Key::PageDown => Some(0x22),
+                        egui::Key::ArrowLeft => Some(0x25), egui::Key::ArrowUp => Some(0x26),
+                        egui::Key::ArrowRight => Some(0x27), egui::Key::ArrowDown => Some(0x28),
+                        _ => None,
+                    };
+                    if let Some(vk) = native {
+                        if *pressed {
+                            if !repeat && self.held.press(InputSource::Keyboard, vk) { self.send_input(InputEvent::KeyDown { vk }); }
+                        } else if self.held.release(InputSource::Keyboard, vk) { self.send_input(InputEvent::KeyUp { vk }); }
                         continue;
                     }
                     // Printable keys arrive as committed Text, never as game actions.
@@ -5571,8 +5596,8 @@ impl PocketLauncher {
         self.status = "Importing...".to_string();
     }
 
-    pub fn request_startup_window(&mut self, fullscreen: bool) {
-        self.startup_window = Some(fullscreen);
+    pub fn request_startup_window(&mut self, fullscreen: bool, minimized: bool) {
+        self.startup_window = Some((fullscreen, minimized));
     }
 
     pub fn launch_from_command_line(&mut self, game: &GameEntry, filter: Option<usize>) {
@@ -6050,7 +6075,7 @@ impl eframe::App for PocketLauncher {
         }
         // Apply startup mode after native restoration, then size a normal window
         // using a fixed physical target capped to the actual monitor, never a game.
-        if let Some(fullscreen) = self.startup_window {
+        if let Some((fullscreen, minimized)) = self.startup_window {
             let target = LibraryViewport { fullscreen, maximized: false, size: None, position: None };
             if target.restore(ctx) {
                 if fullscreen {
@@ -6075,6 +6100,12 @@ impl eframe::App for PocketLauncher {
                         ctx.request_repaint_after(Duration::from_millis(16));
                     }
                 }
+            }
+            if minimized && self.startup_window.is_none() {
+                // Background CE validation starts hidden and inactive. Show it
+                // only after minimization, preserving the foreground game.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             }
         }
 

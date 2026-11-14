@@ -242,6 +242,12 @@ impl Emulator {
         .context("mapping image into CPU")?;
         process.state.gles_local_ordinals = gles_tables;
         process.state.ce.windows.enabled = self.classic_windows;
+        if self.classic_windows || self.ce_image.is_some() {
+            // Pocket Word's native RichEdit expects committed WM_CHAR input.
+            // CE CLI sessions and their children have no game-input profile
+            // to replace the legacy Gizmondo action-key default after load.
+            process.state.gapi_action_key = pocket_kernel::gapi::VK_RETURN;
+        }
         if let Some(image) = &self.ce_image {
             image.configure_process(&mut process.state);
         }

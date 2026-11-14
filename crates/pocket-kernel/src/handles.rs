@@ -232,6 +232,17 @@ impl HandleTable {
             .get(&(self.pid, index))
             .map(|t| t.tid)
     }
+    /// System-wide thread IDs identify live threads independently of handle
+    /// ownership. Opening one creates a new owned reference in the caller.
+    pub fn thread_by_id(&self, tid: u32) -> Option<(u32, usize)> {
+        let domain = self.domain.lock().unwrap();
+        domain.threads.iter().find_map(|(&(pid, index), thread)| {
+            (thread.tid == tid
+                && domain.active.contains(&pid)
+                && !domain.exits.contains_key(&(pid, Some(index))))
+            .then_some((pid, index))
+        })
+    }
     pub fn set_thread_count(&self, index: usize, count: u32) {
         if let Some(t) = self
             .domain

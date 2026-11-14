@@ -66,6 +66,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "CoGetClassObject", co_get_class_object);
     d.register_handler(dll, "OleInitialize", s_ok);
     d.register_handler(dll, "OleUninitialize", void_returning);
+    d.register_handler(dll, "OleRun", crate::ole_run::run);
     d.register_handler(dll, "CoCreateInstance", co_create_instance);
     for &name in &WMP_METHODS {
         d.register_handler(dll, name, wmp_method);
@@ -73,6 +74,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, WMP_CHILD_METHOD, wmp_child_method);
     crate::directshow::register(d);
     crate::ole_bind::register(d);
+    crate::ole_stream::register(d);
+    crate::ole_automation::register(d);
     d.register_constant(dll, "CoGetMalloc", 0, zero_returning);
 }
 

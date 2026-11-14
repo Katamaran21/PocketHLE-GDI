@@ -4,6 +4,66 @@ use pocket_cpu::{regs::ArmReg, unicorn::UnicornCpu, Cpu, Prot, StopReason};
 const RETURN: u32 = 0x70000000;
 
 #[test]
+fn focus_callbacks_execute_arm_and_thumb_before_returning_to_the_original_caller() {
+    // Store message and other HWND at offsets selected by the receiving HWND.
+    let arm: Vec<_> = [
+        0xe59f3010u32,
+        0xe080c003,
+        0xe58c1000,
+        0xe58c2004,
+        0xe3a00000,
+        0xe12fff1e,
+        0x1000,
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    let thumb: Vec<_> = [0x4b02u16, 0x181b, 0x6019, 0x605a, 0x2000, 0x4770]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .chain(0x1000u32.to_le_bytes())
+        .collect();
+    // Use small synthetic HWND values to select distinct result records.
+    for (code, entry) in [(&arm, 0x2000), (&thumb, 0x2001)] {
+        let (mut cpu, mut kernel, mut dispatcher) = setup(code);
+        for hwnd in [0x100, 0x200] {
+            kernel.window_procs.insert(hwnd, entry);
+            kernel.window_threads.insert(hwnd, 0);
+        }
+        kernel.controls.focus = 0x100;
+        args(&mut cpu, [0x200, 1, 2, 3]);
+        let t = thunk("SetFocus");
+        assert_eq!(
+            dispatcher.dispatch(&mut cpu, &t, &mut kernel).unwrap(),
+            DispatchOutcome::JumpTo(entry)
+        );
+        assert_eq!(
+            cpu.run_until_hook(entry, 100).unwrap(),
+            StopReason::Hook(RETURN)
+        );
+        assert_eq!(
+            dispatcher.dispatch(&mut cpu, &t, &mut kernel).unwrap(),
+            DispatchOutcome::JumpTo(entry)
+        );
+        assert_eq!(
+            cpu.run_until_hook(entry, 100).unwrap(),
+            StopReason::Hook(RETURN)
+        );
+        assert_eq!(
+            dispatcher.dispatch(&mut cpu, &t, &mut kernel).unwrap(),
+            DispatchOutcome::ReturnedR0(0x100)
+        );
+        assert_eq!(cpu.read_u32_le(0x1100).unwrap(), 8);
+        assert_eq!(cpu.read_u32_le(0x1104).unwrap(), 0x200);
+        assert_eq!(cpu.read_u32_le(0x1200).unwrap(), 7);
+        assert_eq!(cpu.read_u32_le(0x1204).unwrap(), 0x100);
+        assert_eq!(cpu.read_reg(ArmReg::Sp).unwrap(), 0x4000);
+        assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), 0x1234);
+        assert!(kernel.ce.focus_changes.is_empty());
+    }
+}
+
+#[test]
 fn native_com_factories_execute_both_entry_modes_and_release_before_returning_the_create_result() {
     let arm: Vec<_> = [0xe59f3008u32, 0xe5823000, 0xe3a00000, 0xe12fff1e, 0x3000]
         .into_iter()
@@ -452,6 +512,101 @@ fn bind_context_retains_native_objects_restores_callbacks_and_releases_every_own
     assert!(kernel.ce.com.callbacks.is_empty());
     assert_eq!(kernel.heap.msize(context), None);
     assert_eq!(kernel.heap.msize(vtable), None);
+}
+
+#[test]
+fn ole_run_executes_arm_and_thumb_query_run_release_and_preserves_the_result() {
+    let arm_query: Vec<_> = [0xe59f3008u32, 0xe5823000, 0xe3a00000, 0xe12fff1e, 0x3000]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let thumb_query: Vec<_> = [0x4b01u16, 0x6013, 0x2000, 0x4770]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .chain(0x3000u32.to_le_bytes())
+        .collect();
+    for thumb in [false, true] {
+        for result in [0u32, 0x8004_0112] {
+            let (code, entry) = if thumb {
+                (&thumb_query, 0x2001)
+            } else {
+                (&arm_query, 0x2000)
+            };
+            let (mut cpu, mut k, mut d) = setup(code);
+            k.heap = pocket_kernel::Heap::new(0x50000000, 0x10000);
+            let (run, release) = if thumb {
+                let run: Vec<_> = [0x4a01u16, 0x6011, 0x4801, 0x4770]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .chain(0x3300u32.to_le_bytes())
+                    .chain(result.to_le_bytes())
+                    .collect();
+                let release: Vec<_> = [0x4b02u16, 0x681a, 0x3201, 0x601a, 0x2021, 0x4770]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .chain(0x3304u32.to_le_bytes())
+                    .collect();
+                (run, release)
+            } else {
+                let run = [
+                    0xe59f2008u32,
+                    0xe5821000,
+                    0xe59f0004,
+                    0xe12fff1e,
+                    0x3300,
+                    result,
+                ]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+                let release = [
+                    0xe59f1010u32,
+                    0xe5912000,
+                    0xe2822001,
+                    0xe5812000,
+                    0xe3a00021,
+                    0xe12fff1e,
+                    0x3304,
+                ]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+                (run, release)
+            };
+            cpu.write_mem(0x2240, &run).unwrap();
+            cpu.write_mem(0x2280, &release).unwrap();
+            let mode = u32::from(thumb);
+            cpu.write_mem(0x3000, &0x3100u32.to_le_bytes()).unwrap();
+            for (slot, address) in [(0, entry), (2, 0x2280 | mode), (4, 0x2240 | mode)] {
+                cpu.write_mem(0x3100 + slot * 4, &address.to_le_bytes())
+                    .unwrap();
+            }
+            cpu.write_mem(0x3300, &99u32.to_le_bytes()).unwrap();
+            args(&mut cpu, [0x3000, 11, 22, 33]);
+            let mut t = thunk("OleRun");
+            t.dll = "ole32.dll".into();
+            for address in [entry, 0x2240 | mode, 0x2280 | mode] {
+                assert_eq!(
+                    d.dispatch(&mut cpu, &t, &mut k).unwrap(),
+                    DispatchOutcome::JumpTo(address)
+                );
+                assert_eq!(
+                    cpu.run_until_hook(address, 100).unwrap(),
+                    StopReason::Hook(RETURN)
+                );
+            }
+            assert_eq!(
+                d.dispatch(&mut cpu, &t, &mut k).unwrap(),
+                DispatchOutcome::ReturnedR0(result)
+            );
+            assert_eq!(cpu.read_u32_le(0x3300).unwrap(), 0); // Run(NULL)
+            assert_eq!(cpu.read_u32_le(0x3304).unwrap(), 1); // Release exactly once
+            assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), 0x1234);
+            assert_eq!(cpu.read_reg(ArmReg::Sp).unwrap(), 0x4000);
+            assert_eq!(cpu.read_reg(ArmReg::R1).unwrap(), 11);
+            assert!(k.ce.com.runs.is_empty());
+        }
+    }
 }
 
 fn thunk(name: &str) -> pocket_kernel::Thunk {

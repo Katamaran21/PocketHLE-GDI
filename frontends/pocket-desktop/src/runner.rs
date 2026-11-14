@@ -1180,9 +1180,12 @@ struct RunHook {
 impl RunHook {
     fn activate_process(&self, pid: u32) {
         if let Some(view) = &self.ce_desktop {
-            view.lock().unwrap_or_else(|e| e.into_inner()).desktop.activate(pid);
+            let mut view = view.lock().unwrap_or_else(|e| e.into_inner());
+            view.desktop.activate(pid);
+            self.foreground.store(view.desktop.focused_process(), Ordering::Release);
+        } else {
+            self.foreground.store(pid, Ordering::Release);
         }
-        self.foreground.store(pid, Ordering::Release);
     }
 
     fn retire_desktop_process(&mut self, pid: u32, next: u32) {
@@ -1224,6 +1227,8 @@ impl RunHook {
                 Ok(frame) => {
                     let result = shared.lock().unwrap_or_else(|e| e.into_inner()).desktop.publish(self.pid, frame);
                     if let Err(error) = result { self.send_desktop_frame(Err(error)); return; }
+                    let owner = shared.lock().unwrap_or_else(|e| e.into_inner()).desktop.focused_process();
+                    self.foreground.store(owner, Ordering::Release);
                     self.last_frame = counter;
                     self.last_completed = completed;
                     self.last_emit_at = Some(now);
@@ -1705,21 +1710,7 @@ impl FrameHook for RunHook {
                         self.last_frame = counter;
                         self.last_completed = completed;
                         self.last_emit_at = Some(phase);
-                        snapshot.text_input = state.gapi_action_key
-                            == pocket_core::kernel::gapi::VK_RETURN
-                            && state
-                                .controls
-                                .get(if state.shell_keyboard.sip {
-                                    state.shell_keyboard.target
-                                } else {
-                                    state.controls.focus
-                                })
-                                .is_some_and(|c| {
-                                    c.class == pocket_core::kernel::controls::ControlClass::Edit
-                                        && c.visible
-                                        && c.enabled
-                                        && c.style & 0x800 == 0
-                                });
+                        snapshot.text_input = state.accepts_text_input();
                         if tx.send(snapshot).is_err() {
                             // GUI thread dropped the receiver — the user
                             // closed the run screen / quit the launcher.

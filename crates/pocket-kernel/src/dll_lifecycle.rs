@@ -165,6 +165,19 @@ impl KernelState {
             .filter(|module| module.refcount != 0)
             .map(|module| module.base)
             .collect();
+        // CE6 Remote Desktop releases cetscoem.dll from mstscax.dll's
+        // PROCESS_DETACH. A nested collection must not detach the outer
+        // group again or unmap the code it will return to. The outer loader
+        // continuation owns that group's cleanup until every callback returns.
+        for frame in &self.module_attach_frames {
+            pending.push(frame.base);
+            pending.extend(frame.cleanup.iter().copied());
+        }
+        if self.dll_notification_frame.is_some() {
+            // Normal process/thread notifications retain their frozen DLL
+            // set; process exit performs its final unmap after the callbacks.
+            pending.extend(self.modules.iter().map(|module| module.base));
+        }
         while let Some(base) = pending.pop() {
             if !reachable.insert(base) {
                 continue;
@@ -230,6 +243,7 @@ impl KernelState {
         }
         let module = self.modules.remove(index);
         self.ce.module_versions.remove(&base);
+        self.ce.debug_zones.remove(&base);
         self.ce.com.servers.retain(|_, handle| *handle != base);
         for satellite in module.satellites {
             if let Some(module) = self

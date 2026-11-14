@@ -1171,8 +1171,15 @@ fn parse_virtual_key(value: &str) -> anyhow::Result<u16> {
         "left" | "arrowleft" => gapi::VK_LEFT,
         "right" | "arrowright" => gapi::VK_RIGHT,
         "enter" | "return" => gapi::VK_RETURN,
+        "backspace" => 0x08,
+        "tab" => 0x09,
         "space" => 0x20,
         "escape" | "esc" | "back" => 0x1b,
+        "pageup" | "pgup" => 0x21,
+        "pagedown" | "pgdown" => 0x22,
+        "end" => 0x23,
+        "home" => 0x24,
+        "delete" | "del" => 0x2e,
         "a" | "action" | "select" | "ok" | "fire" => gapi::VK_A,
         "b" => gapi::VK_B,
         "c" => gapi::VK_C,
@@ -1202,6 +1209,23 @@ mod key_name_tests {
         assert_eq!(parse_virtual_key("5").unwrap(), 0x35);
         assert_eq!(parse_virtual_key("0x28").unwrap(), gapi::VK_DOWN);
         assert!(parse_virtual_key("nope").is_err());
+    }
+
+    #[test]
+    fn text_editing_keys_keep_backspace_separate_from_back() {
+        for (name, vk) in [
+            ("backspace", 0x08),
+            ("back", 0x1b),
+            ("tab", 0x09),
+            ("home", 0x24),
+            ("end", 0x23),
+            ("delete", 0x2e),
+            ("pgup", 0x21),
+            ("pagedown", 0x22),
+        ] {
+            assert_eq!(parse_virtual_key(name).unwrap(), vk);
+        }
+        assert_eq!(parse_virtual_key(" Backspace ").unwrap(), 0x08);
     }
 }
 

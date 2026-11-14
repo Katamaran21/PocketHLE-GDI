@@ -31,6 +31,9 @@ pub(crate) fn find(ctx: &mut CallCtx<'_>) -> Result<bool, KernelError> {
     Ok(title.is_empty() || title.eq_ignore_ascii_case("GMSHELL"))
 }
 fn edit_target(ctx: &CallCtx<'_>) -> u32 {
+    if let Some(hwnd) = ctx.kernel.text_input_target() {
+        return hwnd;
+    }
     let focus = ctx.kernel.controls.focus;
     if ctx.kernel.shell_keyboard.sip {
         if ctx.kernel.gapi_action_key != pocket_kernel::gapi::VK_RETURN {
@@ -444,16 +447,7 @@ pub(crate) fn preference(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
 }
 
 pub(crate) fn accepts_text(ctx: &CallCtx<'_>) -> bool {
-    ctx.kernel.gapi_action_key == pocket_kernel::gapi::VK_RETURN
-        && ((ctx.kernel.shell_keyboard.sip
-            && ctx.kernel.shell_keyboard.visible
-            && edit_target(ctx) != 0)
-            || ctx.kernel.controls.get(edit_target(ctx)).is_some_and(|c| {
-                c.class == ControlClass::Edit
-                    && c.enabled
-                    && c.style & 0x800 == 0
-                    && crate::coredll::window_is_visible(ctx.kernel, c.hwnd)
-            }))
+    ctx.kernel.accepts_text_input()
 }
 
 #[cfg(test)]

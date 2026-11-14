@@ -5,6 +5,286 @@ use pocket_kernel::{controls::ControlClass, framebuffer::Framebuffer, windowing}
 const HWND: u32 = 0xdead0080;
 
 #[test]
+fn intersecting_a_clip_preserves_saved_regions_and_never_publishes_pixels() {
+    let mut cpu = tests::scanf_cpu();
+    let mut kernel = tests::fresh_kernel();
+    let dc = kernel.gdi.create_memory_dc();
+    let bitmap = kernel.gdi.create_compatible_bitmap(100, 80);
+    kernel.gdi.dc_mut(dc).unwrap().selected_bitmap = Some(bitmap);
+    let regions = vec![[0, 0, 25, 30], [60, 40, 100, 80]];
+    kernel.gdi.dc_mut(dc).unwrap().clip_rects = Some(regions.clone());
+    let saved = kernel.gdi.save_dc(dc).unwrap() as i32;
+    let before = kernel.framebuffer.authority_epoch();
+    let thunk = tests::dummy_thunk();
+    let mut ctx = CallCtx {
+        cpu: &mut cpu,
+        kernel: &mut kernel,
+        thunk: &thunk,
+    };
+    for (i, value) in [dc, 10, 10, 75].into_iter().enumerate() {
+        ctx.cpu.write_arg(i as u8, value).unwrap();
+    }
+    let sp = ctx.cpu.read_reg(ArmReg::Sp).unwrap();
+    ctx.cpu.write_mem(sp, &60u32.to_le_bytes()).unwrap();
+    assert_eq!(
+        ce_gdi::intersect_clip_rect(&mut ctx).unwrap(),
+        DispatchOutcome::ReturnedR0(3)
+    );
+    assert_eq!(
+        ctx.kernel.gdi.dc(dc).unwrap().clip_rects,
+        Some(vec![[10, 10, 25, 30], [60, 40, 75, 60]])
+    );
+    ctx.cpu.write_arg(1, 80).unwrap();
+    assert_eq!(
+        ce_gdi::intersect_clip_rect(&mut ctx).unwrap(),
+        DispatchOutcome::ReturnedR0(1)
+    );
+    assert_eq!(ctx.kernel.gdi.dc(dc).unwrap().clip_rects, Some(vec![]));
+    assert!(ctx.kernel.gdi.restore_dc(dc, saved));
+    assert_eq!(ctx.kernel.gdi.dc(dc).unwrap().clip_rects, Some(regions));
+    assert_eq!(ctx.kernel.framebuffer.authority_epoch(), before);
+    ctx.cpu.write_arg(0, 0xabcdef).unwrap();
+    assert_eq!(
+        ce_gdi::intersect_clip_rect(&mut ctx).unwrap(),
+        DispatchOutcome::ReturnedR0(0)
+    );
+}
+
+#[test]
+fn control_panel_dynamic_icons_use_cpl_resources_and_survive_image_list_copying() {
+    use crate::bluetooth::tests::{call, setup};
+    let (mut cpu, mut kernel, mut dispatcher) = setup();
+    let base = 0x31000000;
+    cpu.map_region(base, 0x1000, Prot::READ | Prot::WRITE)
+        .unwrap();
+    // CE6 control.exe obtains a caller-owned HICON in NEWCPLINFOW, copies it
+    // into both image lists, then destroys it. The CPL has its own RT_ICON scope.
+    let mut dib = vec![0u8; 48];
+    for (offset, value) in [(0, 40u32), (4, 1), (8, 2)] {
+        dib[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+    dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+    dib[40..44].copy_from_slice(&[0, 0, 255, 0]);
+    let mut group = vec![0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 32, 0];
+    group.extend_from_slice(&(dib.len() as u32).to_le_bytes());
+    group.extend_from_slice(&9u16.to_le_bytes());
+    cpu.write_mem(base + 0x100, &group).unwrap();
+    cpu.write_mem(base + 0x200, &dib).unwrap();
+    kernel.modules.push(LoadedModule {
+        data_file: false,
+        dependencies: Vec::new(),
+        attached: true,
+        satellites: Vec::new(),
+        resident_regions: vec![(base, 0x1000)],
+        module_slot: Some(base),
+        handle: base,
+        name: "cplmain.cpl".into(),
+        base,
+        image_size: 0x1000,
+        image_entry: 0,
+        refcount: 1,
+        resources: vec![
+            ResourceEntry {
+                ty: ResourceKey::Id(14),
+                name: ResourceKey::Id(5040),
+                data_rva: 0x100,
+                size: group.len() as u32,
+                codepage: 0,
+            },
+            ResourceEntry {
+                ty: ResourceKey::Id(3),
+                name: ResourceKey::Id(9),
+                data_rva: 0x200,
+                size: dib.len() as u32,
+                codepage: 0,
+            },
+        ],
+    });
+    assert_eq!(
+        call(
+            &mut cpu,
+            &mut kernel,
+            &mut dispatcher,
+            "cplmain.cpl",
+            "CPlApplet",
+            &[0, 8, 0, 0x2000]
+        ),
+        DispatchOutcome::ReturnedR0(1)
+    );
+    assert_eq!(cpu.read_u32_le(0x2000).unwrap(), 468);
+    let icon = cpu.read_u32_le(0x2010).unwrap();
+    assert_ne!(icon, 0);
+    let DispatchOutcome::ReturnedR0(list) = call(
+        &mut cpu,
+        &mut kernel,
+        &mut dispatcher,
+        "coredll.dll",
+        "ImageList_Create",
+        &[16, 16, 1, 1, 1],
+    ) else {
+        panic!("missing image list")
+    };
+    assert_eq!(
+        call(
+            &mut cpu,
+            &mut kernel,
+            &mut dispatcher,
+            "coredll.dll",
+            "ImageList_ReplaceIcon",
+            &[list, u32::MAX, icon]
+        ),
+        DispatchOutcome::ReturnedR0(0)
+    );
+    assert_eq!(
+        call(
+            &mut cpu,
+            &mut kernel,
+            &mut dispatcher,
+            "coredll.dll",
+            "DestroyIcon",
+            &[icon]
+        ),
+        DispatchOutcome::ReturnedR0(1)
+    );
+    assert!(!kernel.gdi.icons.contains_key(&icon));
+    assert_eq!(
+        call(
+            &mut cpu,
+            &mut kernel,
+            &mut dispatcher,
+            "coredll.dll",
+            "ImageList_Draw",
+            &[list, 0, GDI_SCREEN_DC, 10, 12, 0]
+        ),
+        DispatchOutcome::ReturnedR0(1)
+    );
+    assert_eq!(pixel(&kernel, 10, 12), 0xf800);
+    assert_eq!(pixel(&kernel, 25, 27), 0xf800);
+}
+
+#[test]
+fn is_child_walks_native_and_hle_children_without_following_popup_owners() {
+    let mut cpu = StubCpu::new();
+    let mut state = framed_kernel();
+    let child = HWND + 1;
+    let popup = HWND + 2;
+    state.window_classes.insert(child, "DefShellView".into());
+    state.window_styles.insert(child, (0x50000000, 0));
+    state.window_parents.insert(child, HWND);
+    state.window_classes.insert(popup, "Popup".into());
+    state.window_styles.insert(popup, (0x90000000, 0));
+    state.window_parents.insert(popup, HWND);
+    let edit = state.controls.create(
+        child,
+        ControlClass::Edit,
+        1,
+        String::new(),
+        0x50000000,
+        0,
+        0,
+        40,
+        20,
+    );
+    let thunk = tests::dummy_thunk();
+    let mut ctx = CallCtx {
+        cpu: &mut cpu,
+        kernel: &mut state,
+        thunk: &thunk,
+    };
+    for (parent, descendant, expected) in [
+        (HWND, child, 1),
+        (HWND, edit, 1),
+        (child, edit, 1),
+        (HWND, popup, 0),
+        (child, HWND, 0),
+        (HWND, HWND, 0),
+        (0, child, 0),
+        (HWND, 0, 0),
+        (HWND, 0x9999, 0),
+    ] {
+        ctx.cpu.write_arg(0, parent).unwrap();
+        ctx.cpu.write_arg(1, descendant).unwrap();
+        assert_eq!(
+            is_child(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(expected)
+        );
+    }
+    ctx.kernel.window_parents.insert(child, child);
+    ctx.cpu.write_arg(0, HWND).unwrap();
+    ctx.cpu.write_arg(1, edit).unwrap();
+    assert_eq!(is_child(&mut ctx).unwrap(), DispatchOutcome::ReturnedR0(0));
+}
+
+#[test]
+fn native_caret_is_clipped_to_the_client_and_hidden_or_unchanged_carets_do_not_publish() {
+    let mut state = framed_kernel();
+    state.controls.focus = HWND;
+    state.ce.carets.blink_ms = u32::MAX;
+    let origin = state.window_client_origin(HWND).unwrap();
+    state.composite_controls();
+    let base = pixel(&state, origin.0 as usize, origin.1 as usize);
+    let caption = pixel(&state, origin.0 as usize, origin.1 as usize - 1);
+    let before = state.framebuffer.frame_counter;
+    state.ce.carets.threads.insert(
+        0,
+        pocket_kernel::caret::Caret {
+            hwnd: HWND,
+            position: (-1, -1),
+            size: (2, 2),
+            hidden: 1,
+            gray: false,
+            mask: None,
+            epoch: std::time::Instant::now(),
+        },
+    );
+    state.composite_controls();
+    assert_eq!(state.framebuffer.frame_counter, before);
+    state.ce.carets.threads.get_mut(&0).unwrap().hidden = 0;
+    state.composite_controls();
+    assert_eq!(
+        pixel(&state, origin.0 as usize, origin.1 as usize),
+        base ^ u16::MAX
+    );
+    assert_eq!(
+        pixel(&state, origin.0 as usize, origin.1 as usize - 1),
+        caption
+    );
+    let shown = state.framebuffer.frame_counter;
+    state.composite_controls();
+    assert_eq!(state.framebuffer.frame_counter, shown);
+    state.ce.carets.threads.get_mut(&0).unwrap().hidden = 1;
+    state.composite_controls();
+    assert_eq!(pixel(&state, origin.0 as usize, origin.1 as usize), base);
+    state.discard_window_metadata(&HWND);
+    assert!(state.ce.carets.threads.is_empty());
+}
+
+#[test]
+fn native_rich_edit_text_input_requires_the_active_enabled_visible_edit() {
+    let mut state = framed_kernel();
+    state.gapi_action_key = pocket_kernel::gapi::VK_RETURN;
+    let edit = HWND + 1;
+    state.window_classes.insert(edit, "RichEdit20W".into());
+    state.window_procs.insert(edit, 0x2000);
+    state.window_styles.insert(edit, (0x50000000, 0));
+    state.window_parents.insert(edit, HWND);
+    state.controls.focus = edit;
+    assert_eq!(state.text_input_target(), Some(edit));
+    state.window_styles.get_mut(&edit).unwrap().0 |= 0x800;
+    assert!(!state.accepts_text_input());
+    state.window_styles.get_mut(&edit).unwrap().0 &= !0x800;
+    state.window_visibility.insert(HWND, false);
+    assert!(!state.accepts_text_input());
+    state.window_visibility.insert(HWND, true);
+    state.window_styles.get_mut(&HWND).unwrap().0 |= 0x08000000;
+    assert!(!state.accepts_text_input());
+    state.window_styles.get_mut(&HWND).unwrap().0 &= !0x08000000;
+    state.active_window = HWND + 2;
+    assert!(!state.accepts_text_input());
+}
+
+#[test]
 fn ole_rectangle_scaling_rounds_signed_ties_and_rejects_long_overflow() {
     let mut cpu = tests::scanf_cpu();
     let mut kernel = tests::fresh_kernel();
@@ -82,6 +362,10 @@ fn control_panel_reserves_pending_input_for_its_parked_applet_call() {
         previous_active: 0,
         previous_focus: 0,
         fields: Vec::new(),
+        sound_schemes: Vec::new(),
+        tab: 0,
+        pages: Vec::new(),
+        selected_page: 0,
         status: 0,
     });
     let click = InputEvent::PointerDown { x: 60, y: 100 };

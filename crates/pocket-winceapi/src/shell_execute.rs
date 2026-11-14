@@ -5,6 +5,10 @@ const SIZE: usize = 60;
 const NOCLOSEPROCESS: u32 = 0x40;
 const NO_UI: u32 = 0x400;
 
+fn namespace_path(file: &str) -> bool {
+    file.starts_with("::{")
+}
+
 fn registry_text(kernel: &KernelState, key: &str) -> Option<String> {
     use pocket_kernel::registry::RegistryValue;
     match kernel
@@ -136,6 +140,17 @@ fn resolve_launch(
     let mut associated = false;
     let mut visited = std::collections::HashSet::new();
     for _ in 0..16 {
+        // My Device and Recycle Bin are shell namespace objects, not VFS
+        // files. The original CE6 Explorer opens them through its SHEL set.
+        if namespace_path(&file) {
+            if !verb.is_empty()
+                && !verb.eq_ignore_ascii_case("open")
+                && !verb.eq_ignore_ascii_case("explore")
+            {
+                return Err(1155);
+            }
+            return Ok((file, parameters));
+        }
         file = existing_path(kernel, &file).ok_or(2u32)?;
         if !visited.insert(file.replace('/', "\\").to_ascii_lowercase()) {
             return Err(13);
@@ -176,6 +191,11 @@ fn resolve_launch(
         } else {
             verb.to_owned()
         };
+        if directory
+            && (operation.eq_ignore_ascii_case("open") || operation.eq_ignore_ascii_case("explore"))
+        {
+            return Ok((file, parameters));
+        }
         let command = class.as_ref().and_then(|class| {
             registry_text(kernel, &format!(r"HKCR\{class}\shell\{operation}\command"))
         });
@@ -198,14 +218,126 @@ fn resolve_launch(
             file = target;
             parameters = args;
             associated = true;
-        } else if directory && operation.eq_ignore_ascii_case("open") {
-            parameters = format!("\"{file}\" {}", parameters).trim_end().to_owned();
-            file = r"\Windows\explorer.exe".into();
         } else {
             return Err(1155);
         }
     }
     Err(13)
+}
+
+fn native_folder_method(ctx: &CallCtx<'_>) -> Option<u32> {
+    let id = ctx.kernel.object_handles.query_api_set(*b"SHEL")?;
+    let provider = ctx.kernel.object_handles.api_set_provider(id)?;
+    // This pointer is meaningful only in the process that registered it.
+    // Cross-process pointer marshalling cannot use another CPU's address.
+    if provider.owner != ctx.kernel.object_handles.process_id()
+        || provider.signatures.get(9) != Some(&0x52)
+    {
+        return None;
+    }
+    let method = *provider.methods.get(9)?;
+    (method != 0
+        && ctx
+            .cpu
+            .check_guest_access(method & !1, 2, Prot::EXEC)
+            .is_ok())
+    .then_some(method)
+}
+
+fn open_native_folder(
+    ctx: &mut CallCtx<'_>,
+    ptr: u32,
+    path: &str,
+    method: u32,
+) -> Result<DispatchOutcome, KernelError> {
+    if ctx.kernel.ce.shell_folder_calls.len() >= 64
+        || ctx.kernel.ce.shell_folder_calls.iter().any(|call| {
+            call.thread == ctx.kernel.current_thread && call.thunk == ctx.thunk.thunk_va
+        })
+    {
+        return failed(ctx, ptr, ERROR_NOT_SUPPORTED);
+    }
+    let bytes: Vec<_> = path
+        .encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let Some(scratch) = ctx.kernel.heap.alloc(bytes.len() as u32) else {
+        return failed(ctx, ptr, 8);
+    };
+    if let Err(error) = ctx.cpu.write_mem(scratch, &bytes) {
+        ctx.kernel.heap.free(scratch);
+        return Err(error.into());
+    }
+    let frame = GuestCallFrame {
+        args: [
+            ctx.arg_u32(0)?,
+            ctx.arg_u32(1)?,
+            ctx.arg_u32(2)?,
+            ctx.arg_u32(3)?,
+        ],
+        sp: ctx.cpu.read_reg(ArmReg::Sp)?,
+        lr: ctx.cpu.read_reg(ArmReg::Lr)?,
+    };
+    // CE6's public implicit-call ABI and the original coredll export select
+    // SHEL method 9 (signature 0x52): Unicode path, open/explore flags (4).
+    // Execute the registered application handler, never coredll's ROM code.
+    ctx.cpu.write_arg(0, scratch)?;
+    ctx.cpu.write_arg(1, 4)?;
+    ctx.cpu.write_arg(2, 0)?;
+    ctx.cpu.write_arg(3, 0)?;
+    ctx.cpu.write_reg(ArmReg::Lr, ctx.thunk.thunk_va)?;
+    ctx.kernel
+        .ce
+        .shell_folder_calls
+        .push(pocket_kernel::ce::ShellFolderCall {
+            thread: ctx.kernel.current_thread,
+            thunk: ctx.thunk.thunk_va,
+            frame,
+            scratch,
+        });
+    log::debug!("ShellExecuteEx: native SHEL folder {path:?}");
+    Ok(DispatchOutcome::JumpTo(method))
+}
+
+fn finish_native_folder(ctx: &mut CallCtx<'_>) -> Result<Option<DispatchOutcome>, KernelError> {
+    let sp = ctx.cpu.read_reg(ArmReg::Sp)?;
+    let Some(index) = ctx.kernel.ce.shell_folder_calls.iter().rposition(|call| {
+        call.thread == ctx.kernel.current_thread
+            && call.thunk == ctx.thunk.thunk_va
+            && call.frame.sp == sp
+    }) else {
+        return Ok(None);
+    };
+    let call = ctx.kernel.ce.shell_folder_calls.remove(index);
+    let result = ctx.arg_u32(0)?;
+    let ptr = call.frame.args[0];
+    for (reg, value) in call.frame.args.into_iter().enumerate() {
+        ctx.cpu.write_arg(reg as u8, value)?;
+    }
+    ctx.cpu.write_reg(ArmReg::Sp, call.frame.sp)?;
+    ctx.cpu.write_reg(ArmReg::Lr, call.frame.lr)?;
+    ctx.kernel.heap.free(call.scratch);
+    if ctx
+        .cpu
+        .check_guest_access(ptr, SIZE as u32, Prot::WRITE)
+        .is_err()
+    {
+        set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+        return Ok(Some(DispatchOutcome::ReturnedR0(0)));
+    }
+    if result == 0 {
+        let error = ctx
+            .kernel
+            .thread_last_errors
+            .get(&ctx.kernel.current_thread)
+            .copied()
+            .unwrap_or(2);
+        return Ok(Some(failed(ctx, ptr, error)?));
+    }
+    ctx.cpu.write_mem(ptr + 32, &33u32.to_le_bytes())?;
+    ctx.cpu.write_mem(ptr + 56, &0u32.to_le_bytes())?;
+    Ok(Some(DispatchOutcome::ReturnedR0(1)))
 }
 
 fn failed(ctx: &mut CallCtx<'_>, ptr: u32, error: u32) -> Result<DispatchOutcome, KernelError> {
@@ -224,6 +356,9 @@ fn failed(ctx: &mut CallCtx<'_>, ptr: u32, error: u32) -> Result<DispatchOutcome
 }
 
 pub(super) fn execute(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let Some(outcome) = finish_native_folder(ctx)? {
+        return Ok(outcome);
+    }
     let ptr = ctx.arg_u32(0)?;
     let Ok(info) = ctx.cpu.read_mem(ptr, SIZE as u32) else {
         set_thread_error(ctx, ERROR_INVALID_PARAMETER);
@@ -285,6 +420,7 @@ pub(super) fn execute(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             close_owned_handle(ctx.kernel, handle);
         }
         table.allow_start();
+        system_sound::play_event(ctx.kernel, pocket_kernel::system_sound::SystemEvent::Open);
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
     ctx.cpu.write_mem(ptr + 56, &0u32.to_le_bytes())?;
@@ -308,11 +444,12 @@ pub(super) fn execute(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     log::debug!(
         "ShellExecuteEx: file={file:?}, verb={verb:?}, parameters={parameters:?}, mask=0x{mask:x}"
     );
-    // The ROM player is exposed as a system command. An explicit path to a
-    // different executable still uses the ordinary guest process launcher.
-    if file.eq_ignore_ascii_case("ceplayer")
+    // Prefer the original player UI when the image supplies it. Profiles
+    // without that EXE retain the established in-process media command.
+    if (file.eq_ignore_ascii_case("ceplayer")
         || file.eq_ignore_ascii_case("ceplayer.exe")
-        || file.eq_ignore_ascii_case(r"\Windows\ceplayer.exe")
+        || file.eq_ignore_ascii_case(r"\Windows\ceplayer.exe"))
+        && existing_path(ctx.kernel, r"\Windows\ceplayer.exe").is_none()
     {
         if !verb.is_empty() && !verb.eq_ignore_ascii_case("open") {
             return failed(ctx, ptr, 1155);
@@ -335,10 +472,23 @@ pub(super) fn execute(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     }
     // Native Explorer passes its Desktop .lnk files here. Resolve their CE
     // commands and registered document verbs before validating the real EXE.
-    let (file, parameters) = match resolve_launch(ctx.kernel, &file, &parameters, &verb) {
+    let (mut file, mut parameters) = match resolve_launch(ctx.kernel, &file, &parameters, &verb) {
         Ok(launch) => launch,
         Err(error) => return failed(ctx, ptr, error),
     };
+    if namespace_path(&file) || ctx.kernel.vfs.resolve(&file).is_some_and(|p| p.is_dir()) {
+        if let Some(method) = native_folder_method(ctx) {
+            return open_native_folder(ctx, ptr, &file, method);
+        }
+        if namespace_path(&file) {
+            return failed(ctx, ptr, ERROR_NOT_SUPPORTED);
+        }
+        parameters = format!("\"{file}\" {}", parameters).trim_end().to_owned();
+        file = match existing_path(ctx.kernel, r"\Windows\explorer.exe") {
+            Some(path) => path,
+            None => return failed(ctx, ptr, 2),
+        };
+    }
     if !ctx.kernel.process_launch_enabled
         || ctx.kernel.dll_notification_frame.is_some()
         || !ctx.kernel.module_attach_frames.is_empty()
@@ -364,6 +514,95 @@ pub(super) fn execute(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
 mod tests {
     use super::*;
     use pocket_cpu::{stub::StubCpu, Cpu};
+
+    #[test]
+    fn native_namespace_and_folder_calls_preserve_the_caller_and_never_spawn_another_desktop() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("My Documents")).unwrap();
+        let namespace = "::{000214A0-0000-0000-C000-000000000046}";
+        std::fs::write(
+            root.path().join("Device.lnk"),
+            format!("{}#{namespace}", namespace.len()),
+        )
+        .unwrap();
+        for path in [namespace, r"\My Documents", r"\Device.lnk"] {
+            let mut cpu = StubCpu::new();
+            cpu.map_region(0x1000, 0x5000, Prot::READ | Prot::WRITE)
+                .unwrap();
+            cpu.map_region(0x8000, 0x1000, Prot::READ | Prot::EXEC)
+                .unwrap();
+            cpu.map_region(pocket_kernel::HEAP_BASE, 0x10000, Prot::READ | Prot::WRITE)
+                .unwrap();
+            let original = [0x2000, 0x11223344, 0x55667788, 0x99aabbcc];
+            for (reg, value) in original.into_iter().enumerate() {
+                cpu.write_arg(reg as u8, value).unwrap();
+            }
+            cpu.write_reg(ArmReg::Sp, 0x5000).unwrap();
+            cpu.write_reg(ArmReg::Lr, 0x8011).unwrap();
+            cpu.write_mem(0x2000, &60u32.to_le_bytes()).unwrap();
+            cpu.write_mem(0x2004, &NOCLOSEPROCESS.to_le_bytes())
+                .unwrap();
+            cpu.write_mem(0x2010, &0x3000u32.to_le_bytes()).unwrap();
+            write_wide_str(&mut cpu, 0x3000, 128, path).unwrap();
+            let mut kernel = super::super::tests::fresh_kernel();
+            kernel.vfs.mount("\\", root.path());
+            let mut methods = vec![0; 10];
+            methods[9] = 0x8001;
+            let mut signatures = vec![0; 10];
+            signatures[9] = 0x52;
+            let h = kernel
+                .object_handles
+                .create_api_set(*b"SHEL", methods, signatures)
+                .unwrap();
+            kernel.object_handles.register_api_set(h, 85).unwrap();
+            let thunk = super::super::tests::dummy_thunk();
+            let mut ctx = CallCtx {
+                cpu: &mut cpu,
+                kernel: &mut kernel,
+                thunk: &thunk,
+            };
+            assert_eq!(execute(&mut ctx).unwrap(), DispatchOutcome::JumpTo(0x8001));
+            assert_eq!(ctx.cpu.read_arg(1).unwrap(), 4);
+            assert_eq!(ctx.cpu.read_reg(ArmReg::Lr).unwrap(), thunk.thunk_va);
+            let scratch = ctx.cpu.read_arg(0).unwrap();
+            let expected = if path.ends_with(".lnk") {
+                namespace
+            } else {
+                path
+            };
+            let bytes: Vec<_> = expected
+                .encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            assert_eq!(
+                ctx.cpu.read_mem(scratch, bytes.len() as u32).unwrap(),
+                bytes
+            );
+            assert!(ctx.kernel.pending_process_launch.is_none());
+            // A deeper call must not mistake the suspended outer call for a
+            // completed native callback, even when it uses the same thunk.
+            ctx.cpu.write_reg(ArmReg::Sp, 0x4f00).unwrap();
+            assert!(finish_native_folder(&mut ctx).unwrap().is_none());
+            ctx.cpu.write_reg(ArmReg::Sp, 0x5000).unwrap();
+            ctx.cpu.write_arg(0, 1).unwrap();
+            assert_eq!(execute(&mut ctx).unwrap(), DispatchOutcome::ReturnedR0(1));
+            assert!(ctx.kernel.ce.shell_folder_calls.is_empty());
+            for (reg, value) in original.into_iter().enumerate() {
+                assert_eq!(ctx.cpu.read_arg(reg as u8).unwrap(), value);
+            }
+            assert_eq!(ctx.cpu.read_reg(ArmReg::Lr).unwrap(), 0x8011);
+            assert_eq!(ctx.cpu.read_mem(0x2020, 4).unwrap(), 33u32.to_le_bytes());
+            assert_eq!(ctx.cpu.read_mem(0x2038, 4).unwrap(), 0u32.to_le_bytes());
+            assert!(ctx.kernel.pending_process_launch.is_none());
+            assert_eq!(ctx.kernel.heap.msize(scratch), None);
+            // Another process sees the API registration but cannot execute
+            // the owner's pointer in its independent address space.
+            let (_, child) = ctx.kernel.object_handles.new_child().unwrap();
+            ctx.kernel.object_handles = child;
+            assert_eq!(native_folder_method(&ctx), None);
+        }
+    }
 
     #[test]
     fn desktop_links_preserve_guest_commands_and_documents_use_registered_verbs() {
@@ -395,7 +634,7 @@ mod tests {
         );
         assert_eq!(
             resolve_launch(&mut kernel, r"\My Documents", "", "").unwrap(),
-            (r"\Windows\explorer.exe".into(), "\"\\My Documents\"".into())
+            (r"\My Documents".into(), "".into())
         );
         std::fs::write(root.path().join("My Documents/Read me.htm"), b"help").unwrap();
         kernel.registry.set_value(
@@ -613,5 +852,36 @@ mod tests {
         assert_eq!(cpu.read_mem(0x2038, 4).unwrap(), 0u32.to_le_bytes());
         assert_eq!(kernel.thread_last_errors.get(&0), Some(&2));
         assert!(kernel.pending_process_launch.is_none());
+    }
+
+    #[test]
+    fn an_image_player_with_no_parameters_reaches_executable_validation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("Windows")).unwrap();
+        // Deliberately invalid: error 193 proves ShellExecute selected the
+        // supplied EXE instead of rejecting its empty media parameters.
+        std::fs::write(root.path().join("Windows/ceplayer.exe"), b"invalid PE").unwrap();
+        for name in ["ceplayer", "ceplayer.exe", r"\Windows\ceplayer.exe"] {
+            let mut cpu = super::super::tests::scanf_cpu();
+            let mut kernel = super::super::tests::fresh_kernel();
+            kernel.vfs.mount("\\", root.path());
+            kernel.process_launch_enabled = true;
+            cpu.write_arg(0, 0x2000).unwrap();
+            cpu.write_mem(0x2000, &60u32.to_le_bytes()).unwrap();
+            cpu.write_mem(0x2010, &0x3000u32.to_le_bytes()).unwrap();
+            write_wide_str(&mut cpu, 0x3000, 100, name).unwrap();
+            let thunk = super::super::tests::dummy_thunk();
+            assert_eq!(
+                execute(&mut CallCtx {
+                    cpu: &mut cpu,
+                    kernel: &mut kernel,
+                    thunk: &thunk
+                })
+                .unwrap(),
+                DispatchOutcome::ReturnedR0(0)
+            );
+            assert_eq!(kernel.thread_last_errors.get(&0), Some(&193));
+            assert!(kernel.pending_process_launch.is_none());
+        }
     }
 }

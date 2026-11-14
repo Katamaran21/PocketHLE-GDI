@@ -30,6 +30,9 @@ mod ce_api_sets;
 mod ce_app_events;
 mod ce_crypto;
 mod ce_database;
+mod ce_debug;
+mod ce_devices;
+mod ce_exceptions;
 mod ce_fonts;
 mod ce_indirect;
 #[cfg(all(test, feature = "unicorn-tests"))]
@@ -61,6 +64,7 @@ mod gps;
 pub mod gx;
 pub mod hss;
 mod imgdecmp;
+mod iphlpapi;
 mod legacy_services;
 #[cfg(feature = "video-static")]
 pub mod media_static;
@@ -69,11 +73,15 @@ mod msxml;
 mod native_com;
 mod number_format;
 pub mod ole32;
+mod ole_automation;
 mod ole_bind;
+mod ole_run;
+mod ole_stream;
 pub mod ordinals;
 pub mod recording_encoder;
 mod scroll;
 mod sdl;
+mod security;
 mod serial;
 mod shell;
 mod shell_keyboard;
@@ -307,9 +315,14 @@ impl WinCeDispatcher {
         ce_indirect::register(&mut d);
         ce_fonts::register(&mut d);
         ce_crypto::register(&mut d);
+        security::register(&mut d);
+        iphlpapi::register(&mut d);
         ce_database::register(&mut d);
         ce_notify::register(&mut d);
         ce_services::register(&mut d);
+        ce_devices::register(&mut d);
+        ce_exceptions::register(&mut d);
+        ce_debug::register(&mut d);
         ce_sip::register(&mut d);
         ce_api_sets::register(&mut d);
         ce_app_events::register(&mut d);
@@ -591,6 +604,11 @@ impl Dispatcher for WinCeDispatcher {
     ) -> Result<DispatchOutcome, KernelError> {
         kernel.reclaim_finished_stacks(cpu)?;
         kernel.sync_transferred_handles();
+        coredll::system_sound::service_pending(kernel);
+        if let Some(outcome) = coredll::console::service_input(&mut CallCtx { cpu, thunk, kernel })?
+        {
+            return Ok(outcome);
+        }
         if let Some(outcome) = coredll::wake_due_worker(&mut CallCtx { cpu, thunk, kernel })? {
             return Ok(outcome);
         }
@@ -942,6 +960,22 @@ mod tests {
         assert_eq!(d.constant_for(&t), None);
         let setter = fake_thunk("coredll.dll", "SetLastError");
         assert_eq!(d.constant_for(&setter), None);
+    }
+
+    #[test]
+    fn sound_apis_keep_their_registry_and_playback_side_effects() {
+        let mut d = WinCeDispatcher::new();
+        for name in [
+            "MessageBeep",
+            "PlaySoundW",
+            "PlaySoundA",
+            "sndPlaySoundW",
+            "sndPlaySoundA",
+        ] {
+            let thunk = fake_thunk("coredll.dll", name);
+            assert_eq!(d.constant_for(&thunk), None, "{name}");
+            assert!(d.resolve_handler(&thunk).is_some(), "{name}");
+        }
     }
 
     #[test]

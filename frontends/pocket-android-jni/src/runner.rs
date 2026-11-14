@@ -1148,12 +1148,13 @@ struct SessionHook {
 impl SessionHook {
     fn activate_process(&self, pid: u32) {
         if let Some(view) = &self.ce_desktop {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .desktop
-                .activate(pid);
+            let mut view = view.lock().unwrap_or_else(|e| e.into_inner());
+            view.desktop.activate(pid);
+            self.foreground
+                .store(view.desktop.focused_process(), Ordering::Release);
+        } else {
+            self.foreground.store(pid, Ordering::Release);
         }
-        self.foreground.store(pid, Ordering::Release);
     }
     fn retire_desktop_process(&mut self, pid: u32, next: u32) {
         let Some(view) = self.ce_desktop.as_ref() else {
@@ -1208,6 +1209,12 @@ impl SessionHook {
                         self.send_desktop_frame(Err(error));
                         return;
                     }
+                    let owner = shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .desktop
+                        .focused_process();
+                    self.foreground.store(owner, Ordering::Release);
                     self.last_frame = counter;
                     self.last_emit_at = Some(now);
                     if let Some(p) = &self.state.presentation {

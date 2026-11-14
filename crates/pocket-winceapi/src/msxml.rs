@@ -280,7 +280,7 @@ fn wrap_node(ctx: &mut CallCtx<'_>, doc: u32, id: usize) -> Result<u32, KernelEr
 
 /// Allocate a BSTR (4-byte byte-length prefix, UTF-16, null-terminated) and
 /// return the pointer to its first character, as `SysAllocString` would.
-fn alloc_bstr(ctx: &mut CallCtx<'_>, s: &str) -> Result<u32, KernelError> {
+pub(crate) fn alloc_bstr(ctx: &mut CallCtx<'_>, s: &str) -> Result<u32, KernelError> {
     let u: Vec<u16> = s.encode_utf16().collect();
     alloc_bstr_units(ctx, &u)
 }

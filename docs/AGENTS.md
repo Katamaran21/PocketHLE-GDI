@@ -261,7 +261,7 @@ A handler returns a `DispatchOutcome` (`:521`):
 | `ReturnedR0(u32)` | Normal return. `void` handlers return 0; the guest ignores it. |
 | `ReturnedR0R1(u32, u32)` | 64-bit return, low word in r0. |
 | `JumpTo(va)` | Resume the guest at `va` instead of `LR`. Used to block modally by re-entering the same thunk — see `message_box_w`. |
-| `Halt(reason)` | Stop the run loop. `ExitProcess`, `TerminateProcess`. |
+| `Halt` | Stop the run loop. `ExitProcess`, `TerminateProcess`; the handler logs a reason and records the guest exit code separately. |
 
 **`resolve_handler` memoizes by `thunk_va` and import identity, including negative results**
 (`crates/pocket-winceapi/src/lib.rs:280`). Runtime DLL slots may be reused after `FreeLibrary`: the cached DLL,
@@ -532,6 +532,12 @@ file and `resolve` would otherwise fail them.
 independent paths that mix together. Which one a game uses decides where
 a silence bug lives.
 
+CE system sounds use private wave streams, including on the AudioTap/Android
+path. `MessageBeep` is stateful, never an IAT constant. Preserve positional
+REG_MULTI_SZ silent slots, EventMask, and the independent application/event
+enable bits. PlaySound stop and wave-device closure must not flush unrelated
+audio. See [CE sound settings](WINDOWS-CE.md#desktop-behavior-and-control-panel).
+
 The WinMM mixer API exposes one virtual PCM mixer with a speaker destination,
 a connected stereo wave-output source and volume control. The implementation
 is `coredll/mixer.rs`: device enumeration, ID/open/close, capabilities, line and
@@ -775,6 +781,13 @@ fixups, then discards the section payloads in Process.image. That object
 retains section metadata; resources move to KernelState.resources. The CPU
 keeps backing bytes only for pages not yet committed; see §19. MIPS and
 CPU wrappers without deferred-page support retain the eager fallback.
+
+For a CE Thumb-tagged image, valid packed `.pdata` function records select
+the entry's ARM/Thumb mode before falling back to instruction heuristics.
+CE's 8-byte function-table format must not be applied to ARMNT unwind records.
+The process retains the chosen mode before releasing section payloads; the main
+loop must not recompute it from the now-empty PE. CalNot's pimres.dll has an ARM
+leaf entry without a normal prologue despite its Thumb machine tag.
 
 Runtime modules retain their exact section and thunk mappings in
 `LoadedModule.resident_regions`. `FreeLibrary` decrements the load count;
@@ -1239,6 +1252,16 @@ Validation: isolated original ARM routines for a supplied purchased game;
 persistence regression. Full Android/desktop native builds and device gameplay
 remain to be checked. No build dependencies or lockfile changes.
 
+
+## CE device sessions
+
+The CE device context also shares reserved filesystem names, password-active
+metadata and virtual suspend generations between parent and child processes.
+`PowerOffSystem` pauses guest CPU slices while frontend stop/input polling remains
+available outside the execution gate. New key, stylus-down or text input resumes
+the device; stale queued input and pointer movement do not. Keep the waiting
+call's continuation until its original suspend generation finishes. Owner teardown
+releases its namespace and suspend state. See [CE services](WINDOWS-CE.md#ce-device-and-service-boundaries).
 
 ## Optional executable ARM diagnostics
 

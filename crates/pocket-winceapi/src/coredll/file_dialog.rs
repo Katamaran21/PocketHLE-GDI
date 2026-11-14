@@ -964,6 +964,57 @@ mod tests {
     }
 
     #[test]
+    fn save_edits_the_initial_name_and_accepts_an_existing_empty_parent() {
+        let (root, mut cpu, mut kernel, mut dispatcher) = fixture();
+        std::fs::create_dir(root.path().join("Programs/Empty")).unwrap();
+        cpu.write_mem(0x2000, &wide("Doc1")).unwrap();
+        let save =
+            |cpu: &mut StubCpu, kernel: &mut KernelState, dispatcher: &mut WinCeDispatcher| {
+                call(
+                    cpu,
+                    kernel,
+                    dispatcher,
+                    "coredll.dll",
+                    "GetSaveFileNameW",
+                    &[0x1000],
+                )
+            };
+        assert!(matches!(
+            save(&mut cpu, &mut kernel, &mut dispatcher),
+            DispatchOutcome::JumpTo(_)
+        ));
+        let edit = kernel.controls.file_dialog.as_ref().unwrap().edit;
+        tap(&mut kernel, edit, 10, 10);
+        for _ in 0..4 {
+            kernel
+                .pending_input
+                .extend([InputEvent::KeyDown { vk: 8 }, InputEvent::KeyUp { vk: 8 }]);
+        }
+        kernel.pending_input.extend(
+            r"Programs\Empty\Сохранение.txt"
+                .chars()
+                .map(|character| InputEvent::Text { character }),
+        );
+        kernel
+            .pending_input
+            .push_back(InputEvent::KeyDown { vk: 13 });
+        assert_eq!(
+            save(&mut cpu, &mut kernel, &mut dispatcher),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(
+            output(&mut cpu, 0x2000, 256),
+            r"\Data\Programs\Empty\Сохранение.txt"
+        );
+        assert!(kernel.controls.file_dialog.is_none());
+        assert_eq!(kernel.controls.common_dialog_error, 0);
+        assert!(std::fs::read_dir(root.path().join("Programs/Empty"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
     fn browse_owns_input_over_the_run_thread_and_releases_its_dialog_on_destruction() {
         let (_root, mut cpu, mut kernel, _dispatcher) = fixture();
         let thunk = super::super::tests::dummy_thunk();

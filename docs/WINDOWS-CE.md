@@ -47,6 +47,37 @@ Applications and independently running children inherit the same device registry
 and mounted filesystem. Relative image/data paths in library backups are resolved
 against the library root on both Windows and Android.
 
+## Command Prompt
+
+The original CE6 `Windows/cmd.exe` runs in a classic console window. From this
+source workspace, start `tools/run-wince6-cmd-gui.cmd`; it selects
+`profiles/wince6-cmd-local.json` and a separate `ce-data/wince6-cmd` device.
+The public `profiles/wince6-cmd.json` template expects the image at `wince6/fs`,
+beside the profiles directory. Profile packages include `run-wince6-cmd.cmd`.
+
+From Explorer, use **Start → Run** and enter `\Windows\cmd.exe`. Commands use
+guest CE paths, such as `dir \Windows` and `start \CERF\sampleapp.exe`. The
+guest CMD implements its own commands and batch parser; the emulator provides
+its console, file access and process APIs.
+
+The console accepts committed Unicode text, Enter, Backspace, Delete, Home/End
+and arrow keys. Up/Down recall entered commands; Page Up/Page Down and the mouse
+wheel browse bounded output history. Typing returns to the input line. Ctrl+C
+signals the registered console control event, and Ctrl+Z requests end of input.
+The caption supports dragging, minimizing and closing.
+
+Standard input/output paths and open file positions pass to child processes.
+Redirection, append and pipelines use the mounted VFS. Redirected text follows
+the CE ANSI code page; direct console output preserves Unicode. Console children
+without their own window share the parent's input focus. A child that outlives
+the console owner can create a replacement console window.
+
+`DIR` receives creation/access/write times in its find records and prints
+64-bit totals. `COPY` preserves the destination's timestamps through
+`SetFileTime`, with real file access checks and the image's private overlay.
+These behaviors are console compatibility, not a claim that every CE6
+application or driver is implemented.
+
 ## Android
 
 Install the signed universal APK (Android 7.0 or later; ARM64 and ARMv7). Its
@@ -87,12 +118,38 @@ state, and caption icons use the registered class or `WM_SETICON` resource.
 The private compatibility-DLL builder in `tools/build-portable-explorer-compat.py`
 fixes its folder-history comparison without modifying the original port.
 
+Editable drop-down fields, including Explorer's Run field, accept committed
+Unicode text. Clicking the text area focuses it; the arrow opens the history.
+Selecting a history entry copies its text into the field, and typing edits that
+text independently of the saved entries. Enter with the history closed activates
+the dialog's default button.
+
 The supplied CE6 `control.exe` can discover HLE applets through `CPlApplet`:
 Owner, Display brightness, Keyboard repeat, Mouse double-click timing, System
 identity, Volume & Sounds, and Input Panel. Forms validate and save to the private
-shared registry. The original ROM `cplmain.cpl` is used only for read-only
+shared registry. Owner has Identification/Notes pages, System has
+General/Memory/Device Name pages, and Volume & Sounds separates Volume and Sounds.
+The remaining supported applets expose their corresponding single page. Mouse,
+arrow keys and Ctrl+Tab switch pages while preserving unsaved fields. Apply and
+OK validate all pages; Cancel and the caption X discard edits since the last Apply.
+Owner notes support multiline text, and Memory reads the current emulated-device
+accounting when selected. The original ROM `cplmain.cpl` is used only for read-only
 resources; its instructions and `DllMain` are not executed. Other OEM CPLs and
 hardware settings remain outside this implementation.
+
+System sounds use the original WAV files in the mounted `Windows` directory.
+`MessageBeep`, named and numeric `PlaySound` aliases, desktop startup, message
+boxes, menu actions and classic window transitions follow the live CE registry.
+The positional `HKLM\Snd\Event` schemes retain empty entries as intentional
+silence. **Default sounds** includes startup and alerts; **All sounds** also
+enables menus and window transitions; **No sounds** silences system events.
+
+In **Control Panel → Volume & Sounds**, enable **system events**, choose a
+scheme, and select **Apply**. **Test** previews the current form without saving
+it. Application sounds and system events have separate enable switches and
+share the selected volume. Changes apply to the desktop and running children.
+Stopping `PlaySound` or closing a wave-output device preserves the other audio
+streams. Synchronous sound playback yields to the scheduler while it completes.
 
 In classic profiles, border-only applications such as the original CE6 Control
 Panel receive a Close button at the right of their existing command bar. A
@@ -126,6 +183,12 @@ unverified. Pocket Word's private defaults supply the image's `\Windows`
 template directory once, preserving existing registry values and subsequent
 user deletions. These are application compatibility additions, not complete
 Windows CE or browser conformance.
+
+`GetTextFaceW` reports the requested DC's selected logical font face, with the
+stock bitmap System face and the existing unnamed-font default. Its size query
+and bounded UTF-16 copy count the terminator; invalid DCs/buffers fail without
+drawing or publishing a frame. This supports Pocket Word's font-combobox setup;
+complete font-substitution and rich-edit behavior remain separate work.
 
 Original CE6 application DLLs such as `ceshell.dll` may have no relocation
 table. The application loader reserves their preferred address and places import
@@ -196,6 +259,43 @@ numeric changes send synchronous parent notifications, including vetoes and
 continuation restoration. In CE desktop mode, an unregistered class fails with
 error 1407 instead of reentering the application's main WM_CREATE handler.
 This is a supported common-control subset, not complete commctrl conformance.
+
+## CE device and service boundaries
+
+`GetPasswordActive` reads session-wide device metadata, inactive by default.
+It preserves the calling thread's last error and never reads the Windows host
+account. Password provisioning and authentication remain unsupported.
+
+`RegisterAFSName` reserves a bounded, case-insensitive filesystem name and returns
+an owned positive index. Invalid names/pointers return -1, duplicates fail, and
+another process cannot deregister an owned index. Parent/child applications share
+the namespace; process teardown releases only that owner's names. Reserving a name
+does not mount a filesystem. `RegisterAFSEx` validates the index, API-set handle,
+version and flags, then reports the absent handle-based filesystem marshalling.
+`DeregisterAFS` distinguishes a reserved name from a mounted provider.
+
+`ActivateDeviceEx` validates the HKLM path and complete ARM32 REGINI inputs before
+examining the driver configuration. Missing keys/settings, malformed data and
+unsupported providers have distinct failure results. Failed activation neither
+creates an active driver handle nor publishes REGINI values. Supplying ROM service
+executables is insufficient to implement their kernel/driver interfaces.
+
+Winsock `sendto` shares the actual stream transport and its buffer, socket and
+blocking error rules. For a connected RFCOMM stream the destination is ignored,
+and the backend's partial byte count is returned. Unsupported IPv4/UDP socket
+creation remains a failure; udp2tcp's invalid socket is not a successful send.
+
+`PowerOffSystem` suspends the virtual CE device at CPU boundaries, retaining its
+call until resume. Frontend Stop and input-file polling continue without taking
+the shared execution gate. A new key, stylus-down or text event resumes the device
+and emits the existing CE wakeup event; the input remains queued for the guest.
+The Windows host is never suspended. Driver power callbacks, physical wake sources
+and a full CE power-manager implementation remain separate work.
+
+MSVC `__CxxThrowException` is a noreturn boundary: it records 0xe06d7363 and halts
+with a bounded type diagnostic. Native C++ stack unwinding/catch dispatch remain
+unsupported. EmulatorStub still requires the absent Device Emulator DMA7: channel;
+handling its throw does not supply that driver or make the utility operational.
 
 ## Build and distribution
 

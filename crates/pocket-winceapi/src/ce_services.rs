@@ -10,6 +10,25 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler("coredll.dll", "__GetUserKData", user_kdata);
     d.register_handler("coredll.dll", "IsAPIReady", is_api_ready);
     d.register_handler("coredll.dll", "WaitForAPIReady", wait_api_ready);
+    d.register_handler("coredll.dll", "lineInitialize", line_initialize);
+}
+
+fn line_initialize(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let application = ctx.arg_u32(0)?;
+    let devices = ctx.arg_u32(4)?;
+    if application == 0
+        || devices == 0
+        || ctx
+            .cpu
+            .check_guest_access(application, 4, Prot::WRITE)
+            .is_err()
+        || ctx.cpu.check_guest_access(devices, 4, Prot::WRITE).is_err()
+    {
+        return Ok(DispatchOutcome::ReturnedR0(0x8000_0035)); // LINEERR_INVALPOINTER
+    }
+    // PegTerm must see the missing telephony provider as an actual TAPI
+    // error, never a successful initialization with uninitialized outputs.
+    Ok(DispatchOutcome::ReturnedR0(0x8000_0043)) // LINEERR_NODRIVER
 }
 
 fn user_kdata(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -89,6 +108,41 @@ mod tests {
     use super::*;
     use crate::bluetooth::tests::{call, setup};
     use pocket_cpu::Cpu;
+    #[test]
+    fn absent_tapi_provider_returns_driver_error_without_advertising_or_mutating_devices() {
+        let (mut cpu, mut k, mut d) = setup();
+        k.ce.version = Some((6, 0, 0));
+        cpu.write_mem(0x1400, &[0xa5; 8]).unwrap();
+        k.thread_last_errors.insert(0, 123);
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut k,
+                &mut d,
+                "coredll.dll",
+                "lineInitialize",
+                &[0x1400, 0, 0, 0, 0x1404]
+            ),
+            DispatchOutcome::ReturnedR0(0x8000_0043)
+        );
+        assert_eq!(cpu.read_mem(0x1400, 8).unwrap(), vec![0xa5; 8]);
+        assert_eq!(k.thread_last_errors[&0], 123);
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut k,
+                &mut d,
+                "coredll.dll",
+                "lineInitialize",
+                &[0, 0, 0, 0, 0x1404]
+            ),
+            DispatchOutcome::ReturnedR0(0x8000_0035)
+        );
+        assert_eq!(
+            call(&mut cpu, &mut k, &mut d, "coredll.dll", "IsAPIReady", &[86]),
+            DispatchOutcome::ReturnedR0(0)
+        );
+    }
     #[test]
     fn ce6_bootstrap_uses_live_kdata_and_only_implemented_api_sets() {
         let (mut cpu, mut kernel, mut dispatcher) = setup();
