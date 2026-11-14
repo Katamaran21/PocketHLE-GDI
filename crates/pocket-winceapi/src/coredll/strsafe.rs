@@ -7,6 +7,20 @@ const TOO_SMALL: u32 = 0x8007_007a;
 const MAX_CCH: u32 = 0x7fff_ffff;
 
 pub(super) fn register(dispatcher: &mut WinCeDispatcher, dll: &str) {
+    for (name, handler) in [
+        ("StringCchCopyA", ansi_copy as crate::Handler),
+        ("StringCbCopyA", ansi_copy),
+        ("StringCchCopyNA", ansi_copy_n),
+        ("StringCbCopyNA", ansi_copy_n),
+        ("StringCchCatA", ansi_cat),
+        ("StringCbCatA", ansi_cat),
+        ("StringCchCatNA", ansi_cat_n),
+        ("StringCbCatNA", ansi_cat_n),
+        ("StringCchLengthA", ansi_length),
+        ("StringCbLengthA", ansi_length),
+    ] {
+        dispatcher.register_handler(dll, name, handler);
+    }
     dispatcher.register_handler(dll, "StringCchCopyW", copy);
     dispatcher.register_handler(dll, "StringCchCopyNW", copy_n);
     dispatcher.register_handler(dll, "StringCchCatW", cat);
@@ -36,6 +50,205 @@ pub(super) fn register(dispatcher: &mut WinCeDispatcher, dll: &str) {
         ("StringCbVPrintfExW", cb_vprintf_ex),
     ] {
         dispatcher.register_handler(dll, name, handler);
+    }
+}
+
+fn ansi_read(
+    ctx: &mut CallCtx<'_>,
+    pointer: u32,
+    maximum: u32,
+) -> Result<Option<Vec<u8>>, KernelError> {
+    let mut bytes = Vec::new();
+    for index in 0..maximum {
+        let Some(address) = pointer.checked_add(index) else {
+            return Ok(None);
+        };
+        if ctx.cpu.check_guest_access(address, 1, Prot::READ).is_err() {
+            return Ok(None);
+        }
+        let byte = ctx.cpu.read_mem(address, 1)?[0];
+        if byte == 0 {
+            break;
+        }
+        bytes.push(byte);
+    }
+    Ok(Some(bytes))
+}
+fn ansi_copy(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ansi_copy_cat(ctx, false, None)
+}
+fn ansi_copy_n(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let maximum = ctx.arg_u32(3)?;
+    ansi_copy_cat(ctx, false, Some(maximum))
+}
+fn ansi_cat(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ansi_copy_cat(ctx, true, None)
+}
+fn ansi_cat_n(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let maximum = ctx.arg_u32(3)?;
+    ansi_copy_cat(ctx, true, Some(maximum))
+}
+fn ansi_copy_cat(
+    ctx: &mut CallCtx<'_>,
+    append: bool,
+    maximum: Option<u32>,
+) -> Result<DispatchOutcome, KernelError> {
+    let (dst, capacity, src) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?, ctx.arg_u32(2)?);
+    if dst == 0
+        || src == 0
+        || capacity == 0
+        || capacity > MAX_CCH
+        || maximum.is_some_and(|n| n > MAX_CCH)
+    {
+        return Ok(DispatchOutcome::ReturnedR0(INVALID));
+    }
+    let mut bytes = if append {
+        let Some(bytes) = ansi_read(ctx, dst, capacity)? else {
+            return Ok(DispatchOutcome::ReturnedR0(INVALID));
+        };
+        if bytes.len() as u32 == capacity {
+            return Ok(DispatchOutcome::ReturnedR0(INVALID));
+        }
+        bytes
+    } else {
+        Vec::new()
+    };
+    let remaining = capacity - bytes.len() as u32;
+    let Some(source) = ansi_read(ctx, src, maximum.unwrap_or(remaining).min(remaining))? else {
+        return Ok(DispatchOutcome::ReturnedR0(INVALID));
+    };
+    let truncated = source.len() as u32 >= remaining;
+    bytes.extend(source.into_iter().take(remaining as usize - 1));
+    bytes.push(0);
+    if ctx
+        .cpu
+        .check_guest_access(dst, bytes.len() as u32, Prot::WRITE)
+        .is_err()
+    {
+        return Ok(DispatchOutcome::ReturnedR0(INVALID));
+    }
+    ctx.cpu.write_mem(dst, &bytes)?;
+    Ok(DispatchOutcome::ReturnedR0(if truncated {
+        TOO_SMALL
+    } else {
+        0
+    }))
+}
+fn ansi_length(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let (src, maximum, out) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?, ctx.arg_u32(2)?);
+    if out != 0 && ctx.cpu.check_guest_access(out, 4, Prot::WRITE).is_err() {
+        return Ok(DispatchOutcome::ReturnedR0(INVALID));
+    }
+    let length = if src != 0 && maximum != 0 && maximum <= MAX_CCH {
+        ansi_read(ctx, src, maximum)?
+            .filter(|bytes| bytes.len() < maximum as usize)
+            .map(|bytes| bytes.len() as u32)
+    } else {
+        None
+    };
+    if out != 0 {
+        ctx.cpu.write_mem(out, &length.unwrap_or(0).to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(if length.is_some() {
+        0
+    } else {
+        INVALID
+    }))
+}
+
+#[cfg(test)]
+mod ansi_tests {
+    use super::*;
+    use crate::bluetooth::tests::{call, setup};
+    use pocket_cpu::Cpu;
+
+    #[test]
+    fn ansi_paths_are_copied_as_bytes_with_a_terminator_and_a_truncation_result() {
+        let (mut cpu, mut kernel, mut dispatcher) = setup();
+        cpu.write_mem(0x1100, b"folder\0").unwrap();
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "StringCchCopyA",
+                &[0x1200, 8, 0x1100]
+            ),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert_eq!(cpu.read_mem(0x1200, 7).unwrap(), b"folder\0");
+        cpu.write_mem(0x1300, &[0xa5; 5]).unwrap();
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "StringCchCopyA",
+                &[0x1300, 4, 0x1100]
+            ),
+            DispatchOutcome::ReturnedR0(TOO_SMALL)
+        );
+        assert_eq!(
+            cpu.read_mem(0x1300, 5).unwrap(),
+            [b'f', b'o', b'l', 0, 0xa5]
+        );
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "StringCchLengthA",
+                &[0x1200, 8, 0x1400]
+            ),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert_eq!(cpu.read_u32_le(0x1400).unwrap(), 6);
+    }
+
+    #[test]
+    fn bounded_ansi_copy_stops_at_its_component_and_does_not_read_the_next_page() {
+        let (mut cpu, mut kernel, mut dispatcher) = setup();
+        cpu.write_mem(0x4fff, &[0xe9]).unwrap();
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "StringCchCopyNA",
+                &[0x1200, 8, 0x4fff, 1]
+            ),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert_eq!(cpu.read_mem(0x1200, 2).unwrap(), [0xe9, 0]);
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "StringCchCopyA",
+                &[0x1300, 1, 0x4fff]
+            ),
+            DispatchOutcome::ReturnedR0(TOO_SMALL)
+        );
+        assert_eq!(cpu.read_mem(0x1300, 1).unwrap(), [0]);
+        cpu.write_mem(0x1300, &[0xa5; 8]).unwrap();
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "StringCchCopyA",
+                &[0x1300, 8, 0x5000]
+            ),
+            DispatchOutcome::ReturnedR0(INVALID)
+        );
+        assert_eq!(cpu.read_mem(0x1300, 8).unwrap(), [0xa5; 8]);
     }
 }
 

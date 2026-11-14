@@ -5,12 +5,13 @@ pub struct LaunchArgs {
     pub fullscreen: Option<bool>,
     pub filter: Option<usize>,
 }
-pub const HELP: &str = "Usage: pockethle-gui [--steam-deck] [\"Game name or ID\" [0|1 [filter-index]]]\n       pockethle-gui --ce-exe app.exe [CE options]\n\n0 = fullscreen, 1 = windowed. Omitted display mode opens a normal 1280x800 window (capped to the screen).\nFilters: 0 no filter, 1 reconstruction, 2 SMAA, 3 SMAA Soft,\n4 xBRZ, 5 bicubic, 6 Lanczos, 7 bilinear, 8 nearest.\n--steam-deck selects the Proton/Deck profile, separate settings.\n\nCE options:\n  --ce-profile NAME|FILE  Launch a saved CE profile or JSON profile file\n  --ce-root folder       Extracted image containing Windows or fs/Windows\n  --ce-data folder       Writable device data (automatic when omitted)\n  --ce-app-prefix path   Guest folder for the EXE and DLLs (default \\Application\\)\n  --ce-args text         Arguments passed to the guest application\n  --ce-screen WxH        640x480 (default), 320x240, 240x320, 480x320, 480x640\n  --ce-no-frames         Disable classic window decorations\n  --fullscreen          Start the CE session in fullscreen\n  --windowed            Start the CE session in a normal window";
+pub const HELP: &str = "Usage: pockethle-gui [--steam-deck] [\"Game name or ID\" [0|1 [filter-index]]]\n       pockethle-gui --ce-exe app.exe [CE options]\n\n0 = fullscreen, 1 = windowed. Omitted display mode opens a normal 1280x800 window (capped to the screen).\nFilters: 0 no filter, 1 reconstruction, 2 SMAA, 3 SMAA Soft,\n4 xBRZ, 5 bicubic, 6 Lanczos, 7 bilinear, 8 nearest.\n--steam-deck selects the Proton/Deck profile, separate settings.\n--minimized opens an inactive, minimized window without taking focus.\n\nCE options:\n  --ce-profile NAME|FILE  Launch a saved CE profile or JSON profile file\n  --ce-root folder       Extracted image containing Windows or fs/Windows\n  --ce-data folder       Writable device data (automatic when omitted)\n  --ce-app-prefix path   Guest folder for the EXE and DLLs (default \\Application\\)\n  --ce-args text         Arguments passed to the guest application\n  --ce-screen WxH        640x480 (default), 320x240, 240x320, 480x320, 480x640\n  --ce-no-frames         Disable classic window decorations\n  --fullscreen          Start the CE session in fullscreen\n  --windowed            Start the CE session in a normal window";
 
 #[derive(Debug, PartialEq)]
 pub struct StartupArgs {
     pub profile: pocket_library::LauncherProfile,
     pub help: bool,
+    pub minimized: bool,
     pub launch: Option<LaunchArgs>,
     pub ce_launch: Option<crate::ce_launch::CeLaunch>,
     pub ce_profile: Option<String>,
@@ -21,6 +22,7 @@ pub fn parse(mut args: Vec<String>) -> Result<StartupArgs, String> {
     use pocket_library::LauncherProfile;
     let mut profile = LauncherProfile::Standard;
     let mut help = false;
+    let mut minimized = false;
     let mut ce = crate::ce_launch::CeLaunch::default();
     let mut ce_options = false;
     let mut ce_profile = None;
@@ -32,6 +34,7 @@ pub fn parse(mut args: Vec<String>) -> Result<StartupArgs, String> {
                 profile = LauncherProfile::SteamDeck
             }
             "--help" | "-h" => help = true,
+            "--minimized" if !minimized => minimized = true,
             "--ce-profile" => {
                 if ce_profile.is_some() { return Err("Duplicate --ce-profile".into()); }
                 ce_profile = Some(args.get(1).cloned().ok_or_else(|| format!("--ce-profile requires a profile name or JSON file\n{HELP}"))?);
@@ -101,6 +104,7 @@ pub fn parse(mut args: Vec<String>) -> Result<StartupArgs, String> {
     Ok(StartupArgs {
         profile,
         help,
+        minimized,
         launch,
         ce_launch,
         ce_profile,
@@ -175,7 +179,7 @@ pub fn find_game<'a>(
         .collect();
     match matches.as_slice() {
         [(id, _)] => Ok((*id).into()),
-        [] => Err(format!("Game not found in the PocketHLE library: {query}")),
+        [] => Err(format!("Game not found in the PocketHLE-Reborn library: {query}")),
         _ => Err(format!(
             "Several games are named {query}. Use an ID: {}",
             matches

@@ -30,6 +30,9 @@ mod ce_api_sets;
 mod ce_app_events;
 mod ce_crypto;
 mod ce_database;
+mod ce_debug;
+mod ce_devices;
+mod ce_exceptions;
 mod ce_fonts;
 mod ce_indirect;
 #[cfg(all(test, feature = "unicorn-tests"))]
@@ -49,6 +52,7 @@ mod dc_state;
 pub mod ddraw;
 mod dialog_keys;
 mod directshow;
+mod toolhelp;
 pub use directshow::{
     system_media_command, system_media_status, SystemMediaCommand, SystemMediaInput,
     SystemMediaStatus,
@@ -56,27 +60,35 @@ pub use directshow::{
 pub mod dlgtemplate;
 pub mod game_dlls;
 pub mod gles;
+pub mod gles2;
 pub mod gles_exports;
 mod gps;
 pub mod gx;
 pub mod hss;
+mod htcsensor;
 mod imgdecmp;
+mod iphlpapi;
 mod legacy_services;
 #[cfg(feature = "video-static")]
 pub mod media_static;
 mod mfc;
 mod msxml;
+mod native_com;
 mod number_format;
 pub mod ole32;
+mod ole_automation;
+mod ole_bind;
+mod ole_run;
+mod ole_stream;
 pub mod ordinals;
 pub mod recording_encoder;
 mod scroll;
 mod sdl;
+mod security;
 mod serial;
 mod shell;
 mod shell_keyboard;
 mod vibration;
-mod wave_adpcm;
 mod wavein;
 mod wininet;
 mod ws2;
@@ -238,6 +250,8 @@ pub trait UnimplementedApiSink: Send {
     fn record(&mut self, call: UnimplementedApiCall<'_>);
 }
 
+type CallFilter = fn(&mut CallCtx<'_>, &str) -> Result<bool, KernelError>;
+
 /// Top-level dispatcher that owns per-DLL handler tables.
 pub struct WinCeDispatcher {
     /// Key is `(dll_lowercased, friendly_name)`.
@@ -262,6 +276,7 @@ pub struct WinCeDispatcher {
     /// If `true`, an unimplemented call halts the emulator instead of
     /// returning 0. Useful for the Linux CLI tracing run.
     pub halt_on_unimplemented: bool,
+    call_filter: Option<CallFilter>,
     /// Optional JSON-lines sink. One record per dispatched call.
     trace_sink: Option<Box<dyn Write + Send>>,
     unimplemented_sink: Option<Box<dyn UnimplementedApiSink>>,
@@ -289,6 +304,7 @@ impl WinCeDispatcher {
             system_ordinals: HashMap::new(),
             by_thunk_va: HashMap::new(),
             halt_on_unimplemented: false,
+            call_filter: None,
             trace_sink: None,
             unimplemented_sink: None,
             dependency_notice: None,
@@ -305,9 +321,14 @@ impl WinCeDispatcher {
         ce_indirect::register(&mut d);
         ce_fonts::register(&mut d);
         ce_crypto::register(&mut d);
+        security::register(&mut d);
+        iphlpapi::register(&mut d);
         ce_database::register(&mut d);
         ce_notify::register(&mut d);
         ce_services::register(&mut d);
+        ce_devices::register(&mut d);
+        ce_exceptions::register(&mut d);
+        ce_debug::register(&mut d);
         ce_sip::register(&mut d);
         ce_api_sets::register(&mut d);
         ce_app_events::register(&mut d);
@@ -315,6 +336,7 @@ impl WinCeDispatcher {
         legacy_services::register(&mut d);
         ddraw::register(&mut d);
         aygshell::register(&mut d);
+        toolhelp::register(&mut d);
         commctrl::register(&mut d);
         copilot::register(&mut d);
         scroll::register(&mut d);
@@ -322,9 +344,10 @@ impl WinCeDispatcher {
         gles::register(&mut d);
         gx::register(&mut d);
         hss::register(&mut d);
+        htcsensor::register(&mut d);
         ole32::register(&mut d);
         msxml::register(&mut d);
-        for dll in ["coredll.dll", "ws2.dll"] {
+        for dll in ["coredll.dll", "ws2.dll", "aygshell.dll"] {
             for ordinal in 0..=4095u16 {
                 if let Some(name) = ordinals::lookup(dll, ordinal) {
                     let source = (dll.to_string(), name);
@@ -341,6 +364,11 @@ impl WinCeDispatcher {
             }
         }
         d
+    }
+
+    /// Limit API calls in an isolated setup process.
+    pub fn set_call_filter(&mut self, filter: CallFilter) {
+        self.call_filter = Some(filter);
     }
 
     /// Only frontends launching PocketPC games enable user-facing diagnostics.
@@ -543,6 +571,12 @@ impl Dispatcher for WinCeDispatcher {
 
     fn dynamic_names(&self, dll: &str) -> Vec<String> {
         let dll_key = dll.to_ascii_lowercase();
+        if dll_key == "libglesv2.dll" {
+            return gles2::EXPORTS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect();
+        }
         let mut names: Vec<String> = self
             .by_name
             .keys()
@@ -551,6 +585,7 @@ impl Dispatcher for WinCeDispatcher {
             .collect();
         if !self.system_ordinals.contains_key(&dll_key)
             && (dll_key == "coredll.dll"
+                || dll_key == "aygshell.dll"
                 || dll_key == "ws2.dll"
                 || pocket_gles::ordinals::is_gles_dll(&dll_key))
         {
@@ -581,6 +616,22 @@ impl Dispatcher for WinCeDispatcher {
         names
     }
 
+    fn attach_static_imports(
+        &mut self,
+        cpu: &mut dyn Cpu,
+        kernel: &mut KernelState,
+    ) -> Result<Option<u32>, KernelError> {
+        coredll::attach_static_imports(cpu, kernel, false)
+    }
+
+    fn continue_static_attach(
+        &mut self,
+        cpu: &mut dyn Cpu,
+        kernel: &mut KernelState,
+    ) -> Result<Option<u32>, KernelError> {
+        coredll::attach_static_imports(cpu, kernel, true)
+    }
+
     fn dispatch(
         &mut self,
         cpu: &mut dyn Cpu,
@@ -589,6 +640,11 @@ impl Dispatcher for WinCeDispatcher {
     ) -> Result<DispatchOutcome, KernelError> {
         kernel.reclaim_finished_stacks(cpu)?;
         kernel.sync_transferred_handles();
+        coredll::system_sound::service_pending(kernel);
+        if let Some(outcome) = coredll::console::service_input(&mut CallCtx { cpu, thunk, kernel })?
+        {
+            return Ok(outcome);
+        }
         if let Some(outcome) = coredll::wake_due_worker(&mut CallCtx { cpu, thunk, kernel })? {
             return Ok(outcome);
         }
@@ -616,7 +672,19 @@ impl Dispatcher for WinCeDispatcher {
         } else {
             thunk
         };
-        let handler_opt = if coredll::native_import_preferred(kernel, thunk) {
+        let programmable_handler = gles2::handler(thunk);
+        if let Some(filter) = self.call_filter {
+            let name = import_name(thunk);
+            if !filter(&mut CallCtx { cpu, thunk, kernel }, &name)? {
+                return Err(KernelError::Dispatch(format!(
+                    "CAB setup cannot call {}!{name}",
+                    thunk.dll
+                )));
+            }
+        }
+        let handler_opt = if programmable_handler.is_some() {
+            programmable_handler
+        } else if coredll::native_import_preferred(kernel, thunk) {
             Some(coredll::native_import as Handler)
         } else {
             self.resolve_handler(thunk).or_else(|| {
@@ -663,7 +731,8 @@ impl Dispatcher for WinCeDispatcher {
                 log::trace!("call {}", thunk.label());
             }
             let mut ctx = CallCtx { cpu, thunk, kernel };
-            if gles::needs_thread_switch(ctx.kernel.current_thread)
+            if programmable_handler.is_none()
+                && gles::needs_thread_switch(ctx.kernel.current_thread)
                 && ["libgles_cm.dll", "libgles_cl.dll", "libegl.dll"]
                     .iter()
                     .any(|dll| thunk.dll.eq_ignore_ascii_case(dll))
@@ -699,7 +768,7 @@ impl Dispatcher for WinCeDispatcher {
                     .insert(thunk.dll.to_ascii_lowercase())
                 {
                     let detail = if coredll::runtime_hle_dll(&thunk.dll) {
-                        "This system API needs an implementation in PocketHLE; do not install a system DLL.".to_owned()
+                        "This system API needs an implementation in PocketHLE-Reborn; do not install a system DLL.".to_owned()
                     } else {
                         let folder = kernel
                             .module_search_dirs
@@ -933,6 +1002,23 @@ mod tests {
     }
 
     #[test]
+    fn imm_escape_reports_unsupported_for_the_builtin_input_context() {
+        let (mut cpu, mut kernel, mut dispatcher) = crate::bluetooth::tests::setup();
+        dispatcher.halt_on_unimplemented = true;
+        assert_eq!(
+            crate::bluetooth::tests::call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "ImmEscapeW",
+                &[0, 0x494d_0001, 0x0800, 0],
+            ),
+            pocket_kernel::DispatchOutcome::ReturnedR0(0),
+        );
+    }
+
+    #[test]
     fn constant_for_get_last_error_is_stateful() {
         let d = WinCeDispatcher::new();
         // `GetLastError` is stateful and must cross the dispatcher.
@@ -940,6 +1026,22 @@ mod tests {
         assert_eq!(d.constant_for(&t), None);
         let setter = fake_thunk("coredll.dll", "SetLastError");
         assert_eq!(d.constant_for(&setter), None);
+    }
+
+    #[test]
+    fn sound_apis_keep_their_registry_and_playback_side_effects() {
+        let mut d = WinCeDispatcher::new();
+        for name in [
+            "MessageBeep",
+            "PlaySoundW",
+            "PlaySoundA",
+            "sndPlaySoundW",
+            "sndPlaySoundA",
+        ] {
+            let thunk = fake_thunk("coredll.dll", name);
+            assert_eq!(d.constant_for(&thunk), None, "{name}");
+            assert!(d.resolve_handler(&thunk).is_some(), "{name}");
+        }
     }
 
     #[test]
@@ -1099,3 +1201,5 @@ impl Drop for SuspendedSession {
         coredll::resume_tokenizer(self.tokenizer);
     }
 }
+
+pub mod unimplemented_log;

@@ -8,7 +8,7 @@ package com.pockethle.app
  * used as the lingua franca to keep the FFI surface minimal — no
  * shared data classes between Rust and Kotlin.
  *
- * The session-based methods (`nativeStartGame`, `nativePollFrame`,
+ * The session-based methods (`nativeStartGameWithDiagnostic`, `nativePollFrame`,
  * `nativeSendInput`, `nativeRequestStop`, `nativeFinishGame`) are
  * the ones [GameActivity] uses to drive the real-time emulator.
  * They do *not* round-trip JSON; they exchange a `long` opaque
@@ -27,6 +27,7 @@ object NativeBridge {
     @JvmStatic fun httpRead(id: Int, size: Int): ByteArray = InternetHost.read(id, size)
     @JvmStatic fun httpClose(id: Int) = InternetHost.close(id)
     @JvmStatic fun batteryStatus(): Int = BatteryHost.read()
+    @JvmStatic fun displayPowerState(): Int = BatteryHost.displayPowerState()
     @JvmStatic fun deviceStatus(): Int = DeviceStatusHost.read()
     @JvmStatic fun gpsOpen(): Int = GpsHost.open()
     @JvmStatic fun gpsRead(id: Int): ByteArray = GpsHost.read(id)
@@ -67,6 +68,7 @@ object NativeBridge {
     /** Prepares an import and returns its choices/token; commit returns the imported entries. */
     @JvmStatic external fun prepareImport(libraryRoot: String, source: String): String
     @JvmStatic external fun choosePreparedImportCabinet(libraryRoot: String, token: Long, index: Int): String
+    @JvmStatic external fun choosePreparedImportExecutable(libraryRoot: String, token: Long, gameId: String, index: Int): String
     @JvmStatic external fun choosePreparedImportPlatform(libraryRoot: String, token: Long, gameId: String, gizmondo: Boolean): String
     @JvmStatic external fun commitPreparedImport(libraryRoot: String, token: Long, allowUpdates: Boolean): String
     @JvmStatic external fun cancelPreparedImport(libraryRoot: String, token: Long)
@@ -76,7 +78,7 @@ object NativeBridge {
 
     /** Returns `{"ok":true}` on success or `{"ok":false,"error":...}`. */
     /** Stage only; commit requires explicit overwrite consent if conflicts is nonempty. */
-    @JvmStatic external fun prepareGameData(libraryRoot: String, id: String, source: String, name: String, extract: Boolean): String
+    @JvmStatic external fun prepareGameData(libraryRoot: String, id: String, source: String, name: String, extract: Boolean, myDocuments: Boolean): String
     @JvmStatic external fun commitGameData(libraryRoot: String, token: Long, overwrite: Boolean, executable: String): String
     @JvmStatic external fun cancelGameData(libraryRoot: String, token: Long)
 
@@ -85,11 +87,17 @@ object NativeBridge {
     /** Returns the launcher config as JSON. */
     @JvmStatic external fun readConfig(libraryRoot: String): String
 
+    @JvmStatic external fun cleanupCabInstallFiles(libraryRoot: String): String
+
     /** Persists the launcher config from a JSON blob. */
     @JvmStatic external fun writeConfig(libraryRoot: String, configJson: String): String
 
+    /** Merge first-import choices without replacing unrelated settings or game data. */
+    @JvmStatic external fun finishImportSetup(libraryRoot: String, choicesJson: String): String
+
     /** Returns the per-game settings as JSON. */
     @JvmStatic external fun readGameSettings(libraryRoot: String, id: String): String
+    @JvmStatic external fun launchExecutables(libraryRoot: String, id: String, selected: String?): String
 
     /** Persists the per-game settings from a JSON blob. */
     @JvmStatic external fun writeGameSettings(
@@ -104,12 +112,12 @@ object NativeBridge {
 
     /**
      * Spawn a worker thread that drives the emulator for [id].
-     * Returns an opaque handle (>0 on success, 0 on failure). Pass
-     * the same handle into every other `native…` call below until
+     * Returns JSON with an opaque handle or a startup diagnostic. Pass
+     * the handle into every other `native…` call below until
      * [nativeFinishGame] is called, after which the handle is
      * invalid and **must not** be passed back in.
      */
-    @JvmStatic external fun nativeStartGame(libraryRoot: String, id: String, presentation: Long = 0): Long
+    @JvmStatic external fun nativeStartGameWithDiagnostic(libraryRoot: String, id: String, presentation: Long = 0): String
 
     /** Changed images per second, or -1 before the first change. */
     @JvmStatic external fun nativePublishedImageIps(handle: Long): Float
@@ -167,6 +175,8 @@ object NativeBridge {
      */
     const val INPUT_KEYBOARD_ROTATION = 5
 
+    @JvmStatic external fun nativeSetAccelerometer(present: Boolean, x: Float, y: Float, z: Float)
+
     @JvmStatic external fun nativeSendInput(
         handle: Long,
         kind: Int,
@@ -179,7 +189,7 @@ object NativeBridge {
 
     /**
      * Join the worker thread, free the session, and return the
-     * textual summary it produced. After this call the handle is
+     * JSON summary and optional diagnostic. After this call the handle is
      * invalid and **must not** be passed back in.
      */
     @JvmStatic external fun nativeFinishGame(handle: Long): String

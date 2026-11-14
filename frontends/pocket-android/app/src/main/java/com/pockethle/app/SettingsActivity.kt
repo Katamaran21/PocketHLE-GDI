@@ -1,13 +1,19 @@
 package com.pockethle.app
 
 import android.os.Bundle
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.widget.Toolbar
+import androidx.lifecycle.lifecycleScope
+import androidx.preference.CheckBoxPreference
 import androidx.preference.ListPreference
 import androidx.preference.Preference
 import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.SeekBarPreference
 import androidx.preference.SwitchPreferenceCompat
 import org.json.JSONObject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Global launcher settings (default backend, log verbosity). */
 class SettingsActivity : HostKeyActivity() {
@@ -116,34 +122,23 @@ class SettingsActivity : HostKeyActivity() {
                     writeConfig();true
                 }
             })
+            pocketpc.addPreference(ListPreference(requireContext()).apply {
+                key = "pocketpc_tilt_input"
+                title = "Tilt input (accelerometer)"
+                isPersistent = false
+                entries = TiltInput.values().map { it.label }.toTypedArray()
+                entryValues = TiltInput.values().map { it.id }.toTypedArray()
+                value = current.pocketpcTiltInput.id
+                summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
+                setOnPreferenceChangeListener { _, value ->
+                    val input = TiltInput.fromId(value.toString()) ?: return@setOnPreferenceChangeListener false
+                    current = current.copy(pocketpcTiltInput = input)
+                    writeConfig()
+                    true
+                }
+            })
             identityField(ppc, "device_preset_id", "Device name (Preset ID — WinCE)")
             identityField(ppc, "device_platform_id", "Console identifier (Platform ID — hexadecimal, WinCE)")
-            val ppcGraphics = androidx.preference.PreferenceCategory(requireContext()).apply { title = "Graphics compatibility" }
-            ppc.addPreference(ppcGraphics)
-            ppcGraphics.addPreference(SwitchPreferenceCompat(requireContext()).apply {
-                key = "pocketpc_intel2700g_depth_bias"
-                title = "Intel 2700G depth-bias compatibility"
-                summary = "Use if projected lights or ground decals show through foreground objects. Reproduces the original WinCE driver's integer constant bias without its slope term, with 24-bit depth. Applies next launch, in software and GPU modes."
-                isPersistent = false
-                isChecked = current.toJson().optBoolean("pocketpc_intel2700g_depth_bias", false)
-                setOnPreferenceChangeListener { _, value ->
-                    current = current.copy(originalJson = current.toJson().put("pocketpc_intel2700g_depth_bias", value as Boolean).toString())
-                    writeConfig()
-                    true
-                }
-            })
-            ppcGraphics.addPreference(SwitchPreferenceCompat(requireContext()).apply {
-                key = "pocketpc_nv_combiners"
-                title = "NVIDIA GoForce 5500 AR10/AR11 combiners"
-                summary = "Enable NVIDIA GoForce 5500 combiner programs for PocketPC games that request them. Applies next launch, in software and GPU modes."
-                isPersistent = false
-                isChecked = current.toJson().optBoolean("pocketpc_nv_combiners", true)
-                setOnPreferenceChangeListener { _, value ->
-                    current = current.copy(originalJson = current.toJson().put("pocketpc_nv_combiners", value as Boolean).toString())
-                    writeConfig()
-                    true
-                }
-            })
             identityField(giz, "gizmondo_preset_id", "Device name (Preset ID — Gizmondo)")
             identityField(giz, "gizmondo_platform_id", "Console identifier (Platform ID — hexadecimal, Gizmondo)")
             fun toggle(keyName: String, label: String, checked: Boolean, update: (Boolean) -> Unit) {
@@ -244,15 +239,43 @@ class SettingsActivity : HostKeyActivity() {
             })
             findPreference<androidx.preference.PreferenceCategory>("graphics_options")!!.addPreference(SwitchPreferenceCompat(requireContext()).apply {
                 key="gpu_renderer"; title="GPU rendering"; isPersistent=false; isChecked=current.gpuRenderer
-                summary="Host OpenGL; takes effect on the next launch. Can be overridden per game."
-                setOnPreferenceChangeListener { _,v -> current=current.copy(gpuRenderer=v as Boolean);findPreference<ListPreference>("gles_internal_resolution")?.isEnabled=current.gpuRenderer;writeConfig();true }
+                summary="Host OpenGL for OpenGL ES 1.x. Takes effect the next time a game launches."
+                setOnPreferenceChangeListener { _, v ->
+                    current = current.copy(gpuRenderer = v as Boolean)
+                    writeConfig()
+                    true
+                }
             })
             findPreference<androidx.preference.PreferenceCategory>("graphics_options")!!.addPreference(ListPreference(requireContext()).apply {
-                key="gles_internal_resolution"; title="OpenGLES internal resolution (GPU only)"; isPersistent=false
-                entries=arrayOf("Native (1×)", "2x - only for 320x240 games", "3x - only for 320x240 games", "4x - only for 320x240 games", "2x - also for 640x480 games"); entryValues=arrayOf("1", "3", "4", "5", "2")
-                value=current.glesInternalResolution.toString(); isEnabled=current.gpuRenderer
-                summary="Includes portrait equivalents (240x320 and 480x640). QVGA-only 2x/3x/4x modes leave larger surfaces native; the other 2x mode doubles them. Display size is automatic; PocketPC fits whole logical-screen multiples regardless of internal resolution. Touch coordinates stay logical. More GPU/readback work; no extra detail for 2D assets. Applies next launch."
-                setOnPreferenceChangeListener { _, v -> current=current.copy(glesInternalResolution=v.toString().toInt());writeConfig();true }
+                key = "gles_internal_resolution"
+                title = "OpenGL ES internal resolution (host OpenGL)"
+                isPersistent = false
+                entries = arrayOf("Native", "2×", "3×", "4×")
+                entryValues = arrayOf("1", "2", "3", "4")
+                value = current.glesResolutionScale.toString()
+                summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
+                setOnPreferenceChangeListener { _, v ->
+                    current = current.withGlesResolution(v.toString().toInt(), current.glesResolutionAllSizes)
+                    findPreference<CheckBoxPreference>("gles_resolution_all_sizes")?.apply {
+                        isChecked = current.glesResolutionAllSizes
+                        isEnabled = current.glesResolutionScale > 1
+                    }
+                    writeConfig()
+                    true
+                }
+            })
+            findPreference<androidx.preference.PreferenceCategory>("graphics_options")!!.addPreference(CheckBoxPreference(requireContext()).apply {
+                key = "gles_resolution_all_sizes"
+                title = "Apply to all resolutions, including sizes other than 320×240"
+                summary = "When unchecked, only 320×240 and 240×320 are scaled. Applies the next time a game launches."
+                isPersistent = false
+                isChecked = current.glesResolutionAllSizes
+                isEnabled = current.glesResolutionScale > 1
+                setOnPreferenceChangeListener { _, v ->
+                    current = current.withGlesResolution(current.glesResolutionScale, v as Boolean)
+                    writeConfig()
+                    true
+                }
             })
             findPreference<androidx.preference.PreferenceCategory>("graphics_options")!!.addPreference(ListPreference(requireContext()).apply {
                 key="frame_rate_limit"; title="Frame rate limit"; isPersistent=false
@@ -322,6 +345,29 @@ class SettingsActivity : HostKeyActivity() {
                 }
             }
             findPreference<Preference>("library_root")?.summary = rootDir
+            findPreference<Preference>("cleanup_cab")?.setOnPreferenceClickListener { preference ->
+                preference.isEnabled = false
+                lifecycleScope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching { JSONObject(NativeBridge.cleanupCabInstallFiles(rootDir)) }
+                    }
+                    preference.isEnabled = true
+                    val response = result.getOrNull()
+                    if (isAdded) {
+                        val ok = response?.optBoolean("ok") == true
+                        AlertDialog.Builder(requireContext())
+                            .setTitle(if (ok) "CAB cleanup complete" else "CAB cleanup failed")
+                            .setMessage(
+                                response?.optString(if (ok) "message" else "error")
+                                    ?: result.exceptionOrNull()?.localizedMessage
+                                    ?: "Could not check CAB install files."
+                            )
+                            .setPositiveButton(android.R.string.ok, null)
+                            .show()
+                    }
+                }
+                true
+            }
             if (rootKey != null) preferenceScreen = findPreference<androidx.preference.PreferenceScreen>(rootKey)!!
         }
 
@@ -354,7 +400,7 @@ class SettingsActivity : HostKeyActivity() {
             val result=runCatching { JSONObject(NativeBridge.writeConfig(rootDir,current.toJson().toString())) }.getOrNull()
             val saved = runCatching { JSONObject(NativeBridge.readConfig(rootDir)) }.getOrNull()
             if (result?.optBoolean("ok", false) == true && saved?.optString("android_pocketpc_touch_layout", "") != current.pocketpcTouchLayout) {
-                android.widget.Toast.makeText(context, "Touch layout could not be saved. Please update PocketHLE and try again.", android.widget.Toast.LENGTH_LONG).show()
+                android.widget.Toast.makeText(context, "Touch layout could not be saved. Please update PocketHLE-Reborn and try again.", android.widget.Toast.LENGTH_LONG).show()
             }
             if (result?.optBoolean("ok", false) == true &&
                 (saved == null || !saved.has("android_gizmondo_maximize_screen") ||
@@ -363,7 +409,7 @@ class SettingsActivity : HostKeyActivity() {
             }
             val gpuSaved = saved != null && saved.optString("frame_rate_limit", "") == current.frameRateLimit && saved.has("gpu_renderer") && saved.optBoolean("gpu_renderer") == current.gpuRenderer && saved.has("gles_internal_resolution") && saved.optInt("gles_internal_resolution") == current.glesInternalResolution
             if (result?.optBoolean("ok", false) == true && saved?.optString("android_gizmondo_controls_size", "") != current.gizmondoControlsSize) {
-                android.widget.Toast.makeText(context, "Control size could not be saved. Please update PocketHLE and try again.", android.widget.Toast.LENGTH_LONG).show()
+                android.widget.Toast.makeText(context, "Control size could not be saved. Please update PocketHLE-Reborn and try again.", android.widget.Toast.LENGTH_LONG).show()
             }
             if (result?.optBoolean("ok", false) == true && saved?.optString("android_pocketpc_controls_size", "") != current.pocketpcControlsSize) {
                 android.widget.Toast.makeText(context, "Control size was not saved. Rebuild and install the updated native libraries and APK.", android.widget.Toast.LENGTH_LONG).show()

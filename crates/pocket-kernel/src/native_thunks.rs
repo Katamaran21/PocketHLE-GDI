@@ -57,10 +57,8 @@ pub fn mips_thunk_for(dll: &str, name: &str) -> Option<[u32; 8]> {
     crate::mips_native_thunks::native_thunk_for(dll, name)
 }
 
-/// Pure 64-bit helpers cannot fit a general integer divide in a 32-byte ARM
-/// thunk. Colors' pose interpolation calls these repeatedly per model. A CPU
-/// backend may serve their exact register arithmetic without leaving its run
-/// loop; unsupported backends retain the regular handler.
+/// Serve register-only helpers with the same arithmetic as their host handlers,
+/// without leaving the CPU run loop. Unsupported backends retain dispatch.
 pub fn install_inline_arithmetic64(
     cpu: &mut dyn pocket_cpu::Cpu,
     va: u32,
@@ -72,6 +70,10 @@ pub fn install_inline_arithmetic64(
         return Ok(false);
     }
     let operation = match name {
+        "sqrtf" => Arithmetic64::SingleSquareRoot,
+        "sqrt" => Arithmetic64::DoubleSquareRoot,
+        "sin" => Arithmetic64::DoubleSine,
+        "cos" => Arithmetic64::DoubleCosine,
         "__i64tod" => Arithmetic64::SignedToDouble,
         "__u64tod" => Arithmetic64::UnsignedToDouble,
         "__dtoi64" => Arithmetic64::DoubleToSigned,
@@ -125,7 +127,8 @@ const BYTE_COPY: [u32; 8] = [
 /// Shared bounded-copy helper in the synthetic tick page or a DLL thunk pool.
 /// Aligned 4/16-byte copies load all source words before storing. Other small
 /// copies choose the direction needed for memmove, without touching neighbours.
-pub const SMALL_COPY_HELPER_BYTES: u32 = 512;
+pub const SMALL_COPY_HELPER_BYTES: u32 = 0x300;
+const COPY_SELECTOR_OFFSET: u32 = 0x200;
 pub const SMALL_COPY_HELPER: u32 = TICK_PAGE_VA + 0x100;
 pub fn install_small_copy_helper(
     cpu: &mut dyn pocket_cpu::Cpu,
@@ -193,7 +196,57 @@ pub fn install_small_copy_helper_at(
             .collect::<Vec<_>>(),
     )?;
     install_int64_double(cpu, address + 0x100, true)?;
-    install_int64_double(cpu, address + 0x180, false)
+    install_int64_double(cpu, address + 0x180, false)?;
+    install_copy_selector(cpu, address + COPY_SELECTOR_OFFSET)
+}
+
+/// IP holds the caller's hooked fallback. Keep R0-R2 untouched until the copy
+/// is selected. Copies through the synthetic framebuffer window retain the
+/// WinCE handler's publication logic. Page crossings retain the host path's
+/// source read before any destination write.
+fn install_copy_selector(
+    cpu: &mut dyn pocket_cpu::Cpu,
+    address: u32,
+) -> Result<(), pocket_cpu::CpuError> {
+    // The framebuffer boundary below is encoded as an ARM immediate.
+    const _: () = assert!(crate::SYNTHETIC_FRAMEBUFFER_BASE == 0x7800_0000);
+    let words: [u32; 34] = [
+        0xe3520010, // cmp r2,#16
+        0x9affff7d, // bls original small-copy helper (selector - 0x200)
+        0xe3520020, // cmp r2,#32
+        0x13520030, // cmpne r2,#48
+        0x13520040, // cmpne r2,#64
+        0x112fff1c, // bxne ip
+        0xe1803001, // orr r3,r0,r1
+        0xe3130003, // tst r3,#3
+        0x112fff1c, // bxne ip
+        0xe0903002, // adds r3,r0,r2
+        0x212fff1c, // bxcs ip (address overflow)
+        0xe3530478, // cmp r3,#0x78000000
+        0x812fff1c, // bxhi ip (framebuffer or above)
+        0xe1a03a00, // mov r3,r0,lsl #20 (offset within a 4 KiB page)
+        0xe1730a02, // cmn r3,r2,lsl #20
+        0x212fff1c, // bxcs ip
+        0xe1a03a01, // mov r3,r1,lsl #20
+        0xe1730a02, // cmn r3,r2,lsl #20
+        0x212fff1c, // bxcs ip
+        0xe1500001, // cmp r0,r1
+        0x9a000006, // bls forward
+        0xe0811002, // add r1,r1,r2
+        0xe080c002, // add ip,r0,r2
+        0xe5313004, // ldr r3,[r1,#-4]!
+        0xe52c3004, // str r3,[ip,#-4]!
+        0xe2522004, // subs r2,r2,#4
+        0x1afffffb, // bne backward loop
+        BX_LR, 0xe1a0c000, // mov ip,r0
+        0xe4913004, // ldr r3,[r1],#4
+        0xe48c3004, // str r3,[ip],#4
+        0xe2522004, // subs r2,r2,#4
+        0x1afffffb, // bne forward loop
+        BX_LR,
+    ];
+    let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    cpu.write_mem(address, &bytes)
 }
 
 // high32*2^32 and low32 are exactly representable doubles. Only their sum
@@ -267,7 +320,7 @@ pub fn native_thunk_with_helper(
             BX_LR,
         ]);
     }
-    let delta = i64::from(helper) - (i64::from(address) + 24 + 8);
+    let delta = i64::from(helper + COPY_SELECTOR_OFFSET) - (i64::from(address) + 20 + 8);
     if delta % 4 != 0 || !(-(1i64 << 25)..(1i64 << 25)).contains(&delta) {
         return Some(original);
     }
@@ -276,9 +329,9 @@ pub fn native_thunk_with_helper(
         0x05d1_3000, // ldrbeq r3,[r1]
         0x05c0_3000, // strbeq r3,[r0]
         0x012f_ff1e, // bxeq lr
-        0xe352_0010, // cmp r2,#16
-        0x8a00_0000, // bhi slot+28
+        0xe28f_c004, // adr ip,slot+28
         0xea00_0000 | (((delta >> 2) as u32) & 0x00ff_ffff),
+        BX_LR,
         BX_LR, // host fallback hook
     ])
 }
@@ -496,6 +549,17 @@ pub fn native_thunk_for(dll: &str, name: &str) -> Option<[u32; 8]> {
         "__rt_sdiv" => pad(&[0xE71C_F011, 0xE061_109C, 0xE1A0_000C, BX_LR]),
         "__rt_udiv" => pad(&[0xE73C_F011, 0xE061_109C, 0xE1A0_000C, BX_LR]),
 
+        // The low 64 bits are the full low-word product plus the two
+        // cross-products shifted by 32. Signedness does not affect these bits.
+        "__ll_mul" => pad(&[
+            0xE00C_0291, // mul ip,r1,r2
+            0xE02C_C390, // mla ip,r0,r3,ip
+            0xE081_3290, // umull r3,r1,r0,r2
+            0xE081_100C, // add r1,r1,ip
+            0xE1A0_0003, // mov r0,r3
+            BX_LR,
+        ]),
+
         // ---- f32 binary arithmetic --------------------------------------
         // vmov s0,r0 / vmov s1,r1 / vOP.f32 s0,s0,s1 / vmov r0,s0 / bx lr
         "__adds" => pad(&[0xEE00_0A10, 0xEE00_1A90, 0xEE30_0A20, 0xEE10_0A10, BX_LR]),
@@ -613,6 +677,37 @@ pub fn thunk_bytes(words: &[u32; 8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "unicorn-tests")]
+    #[test]
+    fn arm_long_multiply_returns_the_wrapping_product() {
+        use pocket_cpu::{regs::ArmReg, Cpu, Prot, StopReason};
+        let mut cpu = pocket_cpu::unicorn::UnicornCpu::new().unwrap();
+        cpu.map_region(0x1000, 0x1000, Prot::ALL).unwrap();
+        let words = native_thunk_for("coredll.dll", "__ll_mul").unwrap();
+        cpu.write_mem(0x1200, &thunk_bytes(&words)).unwrap();
+        cpu.add_code_hook(0x1100).unwrap();
+        for (a, b) in [
+            (0, u64::MAX),
+            (0xffff_ffff, 0xffff_ffff),
+            (0x1_0000_0001, 0x1_0000_0001),
+            (0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210),
+            (u64::MAX, 2),
+        ] {
+            cpu.write_reg(ArmReg::R0, a as u32).unwrap();
+            cpu.write_reg(ArmReg::R1, (a >> 32) as u32).unwrap();
+            cpu.write_reg(ArmReg::R2, b as u32).unwrap();
+            cpu.write_reg(ArmReg::R3, (b >> 32) as u32).unwrap();
+            cpu.write_reg(ArmReg::Lr, 0x1100).unwrap();
+            assert_eq!(
+                cpu.run_until_hook(0x1200, 0).unwrap(),
+                StopReason::Hook(0x1100)
+            );
+            let result = u64::from(cpu.read_reg(ArmReg::R0).unwrap())
+                | (u64::from(cpu.read_reg(ArmReg::R1).unwrap()) << 32);
+            assert_eq!(result, a.wrapping_mul(b));
+        }
+    }
 
     #[test]
     fn floating_comparisons_fit_native_slots_and_are_coredll_only() {

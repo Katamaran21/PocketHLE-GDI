@@ -2,7 +2,7 @@
 
 This is the current graphics guide. Older rasterizer milestones, regression
 investigations and historical test counts are retained in
-[implementation notes](IMPLEMENTATION-NOTES.md#history-gpu), not as current
+[implementation notes](history/IMPLEMENTATION-NOTES.md#history-gpu), not as current
 feature switches or universal compatibility claims.
 
 ## Rendering and presentation
@@ -23,6 +23,26 @@ Do not describe all presentation as synchronous readback or claim every frame is
 zero-copy. The correct path depends on pixel authority and the consumer.
 Initialization failure may select software; runtime GPU failure must be reported,
 not silently hidden by continuing with stale software depth or color state.
+
+## Renderer identity
+
+For GLES 1.x, guest `glGetString(GL_RENDERER)` returns the active host OpenGL
+renderer name when a native renderer exists, or `PocketHLE Software Rasterizer`
+in PocketHLE-Reborn's software mode. The host name is captured once during renderer initialization
+and follows the current EGL surface's renderer; querying it does not bind a
+context or synchronize GPU work. Guest strings retain the existing process-owned
+allocation cache, so earlier returned pointers survive a backend change.
+
+This identifies the host OpenGL implementation, including ANGLE or a host
+software renderer such as llvmpipe when present; it is not a host GPU inventory.
+Guest `GL_VENDOR`, `GL_VERSION` and extensions still describe PocketHLE-Reborn's emulated
+API. The shared implementation applies to desktop and Android. Games which
+branch on renderer-name substrings can consequently select different paths.
+
+The GLES 2.0 guest renderer string is `Adreno 200 (PocketHLE)`. The
+**Generic OpenGL ES (2.0, Common)** settings label identifies the profile.
+The guest renderer string identifies the compatibility target, independently
+of whether host OpenGL runs on a GPU or through a software driver.
 
 ## Authority and lifetimes
 
@@ -46,20 +66,204 @@ not silently hidden by continuing with stale software depth or color state.
 
 ## PocketPC graphics compatibility options
 
-The PocketPC options panel exposes **NVIDIA GoForce 5500 AR10/AR11 combiners**
-immediately below Intel 2700G depth-bias compatibility, on desktop and Android.
-It is a global PocketPC setting, applied on the next launch in software and GPU
-modes. The persisted `pocketpc_nv_combiners` flag defaults to true, including
-when absent from older configuration files, preserving detected-client behavior.
+PocketPC games select **GPU compatibility profile** in their own **Graphics**
+settings on desktop and Android. The global **GPU rendering** option selects the
+GLES 1.x backend for all games. Older per-game `gpu_renderer` values are ignored
+on load and removed when the game settings are saved.
 
-Disabling it gates extension advertisement and NV entry points and disables
-active combiner state in the session's contexts. New EGL contexts and client
-state resets preserve the gate. Enabling it permits the existing client detection;
-it does not force combiner rendering on applications that do not request it.
+| Profile | Compatibility behavior |
+| --- | --- |
+| Generic OpenGL ES (1.1, Common) | Standard behavior; no Intel bias or NVIDIA combiners. This is the default. |
+| NVIDIA GoForce 5500 (OpenGL ES 1.1, Common) | Allows detected clients to use AR10/AR11 combiners, exposes legacy OES VBO entry points and an RGBA8 pbuffer configuration without depth; standard depth bias. |
+| Intel 2700G (OpenGL ES 1.0, Common-Lite) | Enables the Intel depth-bias model and opaque coplanar tolerance; NVIDIA combiners disabled. |
+| Generic OpenGL ES (2.0, Common) | Selects the programmable guest EGL and GLES path for `libEGL.dll` and `libGLESv2.dll`. |
 
-The PocketPC switch does not alter Gizmondo's existing policy. Both launchers
-explicitly configure the session gate, independently of the GoForce driver and
-Intel 2700G depth-bias profiles. CLI launches retain their existing default.
+The persisted per-game `gpu_compatibility_profile` enum replaces both global
+compatibility booleans. Old global values are ignored, not inherited; existing
+entries without the field use Generic. The GLES 1.x profiles apply in software
+and GPU modes. The GLES 2.0 profile uses the native host graphics driver.
+Profile changes take effect on the next launch. Gizmondo uses its own driver and combiner policy.
+The profile labels identify guest compatibility targets. The host driver still
+determines the actual rendering device.
+
+A new Pocket PC import presents one launch-settings dialog on desktop and
+Android. It includes screen and rotation guidance, optional FPS advice, and
+a GPU profile selector when the selected executable uses OpenGL ES and its
+profile remains ambiguous. The same selector is offered after switching the
+launch executable or choosing a newly added executable in **Add/Replace Data**.
+
+A direct `libGLESv2.dll` import, or the existing runtime-link signature
+using `libGLESv2.dll` and `glCreateShader`, selects **Generic OpenGL ES (2.0,
+Common)** on a fresh import. A direct `libGLES_CL.dll` import selects
+**Intel 2700G** when GLES 2.0 was not detected. A reference to
+`libGLES_CM.dll` leaves the GPU profile ambiguous on Pocket PC. Users can
+change the profile later under **Graphics**. Reimporting an installed game
+preserves its saved profile. NVIDIA selection enables the existing
+extension and program detection paths.
+
+### Generic OpenGL ES 2.0 programmable rendering
+
+The profile provides a GLES 2.0 implementation with its own EGL
+context, programmable state and object namespaces. The window configuration
+advertises RGB565 color, 16 depth bits and 8 stencil bits. The native window
+framebuffer uses an RGBA color texture and a packed `DEPTH24_STENCIL8`
+attachment. `eglGetConfigAttrib(EGL_DEPTH_SIZE)` reports the virtual EGL
+configuration's 16-bit depth. `glGetIntegerv(GL_DEPTH_BITS)` queries the currently
+bound native framebuffer, so it can report 24 for the default attachment or
+a different depth for an application-created framebuffer. Host GLES compiles
+the guest GLSL ES source. The desktop GL path adapts supported shader sources
+for GLSL 1.20.
+
+- **Dispatch.** An owned offscreen context can use a single native context
+  identity check when it is already current. A context change uses the full
+  EGL/WGL binding path. The renderer skips redundant buffer bindings, active
+  texture selections and vertex-attribute enable changes after validating
+  their arguments.
+- **Presentation.** Window swaps publish an immutable texture from the same
+  bounded pool and fence protocol as the GLES 1.x renderer. The GUI can consume
+  the texture within the shared context group without reading pixels to RAM.
+  The current export copies the window framebuffer into a leased GPU texture.
+  A CPU readback remains available when shared export is unavailable. An
+  explicit guest `glReadPixels` reads the currently bound framebuffer into
+  guest memory and respects pack alignment, including padding between rows.
+- **Textures.** The renderer submits compressed ATC blocks directly when the
+  host driver reports support for the requested format. The CPU decoder
+  provides RGBA uploads for unsupported ATC formats.
+- **Geometry.** Guest buffer objects use native GPU storage. Client vertex and
+  index arrays are read from guest RAM into reusable native buffers. The
+  renderer skips identical uploads and updates the contiguous span covering
+  changed bytes. It uses a CPU copy of element data when it needs to bound a
+  client vertex array. Guest textures and buffer contents stay in native
+  storage until updated or deleted. The application can reuse them across
+  draws and swaps.
+
+For Electopia, select **Generic OpenGL ES (2.0, Common)** and
+**800×480 (WVGA landscape)**. The CLI accepts both `--gles2` and the
+existing `--adreno200` flag.
+
+```sh
+pockethle run ElectopiaSetup.cab --gles2 --screen 800x480
+```
+
+The profile dispatches all 142 core GLES 2.0 entry points.
+Framebuffer-to-texture copies use native OpenGL calls without reading back
+pixels. Compressed subimage uploads use host-supported formats. The profile
+advertises zero shader binary formats.
+
+Electopia reached its menu and attract mode under Linux Mesa llvmpipe.
+GLBenchmark 2.0.3 reached the test menu and rendered Egypt. GLBenchmark
+enumerates and queries EGL configurations and the window surface before
+running GLES2 tests.
+After **More → Run the test**, the default selection can leave a black image
+visible while the benchmark loads resources and draws without swapping. The
+**Swapbuffers** test provides a short presentation check.
+
+Shared presentation tests verify deferred CPU access and retained texture
+contents. [Local timing and validation records](history/VALIDATION.md#electopia-and-glbenchmark-optimization-validation)
+describe the measured sequences. Physical GPU timing on Windows, Steam Deck
+and Android remains pending for these comparisons.
+
+### Intel 2700G depth-bias model
+
+**Intel 2700G depth-bias compatibility** retains the reference driver's integer
+encoding: ignore the slope factor, arithmetic-shift the signed 16.16 units,
+and clamp the signed magnitude. The constant offset is modeled in the 16.16
+primitive-input domain, independently of the advertised 24-bit depth storage.
+This is an inferred hardware model, based on the driver's fixed-point vertex
+and command path, rather than a claim of bit-exact 2700G rasterization. It
+restores the continuous projected headlight pass in GeoRally EX without a
+title check, binary patch or disabled depth testing.
+
+Software applies that normalized constant directly. Native GL/GLES measures
+the host polygon-offset step once per renderer/depth format on the first
+nonzero Intel-biased draw or eligible tolerance replay, using a temporary 2x2
+target. The measured step is cached; explicit guest polygon offsets use native
+polygon offset without readbacks, shader depth writes or additional rendering
+passes. The setup preserves the live
+surface, clears its temporary resources and invalidates only the affected
+host state caches. It does not run for an inactive profile or a draw needing
+neither nonzero offset nor tolerance.
+
+The stronger constant offset can change shadows or decals in other applications
+using this profile. Foreground occlusion remains enabled. The ordinary GLES
+offset policy, guest depth-bit queries, render scaling, presentation, screenshots
+and recordings retain their existing paths. Shared code serves desktop and
+Android; native GL/GLES tests cover both depth formats and 1x/2x rendering.
+
+### Intel 2700G opaque coplanar tolerance
+
+The same existing Intel profile also permits a bounded color-only replay for
+nearly coplanar opaque triangles. This is an **empirical compatibility
+approximation**, not a measured MBX register value or exact GLES depth semantics.
+THPS2's fixed-point projected decals cross their backing ramp's submitted depth
+as the camera moves, with reversed `GEQUAL` testing and no polygon offset. A
+normal draw preserves the nearest real depth; a second draw may contribute color
+within `16 / 65536` of that depth, towards the camera. It never writes depth,
+so the tolerance does not accumulate across draws. The sign is reversed for
+`LEQUAL` versus `GEQUAL`. There is no game, executable or texture identification.
+
+Eligibility requires enabled depth testing and writes, the default depth range,
+`LEQUAL` or `GEQUAL`, no explicit polygon offset, no logic operation and at least
+one writable color channel. Blending must be disabled or standard
+`SRC_ALPHA, ONE_MINUS_SRC_ALPHA`. The replay accepts only fully opaque fragments
+and only when the original alpha test also accepts them; translucent fragments
+therefore retain their original single-pass behavior. Points, lines, strict
+`LESS`/`GREATER` tests, additive/multiplicative effects and NV combiners keep their
+existing paths. The explicit GeoRally EX depth-bias model above is unchanged.
+
+Software reuses transformed vertices and the existing constant-offset rasterizer.
+Native GL/GLES reuses buffers, textures and the current general/affine shader,
+temporarily setting alpha rejection, depth-write mask and calibrated polygon
+offset, then restoring host state. Alpha-test-free fast shader variants are not
+used for these draws. There is no per-draw readback, new texture upload, shader
+depth write or format/presentation change. Both backends, render scaling and the
+shared desktop/Android implementation use the same rule.
+
+Eligible triangles are rasterized twice: this has a real GPU cost, or CPU cost
+in software mode. Nearby hidden opaque surfaces within the tolerance can become
+visible or change overlap order in other Intel-profile games. Generic and NVIDIA
+profiles do not enable this Intel approximation. See the
+[THPS2 validation record](../proof/thps2-hangar/README.md) for before/after images,
+measured costs and the limits of local testing.
+
+## Native fixed-point vertex attributes
+
+Advertising `GL_FIXED` fetch does not guarantee that the host preserves exact
+16.16 coordinates. During renderer creation, supported hosts undergo one small
+private framebuffer check against the existing float conversion. It covers
+positive, negative, fractional and extreme values, plus implicit components of
+two-, three- and four-component arrays. Float equality and deliberate inequality
+are controls; failure or an inconclusive check disables native fixed fetch for
+that renderer. There is no driver-name or application-name selection.
+
+The existing stream builder then converts fixed components to `GL_FLOAT` before
+upload, preserving capture, VBO bindings, strides and index semantics. Other
+native attribute types remain eligible. Transforms, lighting and rasterization
+still run on the host GPU. The check is shared by desktop and Android and does
+not change the Intel depth-bias model or Gizmondo driver rules.
+
+This addresses PowerVR SDK Vase/Trilinear backgrounds on hosts where fixed `1.0`
+arrives above `1.0` and is clipped. It does not move clip planes, add coordinate
+epsilons or modify guest binaries. Validation uses a temporary 8x3 RGBA target,
+at most three tiny readbacks, and releases its resources before guest rendering.
+The result is stored per renderer; no validation or readback occurs per draw.
+Hosts that pass retain native fetch. Failed hosts pay CPU conversion costs for
+fixed streams, with four bytes per component before and after conversion.
+
+## PVRTC texture capability
+
+Both renderers expose `GL_IMG_texture_compression_pvrtc` alongside its four
+PVRTC1 RGB/RGBA 2bpp/4bpp formats in `GL_COMPRESSED_TEXTURE_FORMATS`. Full
+uploads, explicit small mip levels and whole-level compressed replacement use
+the shared texture validation/decoding path. Partial PVRTC rectangles remain
+invalid, as required by the extension. A host without native PVRTC support uses
+the existing decoder and uploads RGBA texels; host extension support does not
+control the guest capability.
+
+Clients such as DoomGLES 2700G check the extension string before loading their
+compressed assets. Listing the formats without the extension leaves those
+textures unloaded. Advertising this implemented capability is shared across
+platforms and does not require a device profile or game-specific detection.
 
 ## EGL surfaces and shared objects
 
@@ -124,7 +328,12 @@ and y. Storage tracks six coordinate sets; capacity checks reject unavailable
 sets. AR10 retains its own four-coordinate/two-temporary encoding limits;
 AR11 supports its additional registers and signed quarter-unit immediate
 literals. Supported equality/inequality rejection discards a fragment without
-writing color or depth. This is not complete or bit-exact GoForce conformance.
+writing color or depth. The 5500 profile also supports AR11 color-register
+routing from interpolated coordinate components and co-issued RGB reads of
+texture alpha initialized by the alpha calculation without a texture fetch.
+Coordinate-only inputs do not enable samplers, and active unsupported color
+selectors still reject the program. This is not complete or bit-exact GoForce
+conformance.
 
 Five/six-coordinate GPU programs use separate shader variants and attributes
 8/9, preserving normal/fog/provoking/point locations, ordinary four-coordinate
@@ -154,19 +363,29 @@ per-draw program decode, screenshot comparison or GPU readback is introduced.
 ## Internal resolution
 
 Internal rasterization resolution, guest logical resolution and display zoom are
-three different quantities. The global GPU-only setting applies next launch.
-Portrait equivalents are included in the QVGA/VGA policies.
+three different quantities. In **Emulator Options**, host OpenGL for GLES 1.x and GLES 2.0
+offers **Native**, **2×**, **3×** and **4×**. By default, a multiplier
+applies only to 320×240 and 240×320 surfaces. Check **Apply to all resolutions,
+including sizes other than 320×240** to apply the same multiplier to all
+supported surface sizes. The checkbox is disabled at **Native**. A surface
+stays at its native size if enlargement would exceed the renderer's
+dimension limit. GLES 2.0 uses the multiplier on its EGL window framebuffer.
+Offscreen guest framebuffers retain their allocated sizes. The scaled window
+frame is presented at render resolution, and guest read/copy calls resolve
+to the logical size on the GPU. Hosts without scaled framebuffer blits use
+native window resolution. Changes apply the next time a game launches.
 
-| Serialized value | Menu choice | Effective GPU rendering |
+| Serialized value | Multiplier | Surface sizes |
 | --- | --- | --- |
-| 1 | Native (1x) | Native logical surface size |
-| 3 | 2x, only for 320x240 games | Double QVGA; larger surfaces stay native |
-| 4 | 3x, only for 320x240 games | Triple QVGA; larger surfaces stay native |
-| 5 | 4x, only for 320x240 games | Quadruple QVGA; larger surfaces stay native |
-| 2 | 2x, also for 640x480 games | Double supported native surfaces, including VGA |
+| 1 | Native | All |
+| 2 | 2× | All |
+| 3 | 2× | 320×240 and 240×320 |
+| 4 | 3× | 320×240 and 240×320 |
+| 5 | 4× | 320×240 and 240×320 |
+| 6 | 3× | All |
+| 7 | 4× | All |
 
-The nonsequential values preserve compatibility: value 2 retains its original
-all-sizes meaning. Do not renumber them to match menu order.
+The serialized values preserve existing settings.
 Evaluate the policy on surface creation/resize, including parked/restored
 surfaces. Viewport/scissor and point/line density follow the effective scale.
 Queries, input coordinates and guest read/copy buffers stay logical-sized.
@@ -222,7 +441,7 @@ or simulates more slowly. Internal resolution does not bypass the game limit.
 Host VSync, explicit guest vertical-blank waits and the modeled display clock
 remain distinct; Unlimited is not a promise of unlimited physical refresh.
 Desktop general settings expose VSync (enabled by default, applied after restarting
-PocketHLE). Disabling it can allow tearing. The desktop publisher follows the
+PocketHLE-Reborn). Disabling it can allow tearing. The desktop publisher follows the
 selected game limit for completed presentations, including 120 and Unlimited;
 there is no fixed 16 ms ceiling on explicit EGL/GX/DirectDraw presents. Without
 an explicit presentation boundary, Unlimited coalesces intermediate dirty GDI
@@ -379,6 +598,8 @@ Native dependencies remain transactional and real missing libraries/exports
 still fail loading. No game-name or DLL-version-specific fallback is added.
 
 Some CE DLLs tagged IMAGE_FILE_MACHINE_THUMB expose an ARM DllMain attach stub.
+Valid CE packed `.pdata` metadata selects the entry mode first; ARMNT has a
+different unwind format. See the [loader lifetime contract](AGENTS.md#15-image-and-thread-memory-lifetimes).
 The entry-mode detector recognizes the two-instruction ARM sequence
 `str lr,[sp,#-4]!; cmp r1,#1` for Thumb-tagged images, alongside the existing ARM
 prologues. Matching only the header or the first halfword is insufficient.
@@ -437,3 +658,104 @@ silhouettes missing when main-thread message polling publishes a worker's draw.
 The issue remains with GetNearestColor implemented. A synthetic worker-draw/main-
 poll regression and the existing retained-GAPI tests cover the ownership guard.
 Device-specific presentation and later gameplay still need separate validation.
+
+## Paired color capture (desktop diagnostics)
+
+Set `POCKETHLE_COLOR_CAPTURE` to an output directory before launching PocketHLE-Reborn.
+At a completed onscreen EGL swap, an enabled session checks once per second for
+`capture.request` in that directory. Creating the empty file requests one pair;
+the emulator consumes the file. Recreate it to capture again. Offscreen swaps
+and cooperative pacing retries do not consume requests. When the variable is
+unset, there is no file polling, image allocation or additional GPU readback.
+The disabled path retains only the capture-state check at the swap boundary.
+
+Windows Command Prompt, from the repository directory:
+
+```bat
+set "POCKETHLE_COLOR_CAPTURE=%CD%\color-captures"
+target\release\pockethle-gui.exe
+```
+
+In a second Command Prompt opened in the same repository directory, once the
+camera is stationary at the desired scene:
+
+```bat
+type nul > color-captures\capture.request
+```
+
+Each request writes three files with one timestamp/sequence stem:
+
+- `.render.png`: logical RGBA render readback before display publication. An
+  RGB565 EGL attachment has already quantized its rendering; this capture does
+  not reconstruct discarded precision. Use the RGBA8888-only profile to test
+  an RGBA attachment and check `render_format` in the JSON.
+- `.presentation.png`: CPU reference for that same publication, including its
+  display color conversion and backlight, before frontend filters, rotation,
+  UI overlays and host-window composition. It is not a window screenshot.
+- `.json`: dimensions, render format, active backend, requested guest dithering
+  state and completed-presentation count. Dithering state is not proof that the
+  backend implements it.
+
+Start with internal resolution 1x, no frontend filter and neutral backlight to
+compare corresponding pixels directly. Higher-density presentation can have
+larger dimensions than the logical render capture. Both software and GPU paths
+are supported. A requested capture synchronously reads/encodes images and can
+cause a short pause; do not use its frame timing as a performance measurement.
+Errors are logged without turning diagnostics into a guest EGL error.
+Disable for subsequent launches with `set "POCKETHLE_COLOR_CAPTURE="`.
+
+The paired-capture regressions verify a real software EGL swap and a native-GL
+swap using shared GPU publication, consumption of one request, PNG contents,
+RGBA shade preservation, separate guest RGB565 bytes and publication identity. Native validation uses
+Mesa llvmpipe; Windows device testing remains required. The regular WinCE API
+suite passes with the optional native tests excluded.
+
+## Preserve the selected EGL color precision
+
+The per-game RGBA8888-only option controls the advertised EGL catalog. It does
+not turn RGB565 rendering into 32-bit rendering after the fact. Presentation
+now follows the actual EGL attachment: an RGBA8888 attachment retains its RGB
+bytes until host filtering/backlight, while a real RGB565 attachment keeps the
+existing 16-bit display expansion. Host display alpha remains opaque.
+This applies equally to default-selected RGBA configurations and the optional
+profile; there is no game-name, texture or combiner-program test.
+
+| Path | Presentation contract |
+| --- | --- |
+| Software EGL | Retain same-size RGBA presentation beside logical RGB565 memory. |
+| GPU with CPU publication | Reuse native readback at 1x/scaled sizes; RGBA surfaces avoid display quantization. |
+| Shared GPU, desktop | Immutable snapshot carries its source format; the display shader preserves RGBA or expands RGB565, then applies backlight. |
+| Shared GPU, Android | Same shader and format policy through the synchronized JNI callback; rebuild native libraries and APK together. |
+| Deferred CPU read/capture | Optional RGBA presentation is valid even at logical size; reads retain GPU authority and publication identity. |
+| Guest GAPI memory and IPS | Logical RGB565 conversion and the existing logical-pixel IPS definition remain. |
+| Screenshots, recording, filters | Frontend presentation snapshots retain RGBA; CLI display PPM captures now use presentation pixels too. Logical snapshot_ppm remains a separate memory diagnostic. |
+| Real CPU drawing | CPU/GDI/GAPI writes invalidate older alternate/GPU images and win; the next EGL swap can publish RGBA again. |
+
+SIP/shell-menu and system-video composition keep their established logical
+CPU composition policy; they can select a 16-bit composite while active. This
+change does not introduce a high-color GDI renderer or a mixed-precision overlay
+engine. An old RGBA image must never cover a newer CPU drawing operation.
+
+The shader change adds no GPU readback to shared display. CPU publication now
+retains/transfers four-byte presentation pixels for RGBA surfaces, including at
+1x; this costs buffer space/bandwidth compared with packed two-byte display
+pixels. A 1x shared RGBA materialization downloads RGBA once and packs the guest
+RGB565 copy on the CPU. Scaled paths retain their established logical reduction
+and separate native presentation preparation.
+
+The reported THPS2 pair established RGBA rendering followed by an unintended
+RGB565 display reduction: a sampled floor region went from 209 colors to 16.
+The fix preserves rendered bytes; it does not reconstruct colors already lost
+in RGB565 textures or attachments and does not implement missing dithering.
+
+
+### Snapshot-reference test correction
+
+The previously reported RGB565 snapshot/reduction discrepancy was traced to a
+malformed test fixture. It set the renderer's RGB565 policy, then replaced the
+actual attachment with GL_RGBA storage before taking an RGB565 snapshot. The
+reference and snapshot consequently started from different color precisions.
+The fixture now uploads in the actual attachment format, checks the GL error,
+and also covers 320x240 at 2x on desktop GL and GLES. No RGB565 production
+reduction arithmetic was changed to make this test pass. The corrected fixture
+also passes against the unmodified production code of commit 9bebfb5b.

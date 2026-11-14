@@ -3,15 +3,18 @@ use super::*;
 pub(crate) fn register(d: &mut WinCeDispatcher) {
     for (name, handler) in [
         ("GetFileTime", get_file_time as crate::Handler),
+        ("SetFileTime", set_file_time),
         ("CompareFileTime", compare_file_time),
         ("SetClassLongW", set_class_long),
         ("GetClassLongW", get_class_long),
         ("ScrollWindowEx", scroll_window_ex),
         ("ScrollWindow", scroll_window),
+        ("ScrollDC", scroll_dc),
         ("CreateRectRgn", create_region),
         ("CreateRectRgnIndirect", create_region_indirect),
         ("SetRectRgn", set_region),
         ("GetRgnBox", get_region_box),
+        ("GetRegionData", get_region_data),
     ] {
         d.register_handler("coredll.dll", name, handler);
     }
@@ -31,7 +34,13 @@ pub(super) fn get_file_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ke
     let pointers = [ctx.arg_u32(1)?, ctx.arg_u32(2)?, ctx.arg_u32(3)?];
     for p in pointers {
         if p != 0 {
-            ctx.cpu.read_mem(p, 8)?;
+            match ctx.cpu.check_guest_access(p, 8, Prot::WRITE) {
+                Ok(()) => {}
+                Err(error @ pocket_cpu::CpuError::ImageOutOfMemory { .. }) => {
+                    return Err(error.into())
+                }
+                Err(_) => return fail(ctx, 87),
+            }
         }
     }
     for (p, value) in pointers.into_iter().zip(times) {
@@ -40,6 +49,27 @@ pub(super) fn get_file_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ke
         }
     }
     ret(1)
+}
+pub(super) fn set_file_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let mut times = [None; 3];
+    for (index, value) in times.iter_mut().enumerate() {
+        let p = ctx.arg_u32(index as u8 + 1)?;
+        if p != 0 {
+            match ctx.cpu.check_guest_access(p, 8, Prot::READ) {
+                Ok(()) => {}
+                Err(error @ pocket_cpu::CpuError::ImageOutOfMemory { .. }) => {
+                    return Err(error.into())
+                }
+                Err(_) => return fail(ctx, 87),
+            }
+            *value = Some(u64::from_le_bytes(
+                ctx.cpu.read_mem(p, 8)?.try_into().unwrap(),
+            ));
+        }
+    }
+    let result = ctx.kernel.vfs.set_file_times(handle, times);
+    vfs_api_bool(ctx, result)
 }
 pub(super) fn compare_file_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let a = ctx.arg_u32(0)?;
@@ -264,6 +294,37 @@ pub(super) fn get_region_box(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
     write_rect_value(ctx, out, r)?;
     ret(kind)
 }
+pub(super) fn get_region_data(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const HEADER_BYTES: u32 = 32;
+    const RECT_BYTES: u32 = 16;
+    let region = ctx.arg_u32(0)?;
+    let capacity = ctx.arg_u32(1)?;
+    let out = ctx.arg_u32(2)?;
+    let Some(rects) = ctx.kernel.gdi.regions.get(&region) else {
+        return fail(ctx, ERROR_INVALID_HANDLE);
+    };
+    let count = rects.len() as u32;
+    let payload_bytes = count * RECT_BYTES;
+    let size = HEADER_BYTES + payload_bytes;
+    if out == 0 || capacity < size {
+        return ret(size);
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    for field in [HEADER_BYTES, 1, count, payload_bytes] {
+        bytes.extend_from_slice(&field.to_le_bytes());
+    }
+    for rect in std::iter::once(bounds(rects)).chain(rects.iter().copied()) {
+        for coordinate in rect {
+            bytes.extend_from_slice(&coordinate.to_le_bytes());
+        }
+    }
+    if !vfs_probe_output(ctx, out, size) {
+        return fail(ctx, ERROR_INVALID_PARAMETER);
+    }
+    ctx.cpu.write_mem(out, &bytes)?;
+    ret(size)
+}
+
 fn scroll_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
     let dx = ctx.arg_u32(1)? as i32;
@@ -284,6 +345,21 @@ pub(super) fn scroll_window_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
     let flags = ctx.arg_u32(7)?;
     ret(scroll(ctx, hwnd, dx, dy, source, clip, region, out, flags)?)
 }
+fn scroll_dc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let dx = ctx.arg_u32(1)? as i32;
+    let dy = ctx.arg_u32(2)? as i32;
+    let source = ctx.arg_u32(3)?;
+    let clip = ctx.arg_u32(4)?;
+    let region = ctx.arg_u32(5)?;
+    let out = ctx.arg_u32(6)?;
+    let Some(_) = scroll_dc_pixels(ctx, dc, dx, dy, source, clip, region, out)? else {
+        return ret(0);
+    };
+    sync_dst_dib_to_guest(ctx, dc)?;
+    ret(1)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scroll(
     ctx: &mut CallCtx<'_>,
@@ -304,58 +380,11 @@ fn scroll(
         set_thread_error(ctx, 1400);
         return Ok(0);
     }
-    if region != 0 && !ctx.kernel.gdi.regions.contains_key(&region) {
-        set_thread_error(ctx, 6);
-        return Ok(0);
-    }
-    if out != 0 {
-        ctx.cpu.read_mem(out, 16)?;
-    }
     let dc = window_dc(ctx, hwnd);
-    sync_dib_from_guest(ctx, dc)?;
-    let (w, h) = surface_for_dc(ctx.kernel, dc).unwrap().dimensions();
-    let client = [0, 0, w as i32, h as i32];
-    let source = intersection(read_rect_or(ctx, source, client)?, client);
-    let clip = intersection(read_rect_or(ctx, clip, client)?, client);
-    let shifted = [
-        source[0].saturating_add(dx),
-        source[1].saturating_add(dy),
-        source[2].saturating_add(dx),
-        source[3].saturating_add(dy),
-    ];
-    let dest = intersection(shifted, clip);
-    let exposed = subtract(intersection(source, clip), dest);
-    if dx != 0 || dy != 0 {
-        let mut surf = surface_for_dc(ctx.kernel, dc).unwrap();
-        let before = surf.pixels().to_vec();
-        let mut changed = false;
-        for y in dest[1]..dest[3] {
-            for x in dest[0]..dest[2] {
-                let sx = i64::from(x) - i64::from(dx);
-                let sy = i64::from(y) - i64::from(dy);
-                if sx < i64::from(source[0])
-                    || sx >= i64::from(source[2])
-                    || sy < i64::from(source[1])
-                    || sy >= i64::from(source[3])
-                {
-                    continue;
-                }
-                let from = (sy as usize * w as usize + sx as usize) * 2;
-                let to = (y as usize * w as usize + x as usize) * 2;
-                if surf.pixels()[to..to + 2] != before[from..from + 2] {
-                    changed = true;
-                    surf.pixels_mut()[to..to + 2].copy_from_slice(&before[from..from + 2]);
-                }
-            }
-        }
-        if changed {
-            surf.mark_dirty();
-        }
-    }
-    if region != 0 {
-        *ctx.kernel.gdi.regions.get_mut(&region).unwrap() = exposed.clone();
-    }
-    write_rect_value(ctx, out, bounds(&exposed))?;
+    let Some((source, exposed)) = scroll_dc_pixels(ctx, dc, dx, dy, source, clip, region, out)?
+    else {
+        return Ok(0);
+    };
     if flags & 1 != 0 {
         let mut children: Vec<_> = ctx
             .kernel
@@ -425,6 +454,77 @@ fn scroll(
     sync_dst_dib_to_guest(ctx, dc)?;
     Ok(complexity(&exposed))
 }
+#[allow(clippy::too_many_arguments)]
+fn scroll_dc_pixels(
+    ctx: &mut CallCtx<'_>,
+    dc: u32,
+    dx: i32,
+    dy: i32,
+    source: u32,
+    clip: u32,
+    region: u32,
+    out: u32,
+) -> Result<Option<([i32; 4], Vec<[i32; 4]>)>, KernelError> {
+    if region != 0 && !ctx.kernel.gdi.regions.contains_key(&region) {
+        set_thread_error(ctx, 6);
+        return Ok(None);
+    }
+    if out != 0 && !vfs_probe_output(ctx, out, 16) {
+        set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+        return Ok(None);
+    }
+    sync_dib_from_guest(ctx, dc)?;
+    let Some(surface) = surface_for_dc(ctx.kernel, dc) else {
+        set_thread_error(ctx, ERROR_INVALID_HANDLE);
+        return Ok(None);
+    };
+    let (w, h) = surface.dimensions();
+    drop(surface);
+    let client = [0, 0, w as i32, h as i32];
+    let source = intersection(read_rect_or(ctx, source, client)?, client);
+    let clip = intersection(read_rect_or(ctx, clip, client)?, client);
+    let shifted = [
+        source[0].saturating_add(dx),
+        source[1].saturating_add(dy),
+        source[2].saturating_add(dx),
+        source[3].saturating_add(dy),
+    ];
+    let dest = intersection(shifted, clip);
+    let exposed = subtract(intersection(source, clip), dest);
+    if (dx != 0 || dy != 0) && dest != [0; 4] {
+        let mut surf = surface_for_dc(ctx.kernel, dc).unwrap();
+        let before = surf.pixels().to_vec();
+        let mut changed = false;
+        for y in dest[1]..dest[3] {
+            for x in dest[0]..dest[2] {
+                let sx = i64::from(x) - i64::from(dx);
+                let sy = i64::from(y) - i64::from(dy);
+                if sx < i64::from(source[0])
+                    || sx >= i64::from(source[2])
+                    || sy < i64::from(source[1])
+                    || sy >= i64::from(source[3])
+                {
+                    continue;
+                }
+                let from = (sy as usize * w as usize + sx as usize) * 2;
+                let to = (y as usize * w as usize + x as usize) * 2;
+                if surf.pixels()[to..to + 2] != before[from..from + 2] {
+                    changed = true;
+                    surf.pixels_mut()[to..to + 2].copy_from_slice(&before[from..from + 2]);
+                }
+            }
+        }
+        if changed {
+            surf.mark_dirty();
+        }
+    }
+    if region != 0 {
+        *ctx.kernel.gdi.regions.get_mut(&region).unwrap() = exposed.clone();
+    }
+    write_rect_value(ctx, out, bounds(&exposed))?;
+    Ok(Some((source, exposed)))
+}
+
 /// Apply deferred class-brush erasure only to newly exposed pixels.
 pub(super) fn erase_scroll_region(
     ctx: &mut CallCtx<'_>,

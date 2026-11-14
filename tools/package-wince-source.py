@@ -44,7 +44,7 @@ def main():
             'Windows: initialize MSVC x64 and LLVM, install MSYS2 make/diffutils/pkgconf,\n'
             'run tools/build-ffmpeg.ps1, then cargo build --release --locked --offline\n'
             '-p pocket-cli -p pocket-desktop --features pocket-cli/unicorn.\n'
-            'Android: use the pinned JDK17/SDK35/NDKr28c in docs/ANDROID-BUILD.md and\n'
+            'Android: use the pinned JDK17/SDK35/NDKr28c in docs/BUILD.md and\n'
             'run tools/build-android-native.sh followed by tools/build-android-apk.sh.\n'
             'Native source archives live under third-party; modify their extracted source\n'
             'under target/native/ffmpeg-source or target/native/openh264-source and rebuild\n'

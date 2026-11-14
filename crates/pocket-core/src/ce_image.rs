@@ -25,10 +25,14 @@ pub fn configure_device(
         }
     }
     state.registry.configure_persistence(&registry_path)?;
+    let app_defaults_changed = image
+        .map(|image| image.complete_application_defaults(&mut state.registry))
+        .transpose()?
+        .unwrap_or(false);
     // Publish the imported image registry at first boot as well as on exit.
     // Explorer's profile remains usable after a host interruption before it
     // writes a preference or reaches normal process teardown.
-    if !registry_path.exists() {
+    if app_defaults_changed || !registry_path.exists() {
         state.registry.flush()?;
     }
     if let Some(image) = image {
@@ -37,6 +41,7 @@ pub fn configure_device(
             .mount_read_only_filesystem("\\", &image.filesystem);
     }
     state.vfs.mount_filesystem("\\", data.join("fs"));
+    state.ce.sounds.startup_pending = true;
     Ok(data)
 }
 
@@ -298,6 +303,113 @@ impl WindowsCeImage {
         Ok(())
     }
 
+    fn complete_application_defaults(&self, registry: &mut Registry) -> Result<bool> {
+        use pocket_kernel::registry::RegistryValue;
+        const MARKER: &str = r"HKLM\Software\PocketHLE\ImageDefaults";
+        const WORD: &str = r"HKLM\Software\Microsoft\Pocket Word\Directories";
+        let word_done =
+            registry.value(MARKER, "BuiltInApplications") == Some(RegistryValue::Dword(1));
+        let com_done =
+            registry.value(MARKER, "ApplicationComClasses") == Some(RegistryValue::Dword(1));
+        let types_done =
+            registry.value(MARKER, "EmbeddedTypeLibraries") == Some(RegistryValue::Dword(1));
+        if word_done && com_done && types_done {
+            return Ok(false);
+        }
+        let baseline = registry.isolated_copy();
+        let mut staged = baseline.isolated_copy();
+        // This CE6 filesystem carries letter.pwt/meetnote.pwt in Windows,
+        // but omits WordPad's required Templates registry value. Supply its
+        // directory in the private profile, preserving imported/saved choices.
+        if !word_done
+            && self.windows.join("pword.exe").is_file()
+            && staged.value(WORD, "Templates").is_none()
+        {
+            anyhow::ensure!(
+                staged.set_value(WORD, "Templates", RegistryValue::Sz(r"\Windows".into())),
+                "CE application defaults allocation failed"
+            );
+        }
+        anyhow::ensure!(
+            staged.set_value(MARKER, "BuiltInApplications", RegistryValue::Dword(1)),
+            "CE application defaults allocation failed"
+        );
+        if !com_done {
+            // The extracted CE6 hive names HTMLDocument in file associations
+            // but omits its server registration. The SDK class IDs select
+            // the original application DLLs; no dummy browser/player is used.
+            for (file, clsid) in [
+                ("mshtml.dll", "{25336920-03F9-11CF-8FD0-00AA00686F13}"),
+                ("mshtml.dll", "{25336921-03F9-11CF-8FD0-00AA00686F13}"),
+                ("msdxm.dll", "{22D6F312-B0F6-11D0-94AB-0080C74C7E95}"),
+            ] {
+                let key = format!(r"HKCR\CLSID\{clsid}\InprocServer32");
+                if self.windows.join(file).is_file()
+                    && staged.value(&key, "").is_none()
+                    && staged.value(&key, "default").is_none()
+                {
+                    anyhow::ensure!(
+                        staged.set_value(&key, "default", RegistryValue::Sz(file.into())),
+                        "CE COM defaults allocation failed"
+                    );
+                }
+            }
+            anyhow::ensure!(
+                staged.set_value(MARKER, "ApplicationComClasses", RegistryValue::Dword(1)),
+                "CE COM defaults marker failed"
+            );
+        }
+        if !types_done {
+            // The CE6 image omits installed TypeLib keys. Messenger loads /1
+            // and /3 directly, but requests /2 by its registered GUID. Derive
+            // registrations from actual resources, once per private profile;
+            // never replace an imported path or resurrect a user deletion.
+            let mut files = std::fs::read_dir(&self.windows)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            files.sort();
+            for file in files {
+                let extension = file
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase());
+                if !extension.is_some_and(|e| matches!(e.as_str(), "exe" | "dll" | "ocx" | "cpl")) {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&file) else {
+                    continue;
+                };
+                let Ok(resources) = pocket_pe::file_resources(
+                    &bytes,
+                    &pocket_pe::ResourceKey::Name("TYPELIB".into()),
+                ) else {
+                    continue;
+                };
+                for (resource, bytes) in resources {
+                    let pocket_pe::ResourceKey::Id(id) = resource else {
+                        continue;
+                    };
+                    let Ok(library) = pocket_pe::typelib::parse(bytes) else {
+                        continue;
+                    };
+                    let path = format!(
+                        r"\Windows\{}\{id}",
+                        file.file_name().unwrap().to_string_lossy()
+                    );
+                    seed_library_registration(&mut staged, &library, &path)?;
+                }
+            }
+            anyhow::ensure!(
+                staged.set_value(MARKER, "EmbeddedTypeLibraries", RegistryValue::Dword(1)),
+                "CE TypeLib defaults marker failed"
+            );
+        }
+        anyhow::ensure!(
+            registry.commit_isolated(&baseline, &staged),
+            "CE application defaults commit failed"
+        );
+        Ok(true)
+    }
+
     /// Per-process metadata and fonts. Registry import is a separate, once per
     /// device operation so CreateProcess never resets a parent's preferences.
     pub fn configure_process(&self, state: &mut pocket_kernel::KernelState) {
@@ -317,6 +429,9 @@ impl WindowsCeImage {
                 "ddraw.dll",
                 "ole32.dll",
                 "oleaut32.dll",
+                "iphlpapi.dll",
+                "crypt32.dll",
+                "secur32.dll",
                 "winsock.dll",
                 "ws2.dll",
                 "wininet.dll",
@@ -324,6 +439,9 @@ impl WindowsCeImage {
             .into_iter()
             .map(str::to_owned),
         );
+        // Original CE6 control.exe needs the resource-only CPL provider here.
+        // Omitting it sends the ROM CPL through the native loader and empties
+        // the applet list, even while the CPlApplet handler remains registered.
         state.ce.system_modules.extend(
             pocket_kernel::ce::CPL_MODULES
                 .iter()
@@ -339,10 +457,163 @@ impl WindowsCeImage {
     }
 }
 
+fn seed_library_registration(
+    registry: &mut Registry,
+    library: &pocket_pe::typelib::Library,
+    path: &str,
+) -> Result<()> {
+    use pocket_kernel::registry::RegistryValue;
+    let b = library.guid;
+    let guid = format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        u32::from_le_bytes(b[..4].try_into().unwrap()),
+        u16::from_le_bytes(b[4..6].try_into().unwrap()),
+        u16::from_le_bytes(b[6..8].try_into().unwrap()),
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15]
+    );
+    let version = format!(
+        r"HKCR\TypeLib\{guid}\{:x}.{:x}",
+        library.version.0, library.version.1
+    );
+    let key = format!(r"{version}\{:x}\win32", library.lcid);
+    for (key, value) in [(version, library.name.clone()), (key, path.to_owned())] {
+        if registry.value(&key, "").is_none() && registry.value(&key, "default").is_none() {
+            anyhow::ensure!(
+                registry.set_value(&key, "default", RegistryValue::Sz(value)),
+                "CE TypeLib defaults allocation failed"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pocket_kernel::vfs::Vfs;
+
+    #[test]
+    fn embedded_library_registration_uses_its_identity_and_preserves_an_existing_server() {
+        use pocket_kernel::registry::RegistryValue;
+        let library = pocket_pe::typelib::Library {
+            guid: [0x11; 16],
+            lcid: 0,
+            syskind: 1,
+            flags: 0,
+            version: (1, 0),
+            name: "Embedded".into(),
+            types: Vec::new(),
+            type_offsets: Vec::new(),
+        };
+        let key = r"HKCR\TypeLib\{11111111-1111-1111-1111-111111111111}\1.0\0\win32";
+        let mut registry = Registry::new();
+        seed_library_registration(&mut registry, &library, r"\Windows\fixture.exe\2").unwrap();
+        assert_eq!(
+            registry.value(key, "default"),
+            Some(RegistryValue::Sz(r"\Windows\fixture.exe\2".into()))
+        );
+        registry.set_value(
+            key,
+            "default",
+            RegistryValue::Sz(r"\Other\custom.dll".into()),
+        );
+        seed_library_registration(&mut registry, &library, r"\Windows\fixture.exe\2").unwrap();
+        assert_eq!(
+            registry.value(key, "default"),
+            Some(RegistryValue::Sz(r"\Other\custom.dll".into()))
+        );
+    }
+
+    #[test]
+    fn application_com_defaults_upgrade_once_preserve_servers_and_do_not_restore_deleted_classes() {
+        use pocket_kernel::registry::RegistryValue;
+        let source = tempfile::tempdir().unwrap();
+        let windows = source.path().join("Windows");
+        std::fs::create_dir(&windows).unwrap();
+        for file in ["mshtml.dll", "msdxm.dll"] {
+            std::fs::write(windows.join(file), b"fixture").unwrap();
+        }
+        let image = WindowsCeImage {
+            filesystem: source.path().to_path_buf(),
+            windows,
+            version: (6, 0, 0),
+            ordinals: HashMap::new(),
+            hives: Vec::new(),
+            fonts: Vec::new(),
+        };
+        let mut registry = Registry::new();
+        registry.set_value(
+            r"HKLM\Software\PocketHLE\ImageDefaults",
+            "BuiltInApplications",
+            RegistryValue::Dword(1),
+        );
+        let html = r"HKCR\CLSID\{25336920-03F9-11CF-8FD0-00AA00686F13}\InprocServer32";
+        let player = r"HKCR\CLSID\{22D6F312-B0F6-11D0-94AB-0080C74C7E95}\InprocServer32";
+        registry.set_value(html, "default", RegistryValue::Sz("custom-html.dll".into()));
+        assert!(image.complete_application_defaults(&mut registry).unwrap());
+        assert_eq!(
+            registry.value(html, "default"),
+            Some(RegistryValue::Sz("custom-html.dll".into()))
+        );
+        assert_eq!(
+            registry.value(player, "default"),
+            Some(RegistryValue::Sz("msdxm.dll".into()))
+        );
+        assert!(registry.delete_value(player, "default"));
+        assert!(!image.complete_application_defaults(&mut registry).unwrap());
+        assert_eq!(registry.value(player, "default"), None);
+        assert!(!source.path().join("registry.json").exists());
+    }
+
+    #[test]
+    fn wordpad_defaults_preserve_saved_paths_and_do_not_resurrect_user_deletions() {
+        use pocket_kernel::registry::RegistryValue;
+        const WORD: &str = r"HKLM\Software\Microsoft\Pocket Word\Directories";
+        let source = tempfile::tempdir().unwrap();
+        let windows = source.path().join("Windows");
+        std::fs::create_dir(&windows).unwrap();
+        std::fs::write(windows.join("pword.exe"), b"fixture").unwrap();
+        let image = WindowsCeImage {
+            filesystem: source.path().to_path_buf(),
+            windows,
+            version: (6, 0, 0),
+            ordinals: HashMap::new(),
+            hives: Vec::new(),
+            fonts: Vec::new(),
+        };
+        for saved in [None, Some(r"\My Documents\Templates")] {
+            let data = tempfile::tempdir().unwrap();
+            let path = data.path().join("registry.json");
+            let mut registry = Registry::new();
+            if let Some(saved) = saved {
+                assert!(registry.set_value(WORD, "Templates", RegistryValue::Sz(saved.into())));
+            }
+            registry.configure_persistence(&path).unwrap();
+            assert!(image.complete_application_defaults(&mut registry).unwrap());
+            assert_eq!(
+                registry.value(WORD, "Templates"),
+                Some(RegistryValue::Sz(saved.unwrap_or(r"\Windows").into()))
+            );
+            assert!(registry.delete_value(WORD, "Templates"));
+            registry.flush().unwrap();
+            let mut reopened = Registry::new();
+            reopened.configure_persistence(&path).unwrap();
+            assert!(!image.complete_application_defaults(&mut reopened).unwrap());
+            assert_eq!(reopened.value(WORD, "Templates"), None);
+        }
+        assert!(!source.path().join("registry.json").exists());
+        assert_eq!(
+            std::fs::read(image.windows.join("pword.exe")).unwrap(),
+            b"fixture"
+        );
+    }
 
     #[test]
     fn image_control_panel_modules_use_the_registered_hle_provider() {
@@ -359,6 +630,7 @@ mod tests {
             source_path: "control-fixture.exe".into(),
             machine: pocket_pe::machine::ARM,
             subsystem: pocket_pe::subsystem::WINDOWS_CE_GUI,
+            subsystem_version: (4, 0),
             image_base: 0x10000,
             size_of_image: 0x2000,
             stack_reserve: 0x4000,

@@ -64,11 +64,16 @@ def package(output, image=None, explorer=None, cerf=None):
         raise ValueError('Write the ZIP outside the supplied image and application directories')
     output.parent.mkdir(parents=True, exist_ok=True)
     profiles = {name: json.loads((ROOT / f'profiles/{name}.json').read_text(encoding='utf-8'))
-                for name in ('wince6-native', 'wince6-native-cerf', 'wince6-portable')}
+                for name in ('wince6-native', 'wince6-native-cerf', 'wince6-portable', 'wince6-cmd')}
     if private:
         for name in ('wince6-native', 'wince6-native-cerf'):
             profiles[name].update(executable='../ce-images/wince6/fs/Windows/explorer.exe',
                                   image_root='../ce-images/wince6/fs')
+        if (image / 'Windows/cmd.exe').is_file():
+            profiles['wince6-cmd'].update(executable='../ce-images/wince6/fs/Windows/cmd.exe',
+                                         image_root='../ce-images/wince6/fs')
+        else:
+            profiles.pop('wince6-cmd')
         profiles['wince6-native-cerf']['mounts'] = [dict(guest_prefix='\\CERF\\', host_dir='../ce-apps/cerf/arm')]
         if explorer is not None:
             profiles['wince6-portable'].update(executable='../games/wince6-desktop/extracted/explorer-portable.exe',
@@ -90,6 +95,8 @@ def package(output, image=None, explorer=None, cerf=None):
                 put_json(archive, f'profiles/{name}.json', profile)
             archive.writestr('run-wince6-gui.cmd', LAUNCHER.replace('\n', '\r\n'))
             archive.writestr('run-wince6-portable.cmd', LAUNCHER.replace('wince6-native.json', 'wince6-portable.json').replace('\n', '\r\n'))
+            if 'wince6-cmd' in profiles:
+                archive.writestr('run-wince6-cmd.cmd', LAUNCHER.replace('wince6-native.json', 'wince6-cmd.json').replace('\n', '\r\n'))
             put_json(archive, 'windows-ce-android.json', dict(screen='vga_landscape', rotation='none', max_slices=0, windows_ce=settings))
             archive.write(ROOT / 'docs/WINDOWS-CE.md', 'README-Windows-CE.md')
             if private:

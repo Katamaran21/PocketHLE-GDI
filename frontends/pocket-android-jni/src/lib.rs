@@ -1,4 +1,4 @@
-//! JNI bridge between the PocketHLE core/library and the Android
+//! JNI bridge between the PocketHLE-Reborn core/library and the Android
 //! frontend. The Java side talks to this crate exclusively through
 //! UTF-8 JSON strings — that keeps the FFI surface small and removes
 //! any need for shared Kotlin/Rust data classes.
@@ -13,7 +13,7 @@
 //! * `writeConfig(libraryRoot, json)` — overwrite config with a JSON blob.
 //! * `readGameSettings(libraryRoot, id)` — JSON of per-game settings.
 //! * `writeGameSettings(libraryRoot, id, json)` — persist per-game settings.
-//! * `nativeStartGame` / `nativePollFrame` / `nativeSendInput` /
+//! * `nativeStartGameWithDiagnostic` / `nativePollFrame` / `nativeSendInput` /
 //!   `nativeRequestStop` / `nativeFinishGame` — session-based
 //!   replacement that streams framebuffers to the UI as the guest
 //!   draws them, forwards touches and D-pad presses to the kernel,
@@ -29,7 +29,6 @@ mod internet;
 mod managed_game;
 mod power;
 mod runner;
-mod unimplemented_log;
 mod vibration;
 
 use anyhow::Context;
@@ -86,7 +85,7 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_libraryBackup<'local>
 }
 
 fn about_banner() -> String {
-    format!("PocketHLE v{} (Android)\nFork: https://github.com/guizmox/PocketHLE\nOriginal project — j92580498-max\nhttps://github.com/j92580498-max/PocketHLE\n\nGTShell support — Katamaran21\nhttps://github.com/Katamaran21/PocketHLE-GTShell\n\nThanks\nNekomo\nOLego\nTimofeyLednev\nBenoît (FX-man)\nJérôme (SoldatGG)\nTim (Firefly)\nMarat\ntorrenia", env!("CARGO_PKG_VERSION"))
+    format!("PocketHLE-Reborn v{} (Android)\nFork: https://github.com/guizmox/PocketHLE-Reborn\nRepository before the rename: https://github.com/guizmox/PocketHLE\nOriginal project — j92580498-max\nhttps://github.com/j92580498-max/PocketHLE\n\nGTShell support — Katamaran21\nhttps://github.com/Katamaran21/PocketHLE-GTShell\n\nThanks\nNekomo\nOLego\nTimofeyLednev\nBenoît (FX-man)\nJérôme (SoldatGG)\nTim (Firefly)\nMarat\ntorrenia", env!("CARGO_PKG_VERSION"))
 }
 
 #[no_mangle]
@@ -190,9 +189,7 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_listGames<'local>(
                 value["screen_height"] = height.into();
                 value["custom_settings"] = game.settings.has_custom_settings(lib.config()).into();
                 value["graphics_api"] =
-                    serde_json::to_value(pocket_library::analysis::detect_graphics_api_cached(
-                        &game.executable_path(&root),
-                    ))?;
+                    serde_json::to_value(pocket_library::analysis::game_graphics_api(game, &root))?;
                 Ok(value)
             })
             .collect::<Result<Vec<serde_json::Value>, serde_json::Error>>()?;
@@ -226,7 +223,7 @@ fn prepared_import_json(token: u64, pending: &pocket_library::PreparedImport) ->
         .into_iter()
         .map(|(id, display_name)| serde_json::json!({"id":id,"display_name":display_name}))
         .collect();
-    serde_json::json!({"ok":true,"token":token.to_string(),"count":pending.entries().len(),"updates":pending.updates(),"platform_choices":choices,"cabinet_choices":pending.cabinet_choices()}).to_string()
+    serde_json::json!({"ok":true,"token":token.to_string(),"count":pending.entries().len(),"updates":pending.updates(),"platform_choices":choices,"cabinet_choices":pending.cabinet_choices(),"executable_choices":pending.executable_choices()}).to_string()
 }
 #[no_mangle]
 pub extern "system" fn Java_com_pockethle_app_NativeBridge_choosePreparedImportCabinet<'local>(
@@ -289,6 +286,38 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_choosePreparedImportP
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_choosePreparedImportExecutable<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    library_root: JString<'local>,
+    token: jlong,
+    game_id: JString<'local>,
+    index: jint,
+) -> jstring {
+    let result = (|| -> anyhow::Result<String> {
+        let root = jstring_to_path(&mut env, library_root).context("missing library root")?;
+        let id: String = env.get_string(&game_id)?.into();
+        let mut imports = PREPARED_IMPORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (owner, pending) = imports
+            .get_mut(&(token as u64))
+            .context("import no longer pending")?;
+        anyhow::ensure!(*owner == root, "import belongs to another library");
+        let index = usize::try_from(index).context("invalid executable index")?;
+        anyhow::ensure!(
+            pending.choose_executable(&id, index),
+            "unknown executable choice"
+        );
+        Ok(prepared_import_json(token as u64, pending))
+    })();
+    new_jstring(
+        &env,
+        result.unwrap_or_else(|e| error_json(&format!("choosePreparedImportExecutable: {e:#}"))),
+    )
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_pockethle_app_NativeBridge_prepareImport<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -323,11 +352,38 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_commitPreparedImport<
     let result = (|| -> anyhow::Result<String> {
         let root = jstring_to_path(&mut env, library_root).context("missing library root")?;
         let pending = take_prepared_import(&root, token as u64)?;
-        let entries = Library::open(&root)?.apply_prepared_import(pending, allow_updates != 0)?;
+        let mut library = Library::open(&root)?;
+        let before = pocket_library::import_setup::Presence::read(library.games(), &root);
+        let existing_ids: std::collections::HashSet<_> = library
+            .games()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        let entries = library.apply_prepared_import(pending, allow_updates != 0)?;
+        let setup_requests = library.config().first_import_setup.requests(
+            before,
+            pocket_library::import_setup::Presence::read(&entries, &root),
+        );
+        let mut values = entries
+            .iter()
+            .map(|entry| -> anyhow::Result<serde_json::Value> {
+                let mut value = serde_json::to_value(entry)?;
+                value["is_gizmondo"] = pocket_library::is_gizmondo_game(entry, &root).into();
+                if !existing_ids.contains(&entry.id) && !library.is_demo_card(&entry.id) {
+                    if let Some(options) = pocketpc_launch_options(entry, &root, true)? {
+                        value["launch_options"] = options;
+                    }
+                }
+                Ok(value)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if let Some(first) = values.first_mut() {
+            first["first_import_setup"] = serde_json::to_value(setup_requests)?;
+        }
         if entries.len() == 1 && !entries[0].source_cab.starts_with("gzga-collection:") {
-            Ok(serde_json::to_string(&entries[0])?)
+            Ok(serde_json::to_string(&values[0])?)
         } else {
-            Ok(serde_json::to_string(&entries)?)
+            Ok(serde_json::to_string(&values)?)
         }
     })();
     new_jstring(
@@ -376,6 +432,7 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_prepareGameData<'loca
     source: JString<'local>,
     name: JString<'local>,
     extract: jni::sys::jboolean,
+    my_documents: jni::sys::jboolean,
 ) -> jstring {
     let result = (|| -> anyhow::Result<String> {
         let root = jstring_to_path(&mut env, library_root).context("Missing library root")?;
@@ -386,12 +443,19 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_prepareGameData<'loca
             .lock()
             .map_err(|_| anyhow::anyhow!("Library lock unavailable"))?;
         anyhow::ensure!(*sessions == 0, "Stop the running game before adding data");
-        let pending = pocket_library::add_data::prepare(
+        use pocket_library::add_data::{self, Destination};
+        let destination = if my_documents != 0 {
+            Destination::MyDocuments
+        } else {
+            Destination::ApplicationFolder
+        };
+        let pending = add_data::prepare_at(
             &Library::open(&root)?,
             &id,
             &source,
             &name,
             extract != 0,
+            destination,
         )?;
         let token = NEXT_IMPORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let json = serde_json::json!({"ok": true, "token": token.to_string(), "conflicts": pending.conflicts(), "executables": pending.executables()}).to_string();
@@ -427,8 +491,17 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_commitGameData<'local
             .map_err(|_| anyhow::anyhow!("Library lock unavailable"))?;
         anyhow::ensure!(*sessions == 0, "Stop the running game before adding data");
         let destination = pending.destination().display().to_string();
-        pending.apply(&mut Library::open(&root)?, overwrite != 0)?;
-        Ok(serde_json::json!({"ok": true, "destination": destination}).to_string())
+        let selected_game = pending.selected_game_id().map(str::to_owned);
+        let mut library = Library::open(&root)?;
+        pending.apply(&mut library, overwrite != 0)?;
+        let options = match selected_game.as_deref().and_then(|id| library.get(id)) {
+            Some(game) => pocketpc_launch_options(game, &root, false)?,
+            None => None,
+        };
+        Ok(
+            serde_json::json!({"ok": true, "destination": destination, "launch_options": options})
+                .to_string(),
+        )
     })();
     new_jstring(
         &env,
@@ -484,6 +557,23 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_removeGame<'local>(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_cleanupCabInstallFiles<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    library_root: JString<'local>,
+) -> jstring {
+    let result = (|| -> anyhow::Result<String> {
+        let root = jstring_to_path(&mut env, library_root).context("missing library root")?;
+        Ok(pocket_library::cab_cleanup::run(&root)?)
+    })();
+    let response = match result {
+        Ok(message) => serde_json::json!({"ok": true, "message": message}).to_string(),
+        Err(error) => error_json(&format!("{error:#}")),
+    };
+    new_jstring(&env, response)
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_pockethle_app_NativeBridge_readConfig<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -517,6 +607,33 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_readConfig<'local>(
         Ok(j) => new_jstring(&env, j),
         Err(e) => new_jstring(&env, error_json(&format!("readConfig: {e:#}"))),
     }
+}
+
+/// Finish first-import setup by merging only the selected fields into current settings.
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_finishImportSetup<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    library_root: JString<'local>,
+    choices_json: JString<'local>,
+) -> jstring {
+    let result = (|| -> anyhow::Result<()> {
+        let root = jstring_to_path(&mut env, library_root).context("missing library root")?;
+        let body = jstring_to_string(&mut env, choices_json).context("missing setup choices")?;
+        let choices: pocket_library::import_setup::Choices = serde_json::from_str(&body)?;
+        pocket_library::import_setup::save(
+            &root,
+            pocket_library::LauncherProfile::Standard,
+            &choices,
+        )?;
+        Ok(())
+    })();
+    new_jstring(
+        &env,
+        result
+            .map(|_| "{\"ok\":true}".to_owned())
+            .unwrap_or_else(|error| error_json(&format!("finishImportSetup: {error:#}"))),
+    )
 }
 
 #[no_mangle]
@@ -556,6 +673,70 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_writeConfig<'local>(
         Ok(()) => new_jstring(&env, "{\"ok\":true}"),
         Err(e) => new_jstring(&env, error_json(&format!("writeConfig: {e:#}"))),
     }
+}
+
+fn pocketpc_launch_options(
+    game: &pocket_library::GameEntry,
+    root: &std::path::Path,
+    display_advice: bool,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let Some(advice) =
+        pocket_library::gpu_profile::ImportAdvice::for_game(game, root, display_advice)
+    else {
+        return Ok(None);
+    };
+    let profiles = if advice.choose_gpu_profile {
+        pocket_library::gpu_profile::GpuCompatibilityProfile::ALL
+            .into_iter()
+            .map(|profile| serde_json::json!({"id": profile, "label": profile.label()}))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(Some(serde_json::json!({
+        "id": game.id,
+        "display_name": game.display_name,
+        "message": advice.message(),
+        "show_display_advice": advice.show_display_advice,
+        "profiles": profiles,
+        "current_profile": game.settings.gpu_compatibility_profile,
+    })))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_launchExecutables<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    library_root: JString<'local>,
+    id: JString<'local>,
+    selected: JString<'local>,
+) -> jstring {
+    let result = (|| -> anyhow::Result<String> {
+        let root = jstring_to_path(&mut env, library_root).context("missing library root")?;
+        let id = jstring_to_string(&mut env, id).context("missing game id")?;
+        let mut library = Library::open(&root)?;
+        if let Some(path) = jstring_to_path(&mut env, selected) {
+            library.switch_launch_executable(&id, &path)?;
+            let options =
+                pocketpc_launch_options(library.get(&id).context("Unknown game")?, &root, false)?;
+            return Ok(serde_json::json!({"ok": true, "launch_options": options}).to_string());
+        }
+        let game = library.get(&id).context("unknown game")?;
+        let launch = game.launch_path(&root);
+        let current = launch
+            .strip_prefix(root.join(game.relative_dir()))
+            .unwrap_or(&launch);
+        Ok(serde_json::json!({
+            "ok": true,
+            "current": current,
+            "executables": library.launch_executables(&id)?,
+        })
+        .to_string())
+    })();
+    new_jstring(
+        &env,
+        result.unwrap_or_else(|error| error_json(&format!("{error:#}"))),
+    )
 }
 
 #[no_mangle]
@@ -662,7 +843,11 @@ fn init_logger() {
         android_logger::init_once(
             android_logger::Config::default()
                 .with_max_level(log::LevelFilter::Trace)
-                .with_tag("PocketHLE"),
+                .with_tag("PocketHLE-Reborn")
+                .format(|buffer, record| {
+                    pocket_library::session_diagnostic::record(record);
+                    write!(buffer, "{}", record.args())
+                }),
         );
     });
 }
@@ -672,8 +857,8 @@ fn init_logger() {
 //
 // A worker streams images and accepts input while the guest is running.
 //
-//  * `nativeStartGame` returns an opaque `jlong` handle (a pointer to a
-//    boxed [`Session`]).
+//  * `nativeStartGameWithDiagnostic` returns JSON with an opaque session handle
+//    on success or a startup diagnostic on failure.
 //  * `nativePollFrame` returns the latest framebuffer that the worker has
 //    produced since the last poll, as a flat `byte[]` with an 8-byte
 //    little-endian header `(width: u32, height: u32)` followed by RGBA
@@ -684,7 +869,7 @@ fn init_logger() {
 //  * `nativeRequestStop` asks the worker to stop at the next slice
 //    boundary.
 //  * `nativeFinishGame` joins the worker and frees the session, returning
-//    a textual summary that the activity shows in its status panel.
+//    a JSON session summary and optional diagnostic.
 //
 // The pointer is opaque to Kotlin and is consumed exactly once by
 // `nativeFinishGame`. After that call the handle is invalid and Kotlin must
@@ -700,63 +885,63 @@ const INPUT_KIND_POINTER_MOVE: jint = 4;
 const INPUT_KIND_KEYBOARD_ROTATION: jint = 5;
 
 #[no_mangle]
-pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeStartGame<'local>(
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeStartGameWithDiagnostic<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     library_root: JString<'local>,
     id: JString<'local>,
     presentation: jlong,
-) -> jlong {
+) -> jstring {
     init_logger();
-    if let Err(e) = bluetooth::install(&mut env, &_class) {
-        log::error!("Cannot initialize Android Bluetooth bridge: {e}");
-        return 0;
-    }
-    if let Err(e) = internet::install(&mut env, &_class) {
-        log::error!("Cannot initialize Android HTTP bridge: {e}");
-        return 0;
-    }
-    if let Err(e) = vibration::install(&mut env, &_class) {
-        log::error!("Cannot initialize Android vibration bridge: {e}");
-        return 0;
-    }
-    if let Err(e) = power::install(&mut env, &_class) {
-        log::error!("Cannot initialize Android battery bridge: {e}");
-        return 0;
-    }
-    if let Err(e) = gps::install(&mut env, &_class) {
-        log::error!("Cannot initialize Android GPS bridge: {e}");
-        return 0;
-    }
-    if let Err(e) = camera::install(&mut env, &_class) {
-        log::error!("Cannot initialize Android camera bridge: {e}");
-        return 0;
-    }
-    let root = match jstring_to_path(&mut env, library_root) {
-        Some(p) => p,
-        None => {
-            log::error!("nativeStartGame: missing library root");
-            return 0;
+    let (result, log) = pocket_library::session_diagnostic::capture(|| -> Result<jlong, String> {
+        if let Err(e) = bluetooth::install(&mut env, &_class) {
+            return Err(format!("Cannot initialize Android Bluetooth bridge: {e}"));
+        }
+        if let Err(e) = internet::install(&mut env, &_class) {
+            return Err(format!("Cannot initialize Android HTTP bridge: {e}"));
+        }
+        if let Err(e) = vibration::install(&mut env, &_class) {
+            return Err(format!("Cannot initialize Android vibration bridge: {e}"));
+        }
+        if let Err(e) = power::install(&mut env, &_class) {
+            return Err(format!("Cannot initialize Android battery bridge: {e}"));
+        }
+        if let Err(e) = gps::install(&mut env, &_class) {
+            return Err(format!("Cannot initialize Android GPS bridge: {e}"));
+        }
+        if let Err(e) = camera::install(&mut env, &_class) {
+            return Err(format!("Cannot initialize Android camera bridge: {e}"));
+        }
+        let root = match jstring_to_path(&mut env, library_root) {
+            Some(p) => p,
+            None => {
+                return Err("missing library root".into());
+            }
+        };
+        let id = match jstring_to_string(&mut env, id) {
+            Some(s) => s,
+            None => {
+                return Err("missing game id".into());
+            }
+        };
+        let mut sessions = LIBRARY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        match runner::start_with_presentation(root, id, graphics::get(presentation)) {
+            Ok(session) => {
+                *sessions += 1;
+                Ok(Box::into_raw(Box::new(session)) as jlong)
+            }
+            Err(error) => Err(format!("{error:#}")),
+        }
+    });
+    let body = match result {
+        Ok(handle) => serde_json::json!({"handle": handle}),
+        Err(reason) => {
+            log::error!("nativeStartGameWithDiagnostic: {reason}");
+            let diagnostic = pocket_library::session_diagnostic::startup_failure(reason, log);
+            serde_json::json!({"diagnostic": diagnostic})
         }
     };
-    let id = match jstring_to_string(&mut env, id) {
-        Some(s) => s,
-        None => {
-            log::error!("nativeStartGame: missing game id");
-            return 0;
-        }
-    };
-    let mut sessions = LIBRARY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    match runner::start_with_presentation(root, id, graphics::get(presentation)) {
-        Ok(session) => {
-            *sessions += 1;
-            Box::into_raw(Box::new(session)) as jlong
-        }
-        Err(e) => {
-            log::error!("nativeStartGame: {e:#}");
-            0
-        }
-    }
+    new_jstring(&env, body.to_string())
 }
 
 #[no_mangle]
@@ -973,6 +1158,19 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativePollGpsNotice<'
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeSetAccelerometer(
+    _env: JNIEnv,
+    _class: JClass,
+    present: jni::sys::jboolean,
+    x: jni::sys::jfloat,
+    y: jni::sys::jfloat,
+    z: jni::sys::jfloat,
+) {
+    let present = present != 0;
+    pocket_core::kernel::accelerometer::publish(present, present.then_some([x, y, z]));
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeSendInput<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -1054,7 +1252,7 @@ fn session_from_handle<'a>(handle: jlong) -> Option<&'a Session> {
         return None;
     }
     // SAFETY: the handle was produced by `Box::into_raw` in
-    // `nativeStartGame` and is freed exactly once by
+    // `nativeStartGameWithDiagnostic` and is freed exactly once by
     // `nativeFinishGame`. Kotlin guarantees the lifetime by treating
     // the handle as opaque and never passing a freed value back in.
     Some(unsafe { &*(handle as *const Session) })

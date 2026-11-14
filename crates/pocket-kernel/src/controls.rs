@@ -430,6 +430,8 @@ pub struct ChildWindow {
     pub list_images: Vec<i32>,
     pub list_states: Vec<u32>,
     pub list_text_callbacks: Vec<bool>,
+    /// LVIF_DI_SETITEM caches only the returned subitem, not every report column.
+    pub list_cached_text: Vec<std::collections::BTreeSet<u32>>,
     pub list_image_callbacks: Vec<bool>,
     pub list_image_lists: [u32; 3],
     pub list_image_sizes: [(u32, u32); 3],
@@ -555,6 +557,23 @@ pub struct RebarState {
 const LIST_VIEW_ROW_HEIGHT: i32 = 14;
 
 impl ChildWindow {
+    pub fn has_combo_edit(&self) -> bool {
+        self.class == ControlClass::ComboBox && matches!(self.style & 3, 1 | 2)
+    }
+
+    pub fn is_text_editable(&self) -> bool {
+        (self.class == ControlClass::Edit && self.style & 0x800 == 0) || self.has_combo_edit()
+    }
+
+    pub fn select_choice(&mut self, index: Option<usize>) {
+        self.list_selected = index.filter(|&i| i < self.list_items.len());
+        if self.has_combo_edit() {
+            self.text = self
+                .list_selected
+                .map_or_else(String::new, |i| self.list_items[i].0.clone());
+        }
+    }
+
     /// A drop-down list has no editable text buffer: its window text is the
     /// selected item's label (WM_GETTEXT / GetWindowText), or empty if unset.
     pub fn window_text(&self) -> &str {
@@ -1480,11 +1499,14 @@ impl ChildWindow {
         surf.fill_rect(self.x, self.y, self.w, height, Self::WINDOW);
         stroke(surf, self.x, self.y, self.w, height, Self::SHADOW);
         if combo {
-            let value = self
-                .list_selected
-                .and_then(|i| self.list_items.get(i))
-                .map(|i| i.0.as_str())
-                .unwrap_or(&self.text);
+            let value = if self.has_combo_edit() {
+                self.text.as_str()
+            } else {
+                self.list_selected
+                    .and_then(|i| self.list_items.get(i))
+                    .map(|i| i.0.as_str())
+                    .unwrap_or(&self.text)
+            };
             let line = crate::text::layout(face, &value.encode_utf16().collect::<Vec<_>>());
             line.draw(
                 surf,
@@ -2242,6 +2264,7 @@ impl Controls {
             list_images: Vec::new(),
             list_states: Vec::new(),
             list_text_callbacks: Vec::new(),
+            list_cached_text: Vec::new(),
             list_image_callbacks: Vec::new(),
             list_image_lists: [0; 3],
             list_image_sizes: [(0, 0); 3],
@@ -2690,14 +2713,18 @@ impl Controls {
             let combo = child.class == ControlClass::ComboBox;
             let local_y = y - origin.1 - child.y;
             if combo && (0..child.choice_closed_height()).contains(&local_y) {
-                child.choice_open = !child.choice_open;
+                // Original CE6 Explorer's Run field is CBS_DROPDOWN. Clicking
+                // its edit area takes focus; only its arrow opens the list.
+                child.choice_open = (!child.has_combo_edit()
+                    || x - origin.0 - child.x >= child.w - 17)
+                    && !child.choice_open;
                 return Some(ControlAction::Consumed);
             }
             let index = ((local_y - if combo { child.choice_popup_y + 1 } else { 1 }).max(0)
                 / child.choice_row_height
                 + child.list_scroll_y.max(0)) as usize;
             if index < child.list_items.len() {
-                child.list_selected = Some(index);
+                child.select_choice(Some(index));
                 child.choice_open = false;
                 return Some(ControlAction::Notify {
                     parent: child.parent,
@@ -2950,6 +2977,15 @@ impl Controls {
     /// [`Self::key_down`] restricted to the children of `parent`.
     pub fn key_down_in(&mut self, parent: u32, vk: u16) -> Option<ControlAction> {
         self.last_list_click = None;
+        // Volume & Sounds and file dialogs first dismiss an open choice list.
+        // Its Enter/Escape must not also accept/cancel the containing dialog.
+        if matches!(vk, 0x0D | 0x1B)
+            && self.get(self.focus).is_some_and(|c| {
+                c.parent == parent && c.class == ControlClass::ComboBox && c.choice_open
+            })
+        {
+            return self.key_down(vk);
+        }
         // Dialog-manager keys apply even when WM_INITDIALOG left no child
         // focused. Never borrow a default button from the window underneath.
         if vk == 0x1B {
@@ -3074,7 +3110,9 @@ impl Controls {
                 })
             }
             ControlClass::ComboBox
-                if vk == 0x0d || (vk == 0x1b && child.choice_open) || vk == 0x73 =>
+                if (vk == 0x0d && (!child.has_combo_edit() || child.choice_open))
+                    || (vk == 0x1b && child.choice_open)
+                    || vk == 0x73 =>
             {
                 child.choice_open = vk != 0x1b && !child.choice_open;
                 Some(ControlAction::Consumed)
@@ -3106,7 +3144,7 @@ impl Controls {
                     Some(i) => (i + 1).min(child.list_items.len() - 1),
                     None => 0,
                 };
-                child.list_selected = Some(next);
+                child.select_choice(Some(next));
                 Some(ControlAction::Notify {
                     parent: child.parent,
                     id: child.id,
@@ -3149,6 +3187,25 @@ impl Controls {
                     hwnd: child.hwnd,
                     code: (-101i32) as u32,
                     index: next as i32,
+                })
+            }
+            ControlClass::ComboBox if child.has_combo_edit() => {
+                let changed = if vk == VK_BACK {
+                    child.text.pop().is_some()
+                } else {
+                    child.text.push(vk_to_char(vk)?);
+                    true
+                };
+                if !changed {
+                    return Some(ControlAction::Consumed);
+                }
+                child.list_selected = None;
+                Some(ControlAction::Notify {
+                    parent: child.parent,
+                    id: child.id,
+                    hwnd: child.hwnd,
+                    code: 5,
+                    index: -1,
                 })
             }
             ControlClass::Edit => {
@@ -3386,6 +3443,43 @@ fn vk_to_char(vk: u16) -> Option<char> {
 mod tests {
     use super::*;
     use crate::gdi::Bitmap;
+
+    #[test]
+    fn editable_combo_focus_and_arrow_keep_history_selection_and_text_distinct() {
+        let mut controls = Controls::default();
+        let hwnd = controls.create(
+            PARENT,
+            ControlClass::ComboBox,
+            1,
+            String::new(),
+            WS_VISIBLE | 2,
+            10,
+            10,
+            100,
+            25,
+        );
+        let c = controls.get_mut(hwnd).unwrap();
+        c.list_items = vec![("Previous path".into(), 0), ("Other path".into(), 0)];
+        c.select_choice(Some(0));
+        assert_eq!(c.window_text(), "Previous path");
+        controls.pointer_down(30, 20);
+        assert_eq!(controls.focus, hwnd);
+        assert!(!controls.get(hwnd).unwrap().choice_open);
+        assert!(matches!(
+            controls.key_down(0x08),
+            Some(ControlAction::Notify { code: 5, .. })
+        ));
+        assert_eq!(controls.get(hwnd).unwrap().window_text(), "Previous pat");
+        assert_eq!(controls.get(hwnd).unwrap().list_selected, None);
+        assert_eq!(controls.key_down(0x0d), None);
+        controls.pointer_down(105, 20);
+        assert!(controls.get(hwnd).unwrap().choice_open);
+        assert_eq!(controls.key_down(0x1b), Some(ControlAction::Consumed));
+        assert!(!controls.get(hwnd).unwrap().choice_open);
+        controls.get_mut(hwnd).unwrap().style |= 3;
+        controls.pointer_down(30, 20);
+        assert!(controls.get(hwnd).unwrap().choice_open);
+    }
 
     #[test]
     fn combo_parent_brush_does_not_erase_buttons_created_before_it() {

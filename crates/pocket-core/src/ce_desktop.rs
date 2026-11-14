@@ -31,6 +31,7 @@ pub struct ProcessFrame {
     pub rgba: Arc<[u8]>,
     pub layers: Vec<Layer>,
     pub text_input: bool,
+    pub console_owner: Option<u32>,
     pub stats: PresentationStats,
 }
 
@@ -134,40 +135,41 @@ impl ProcessFrame {
             });
         }
         if state.shell_keyboard.visible {
-            let h = crate::kernel::shell_keyboard::ShellKeyboard::panel_height(logical[1] as i32);
             layers.push(Layer {
                 id: 4 << 32,
-                bounds: (0, logical[1] as i32 - h, logical[0] as i32, h),
+                bounds: state
+                    .shell_keyboard
+                    .display_bounds(logical[0] as i32, logical[1] as i32),
                 kind: LayerKind::Overlay,
             });
         }
+        let console_owner = state.vfs.console_device().and_then(|device| {
+            device
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .owner_process
+        });
         // Windowless GAPI/GLES applications still own their whole display.
         // A classic process whose last window was destroyed owns no pixels.
-        if layers.is_empty() && !state.ce.windows.enabled {
+        // Pocket CMD children share CON: and have no independent display.
+        if layers.is_empty()
+            && !state.ce.windows.enabled
+            && (!state.console.inherited || state.framebuffer.presentation_stats.completed() != 0)
+        {
             layers.push(Layer {
                 id: 0,
                 bounds: (0, 0, logical[0] as i32, logical[1] as i32),
                 kind: LayerKind::Window,
             });
         }
-        let focus = if state.shell_keyboard.sip {
-            state.shell_keyboard.target
-        } else {
-            state.controls.focus
-        };
-        let text_input = state.gapi_action_key == crate::kernel::gapi::VK_RETURN
-            && state.controls.get(focus).is_some_and(|c| {
-                c.class == crate::kernel::controls::ControlClass::Edit
-                    && c.visible
-                    && c.enabled
-                    && c.style & 0x800 == 0
-            });
+        let text_input = state.accepts_text_input();
         Ok(Self {
             logical,
             image: [image.0, image.1],
             rgba: rgba.into(),
             layers,
             text_input,
+            console_owner,
             stats: state.framebuffer.presentation_stats.clone(),
         })
     }
@@ -278,14 +280,30 @@ impl Desktop {
         if self.focus == 0 {
             self.focus = pid;
         }
+        // A console child shares its parent's CON: window. Its output must not
+        // take keyboard focus away from the only process with that window.
+        self.focus = self.visible_input_owner(self.focus);
         self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
     pub fn activate(&mut self, pid: u32) {
+        let pid = self.visible_input_owner(pid);
         if self.focus != pid {
             self.focus = pid;
             self.revision = self.revision.wrapping_add(1);
         }
+    }
+    fn visible_input_owner(&self, pid: u32) -> u32 {
+        self.frames
+            .get(&pid)
+            .filter(|frame| frame.layers.is_empty())
+            .and_then(|frame| frame.console_owner)
+            .filter(|owner| {
+                self.frames
+                    .get(owner)
+                    .is_some_and(|frame| !frame.layers.is_empty())
+            })
+            .unwrap_or(pid)
     }
     pub fn focused_process(&self) -> u32 {
         self.focus
@@ -299,7 +317,7 @@ impl Desktop {
             self.pointer_owner = None;
         }
         if self.focus == pid {
-            self.focus = next;
+            self.focus = self.visible_input_owner(next);
         }
         self.revision = self.revision.wrapping_add(1);
     }
@@ -472,6 +490,7 @@ mod tests {
                 .map(|&(id, bounds, kind)| Layer { id, bounds, kind })
                 .collect(),
             text_input: false,
+            console_owner: None,
             stats: PresentationStats::default(),
         }
     }
@@ -544,6 +563,39 @@ mod tests {
         assert_eq!(input.len(), 5);
     }
     #[test]
+    fn a_child_keyboard_owns_pixels_and_clicks_outside_its_dialog() {
+        let mut desktop = Desktop::default();
+        desktop
+            .publish(1, frame(20, &[(1, (0, 0, 8, 6), LayerKind::Window)]))
+            .unwrap();
+        desktop
+            .publish(
+                2,
+                frame(
+                    200,
+                    &[
+                        (1, (2, 1, 4, 3), LayerKind::Window),
+                        (4 << 32, (0, 3, 8, 3), LayerKind::Overlay),
+                    ],
+                ),
+            )
+            .unwrap();
+        desktop.activate(2);
+        assert_eq!(
+            desktop.compose().unwrap().unwrap().rgba[(5 * 8 + 7) * 4],
+            200
+        );
+        assert_eq!(desktop.queue(InputEvent::PointerDown { x: 7, y: 5 }, 1), 2);
+        assert_eq!(desktop.queue(InputEvent::PointerUp { x: 7, y: 5 }, 1), 2);
+        desktop
+            .publish(2, frame(200, &[(1, (2, 1, 4, 3), LayerKind::Window)]))
+            .unwrap();
+        assert_eq!(desktop.focused_process(), 2);
+        let combined = desktop.compose().unwrap().unwrap();
+        assert_eq!(combined.rgba[(2 * 8 + 3) * 4], 200);
+        assert_eq!(combined.rgba[(5 * 8 + 7) * 4], 20);
+    }
+    #[test]
     fn unchanged_repaint_keeps_image_identity_and_high_density_child_pixels() {
         let mut d = Desktop::default();
         let root = frame(20, &[(1, (0, 0, 8, 6), LayerKind::Window)]);
@@ -559,5 +611,46 @@ mod tests {
         assert_eq!(combined.image, [16, 12]);
         assert_eq!(combined.rgba[(4 * 16 + 6) * 4], 200);
         assert_eq!(combined.rgba[0], 20);
+    }
+    #[test]
+    fn windowless_cmd_child_keeps_console_pixels_text_focus_and_explorer_taskbar() {
+        let mut desktop = Desktop::default();
+        desktop
+            .publish(
+                1,
+                frame(
+                    20,
+                    &[
+                        (1, (0, 0, 8, 6), LayerKind::Desktop),
+                        (2, (0, 5, 8, 1), LayerKind::Topmost),
+                    ],
+                ),
+            )
+            .unwrap();
+        let mut console = frame(100, &[(1, (1, 1, 6, 4), LayerKind::Window)]);
+        console.text_input = true;
+        console.console_owner = Some(2);
+        desktop.publish(2, console).unwrap();
+        desktop.activate(2);
+        let before = desktop.compose().unwrap().unwrap();
+        let mut child = frame(0, &[]);
+        child.console_owner = Some(2);
+        desktop.publish(3, child).unwrap();
+        desktop.activate(3);
+        assert_eq!(desktop.focused_process(), 2);
+        let combined = desktop.compose().unwrap().unwrap();
+        assert!(combined.text_input);
+        assert_eq!(combined.rgba, before.rgba);
+        assert_eq!(combined.image_revision, before.image_revision);
+        assert_eq!(desktop.queue(InputEvent::Text { character: 'Ж' }, 3), 2);
+        let mut input = VecDeque::new();
+        desktop.drain(2, &mut input);
+        assert_eq!(input.pop_front(), Some(InputEvent::Text { character: 'Ж' }));
+        assert_eq!(desktop.queue(InputEvent::PointerDown { x: 2, y: 5 }, 3), 1);
+        assert_eq!(desktop.queue(InputEvent::PointerUp { x: 2, y: 5 }, 3), 1);
+        desktop.activate(3);
+        desktop.remove(3, 2);
+        assert_eq!(desktop.focused_process(), 2);
+        assert_eq!(desktop.compose().unwrap().unwrap().rgba, before.rgba);
     }
 }

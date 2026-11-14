@@ -31,6 +31,7 @@ audio-cpal = ["pocket-core/audio-cpal"]
 video-static = ["pocket-core/video-static"]
 
 [dependencies]
+pocket-netcf = { path = "../../crates/pocket-netcf" }
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
@@ -53,7 +54,7 @@ pocket-pe = { path = "../../crates/pocket-pe" }
 
 xbrz-rs = "=0.1.0"
 
-sdl3 = { version = "=0.22.0", features = ["build-from-source-static"] }
+sdl3 = { version = "=0.22.0", features = ["build-from-source-static", "hidapi"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.54", features = ["implement", "ApplicationModel_DataTransfer", "Foundation", "Foundation_Collections", "Storage", "Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }

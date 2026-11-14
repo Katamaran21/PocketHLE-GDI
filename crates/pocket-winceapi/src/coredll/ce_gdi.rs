@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) fn register(d: &mut WinCeDispatcher, dll: &str) {
     d.register_handler(dll, "ExcludeClipRect", exclude_clip_rect);
+    d.register_handler(dll, "IntersectClipRect", intersect_clip_rect);
     d.register_handler(dll, "CharUpperBuffW", char_upper_buff);
     d.register_handler(dll, "CreateDIBPatternBrushPt", dib_pattern_brush);
     d.register_handler(dll, "CreatePatternBrush", pattern_brush);
@@ -21,6 +22,45 @@ pub(super) fn dimensions(k: &KernelState, dc: u32) -> Option<(u32, u32)> {
             Some((b.width, b.height))
         }
     }
+}
+
+pub(super) fn intersect_clip_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let Some((width, height)) = dimensions(ctx.kernel, dc) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let bounds = [
+        ctx.arg_u32(1)? as i32,
+        ctx.arg_u32(2)? as i32,
+        ctx.arg_u32(3)? as i32,
+        ctx.arg_u32(4)? as i32,
+    ];
+    // Pocket Word's native RichEdit clips its text layout before painting.
+    // Keep this in the DC so SaveDC/RestoreDC and every primitive share it;
+    // changing a clip does not read or publish any framebuffer pixels.
+    let input = ctx
+        .kernel
+        .gdi
+        .dc(dc)
+        .unwrap()
+        .clip_rects
+        .clone()
+        .unwrap_or_else(|| vec![[0, 0, width as i32, height as i32]]);
+    let out: Vec<_> = input
+        .into_iter()
+        .map(|rect| {
+            [
+                rect[0].max(bounds[0]),
+                rect[1].max(bounds[1]),
+                rect[2].min(bounds[2]),
+                rect[3].min(bounds[3]),
+            ]
+        })
+        .filter(|rect| rect[0] < rect[2] && rect[1] < rect[3])
+        .collect();
+    let kind = clipping::region_kind(&out);
+    ctx.kernel.gdi.dc_mut(dc).unwrap().clip_rects = Some(out);
+    Ok(DispatchOutcome::ReturnedR0(kind))
 }
 
 fn exclude_clip_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {

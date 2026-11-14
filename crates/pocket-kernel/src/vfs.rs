@@ -21,7 +21,7 @@ use rmp3::{Frame, RawDecoder, MAX_SAMPLES_PER_FRAME};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 mod contracts;
 #[path = "vfs_mapping.rs"]
 mod mapping;
-pub use contracts::{FileInfo, OpenResult, VfsShared};
+pub use contracts::{FileInfo, FindEntry, OpenResult, VfsShared};
 pub use mapping::MappedFile;
 
 /// `INVALID_HANDLE_VALUE` from `<windows.h>`.
@@ -70,6 +70,9 @@ pub struct OpenFile {
     pub host_path: PathBuf,
     pub access: Access,
     pub file: File,
+    // CRT read-ahead belongs to the shared open description, like its cursor.
+    // Win32 I/O synchronizes it before using the underlying file directly.
+    stdio_reader: Option<BufReader<File>>,
     /// Whether the CRT stream was opened in text mode (`fopen` without
     /// `b`). Only the stdio layer in `pocket-winceapi` consults this —
     /// `CreateFileW` has no text mode on Windows CE, so handles opened
@@ -78,6 +81,17 @@ pub struct OpenFile {
     lease: Option<Arc<contracts::Lease>>,
     append: bool,
     for_mapping: bool,
+}
+
+impl OpenFile {
+    fn sync_stdio(&mut self) -> std::io::Result<()> {
+        if let Some(reader) = self.stdio_reader.as_mut() {
+            let position = reader.stream_position()?;
+            self.file.seek(SeekFrom::Start(position))?;
+            self.stdio_reader = None;
+        }
+        Ok(())
+    }
 }
 
 // MPEG Layer III frame size, used to retain a split frame until the next
@@ -280,6 +294,7 @@ struct RamFile {
     data: RamData,
     charge: crate::memory_division::StoreCharge,
     name_bytes: u64,
+    times: [u64; 3],
 }
 #[derive(Debug)]
 enum RamData {
@@ -375,8 +390,16 @@ static NEXT_MAS_STREAM: std::sync::atomic::AtomicU32 =
 /// Cloneable open description for transfer between process namespaces.
 #[derive(Clone)]
 pub struct VfsObject(VfsObjectInner, Option<(u32, crate::audio::MasPlayback)>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccelerometerStream {
+    Sen0,
+    Acc1,
+}
+
 #[derive(Clone)]
 enum VfsObjectInner {
+    Console(Arc<ConsoleOpen>),
+    Null(u32),
     Bluetooth(Arc<BluetoothOpen>),
     BluetoothDriver(Arc<BluetoothDriverOpen>),
     Camera(Arc<CameraOpen>),
@@ -386,6 +409,7 @@ enum VfsObjectInner {
     Ram(Arc<Mutex<OpenRamFile>>),
     Volume(OpenVolume),
     Registration,
+    HtcSensor(AccelerometerStream),
     Decoder(Arc<Mutex<Mp3DecoderState>>),
 }
 impl VfsObject {
@@ -425,9 +449,17 @@ pub struct BluetoothOpen {
     _lease: Arc<contracts::Lease>,
 }
 
+pub struct ConsoleOpen {
+    pub device: crate::console::SharedConsole,
+    pub access: u32,
+}
+
 /// Mount-point + open-handle table.
 pub struct Vfs {
     pub stdio_text_modes: [bool; 3],
+    console_device: Option<crate::console::SharedConsole>,
+    console_handles: HashMap<u32, Arc<ConsoleOpen>>,
+    null_handles: HashMap<u32, u32>,
     pub bluetooth: crate::bluetooth::State,
     bluetooth_handles: HashMap<u32, Arc<BluetoothOpen>>,
     bluetooth_driver_handles: HashMap<u32, Arc<BluetoothDriverOpen>>,
@@ -450,6 +482,7 @@ pub struct Vfs {
     next_handle: u32,
     /// Handles opened on the Gizmondo registration service device.
     registration: std::collections::HashSet<u32>,
+    htc_sensor_handles: HashMap<u32, AccelerometerStream>,
     /// Directory relative guest paths are resolved against.
     ///
     /// Windows CE has no per-process working directory, but Pocket PC
@@ -473,6 +506,9 @@ impl Vfs {
     pub fn new() -> Self {
         let mut vfs = Self {
             stdio_text_modes: [true; 3],
+            console_device: None,
+            console_handles: HashMap::new(),
+            null_handles: HashMap::new(),
             bluetooth: Default::default(),
             bluetooth_handles: HashMap::new(),
             bluetooth_driver_handles: HashMap::new(),
@@ -490,6 +526,7 @@ impl Vfs {
             decoders: HashMap::new(),
             next_handle: HANDLE_BASE,
             registration: std::collections::HashSet::new(),
+            htc_sensor_handles: HashMap::new(),
             default_dir: "\\".to_string(),
             colors_language_extensions: &[],
         };
@@ -499,6 +536,38 @@ impl Vfs {
 
     pub fn attach_ram(&mut self, ram: Option<crate::memory_division::MemoryDivision>) {
         self.ram = ram;
+    }
+
+    pub fn console_device(&self) -> Option<crate::console::SharedConsole> {
+        self.console_device.clone()
+    }
+    pub fn ensure_console_device(&mut self) -> crate::console::SharedConsole {
+        self.console_device
+            .get_or_insert_with(Default::default)
+            .clone()
+    }
+    pub fn attach_console_device(&mut self, device: crate::console::SharedConsole) {
+        self.console_device = Some(device);
+    }
+    pub fn console_open(&self, handle: u32) -> Option<Arc<ConsoleOpen>> {
+        self.console_handles.get(&handle).cloned()
+    }
+    pub fn is_null(&self, handle: u32) -> bool {
+        self.null_handles.contains_key(&handle)
+    }
+    pub fn open_console_device(&mut self, access: u32) -> Result<u32, u32> {
+        let h = self.next_handle;
+        self.next_handle = self.next_handle.checked_add(1).ok_or(8u32)?;
+        let device = self.ensure_console_device();
+        self.console_handles
+            .insert(h, Arc::new(ConsoleOpen { device, access }));
+        Ok(h)
+    }
+    pub fn open_null_device(&mut self, access: u32) -> Result<u32, u32> {
+        let h = self.next_handle;
+        self.next_handle = self.next_handle.checked_add(1).ok_or(8u32)?;
+        self.null_handles.insert(h, access);
+        Ok(h)
     }
     /// External mounts, including read-only card/ROM overlays, always win.
     pub fn is_ram_path(&self, path: &str) -> bool {
@@ -557,6 +626,7 @@ impl Vfs {
                 data: RamData::Bytes(Vec::new()),
                 charge,
                 name_bytes,
+                times: [0; 3],
             }));
             store.files.insert(key, file.clone());
             file
@@ -579,13 +649,27 @@ impl Vfs {
         Some(handle)
     }
     pub fn read_failure_error(&self, handle: u32) -> u32 {
-        if self.lease(handle).is_some_and(|l| l.access & 1 == 0) {
+        if self
+            .console_handles
+            .get(&handle)
+            .is_some_and(|c| c.access & 1 == 0)
+            || self.null_handles.get(&handle).is_some_and(|a| a & 1 == 0)
+            || self.lease(handle).is_some_and(|l| l.access & 1 == 0)
+        {
             5
         } else {
             30
         }
     }
     pub fn write_failure_error(&self, handle: u32) -> u32 {
+        if self
+            .console_handles
+            .get(&handle)
+            .is_some_and(|c| c.access & 2 == 0)
+            || self.null_handles.get(&handle).is_some_and(|a| a & 2 == 0)
+        {
+            return 5;
+        }
         if let Some(lease) = self.lease(handle) {
             if lease.access & 2 == 0 {
                 return 5;
@@ -915,6 +999,41 @@ impl Vfs {
             })
             .map(|m| m.display_prefix.trim_matches(['/', '\\']).to_string())
             .collect()
+    }
+
+    /// Prefer the guest spelling used to load a file, or locate it in a
+    /// mounted directory when the loader found it through a search path.
+    pub fn guest_path_for_file(&self, request: &str, host: &Path) -> String {
+        let requested = self.absolute(request);
+        let host = host.canonicalize().unwrap_or_else(|_| host.to_path_buf());
+        let resolves_to_file = |path: &str| {
+            self.resolve(path)
+                .and_then(|file| file.canonicalize().ok())
+                .as_ref()
+                == Some(&host)
+        };
+        if resolves_to_file(&requested) {
+            return requested;
+        }
+        let leaf = host
+            .file_name()
+            .map(|name| self.absolute(&name.to_string_lossy()));
+        if let Some(leaf) = leaf.filter(|path| resolves_to_file(path)) {
+            return leaf;
+        }
+        self.mounts
+            .iter()
+            .find_map(|mount| {
+                let root = mount.host_dir.canonicalize().ok()?;
+                let relative = host.strip_prefix(root).ok()?;
+                let path = format!(
+                    "{}\\{}",
+                    mount.display_prefix.trim_end_matches(['/', '\\']),
+                    relative.to_string_lossy().replace('/', "\\")
+                );
+                resolves_to_file(&path).then_some(path)
+            })
+            .unwrap_or(requested)
     }
 
     pub fn mounts_snapshot(&self) -> Vec<(String, PathBuf)> {
@@ -1304,6 +1423,7 @@ impl Vfs {
         let normalised = self.normalise_guest_path(guest_dir);
         let mut merged = std::collections::BTreeMap::new();
         let mut ram_directory = false;
+        let mut host_directory = false;
         if self.is_ram_path(guest_dir) {
             if let Some(ram) = &self.ram {
                 if let Ok(store) = ram.files.lock() {
@@ -1341,6 +1461,10 @@ impl Vfs {
             let Ok(entries) = std::fs::read_dir(host) else {
                 continue;
             };
+            // Pocket Word's Save As validates the parent through this listing.
+            // A fresh CE profile's empty My Documents still exists; filtered
+            // or overlay-deleted contents must not make it a missing directory.
+            host_directory = true;
             for entry in entries.flatten() {
                 if self.hidden_backing(mount, &entry.path()) {
                     continue;
@@ -1388,7 +1512,8 @@ impl Vfs {
                 .entry(child.to_string())
                 .or_insert((display.to_string(), 0, true));
         }
-        (ram_directory || !merged.is_empty()).then(|| merged.into_values().collect())
+        (ram_directory || host_directory || !merged.is_empty())
+            .then(|| merged.into_values().collect())
     }
 
     /// Create a guest directory through the writable mount that owns it.
@@ -1685,6 +1810,7 @@ impl Vfs {
                 host_path,
                 access,
                 file,
+                stdio_reader: None,
                 text_mode: false,
                 lease: None,
                 append: false,
@@ -1695,6 +1821,9 @@ impl Vfs {
     }
 
     pub fn read(&mut self, handle: u32, buf: &mut [u8]) -> Option<usize> {
+        if let Some(access) = self.null_handles.get(&handle) {
+            return (access & 1 != 0).then_some(0);
+        }
         if let Some(open) = self.ram_handles.get(&handle) {
             let mut open = open.lock().ok()?;
             if open.access == Access::Write
@@ -1722,10 +1851,79 @@ impl Vfs {
         if of.lease.as_ref().is_some_and(|l| l.access & 1 == 0) {
             return None;
         }
+        of.sync_stdio().ok()?;
         of.file.read(buf).ok()
     }
 
+    /// CRT reads have bounded read-ahead, unlike byte-exact Win32 ReadFile.
+    /// Parsers using fread(1) and feof for each character otherwise lose the
+    /// buffering provided by the CE CRT at every emulated API boundary.
+    pub fn read_stdio(&mut self, handle: u32, buf: &mut [u8]) -> Option<usize> {
+        let Some(open) = self.handles.get(&handle) else {
+            return self.read(handle, buf);
+        };
+        let mut open = open.lock().ok()?;
+        if open
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.access & 1 == 0)
+        {
+            return None;
+        }
+        if buf.is_empty() {
+            return Some(0);
+        }
+        // Mapped bytes can change outside the stream APIs. Keep that path
+        // unbuffered rather than retaining stale data beside a writable view.
+        if open.for_mapping
+            || open
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.mapped.load(std::sync::atomic::Ordering::Relaxed) != 0)
+        {
+            open.sync_stdio().ok()?;
+            return open.file.read(buf).ok();
+        }
+        if open.stdio_reader.is_none() {
+            // Buffering is optional if the host cannot allocate a duplicate
+            // descriptor; an already open readable file must remain usable.
+            let Ok(file) = open.file.try_clone() else {
+                return open.file.read(buf).ok();
+            };
+            open.stdio_reader = Some(BufReader::with_capacity(16 * 1024, file));
+        }
+        let reader = open.stdio_reader.as_mut()?;
+        let mut total = 0;
+        // A buffered tail can be shorter than the caller's request without
+        // reaching EOF. fread must continue into the next buffer in that case.
+        while total < buf.len() {
+            match reader.read(&mut buf[total..]) {
+                Ok(0) => break,
+                Ok(count) => total += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) if total == 0 => return None,
+                Err(_) => break,
+            }
+        }
+        Some(total)
+    }
+
+    /// Unconsumed CRT bytes prove that EOF has not been reached without a
+    /// host metadata/position query. Empty buffers retain the live-file check.
+    pub fn has_stdio_read_ahead(&self, handle: u32) -> bool {
+        self.handles.get(&handle).is_some_and(|open| {
+            open.lock().is_ok_and(|open| {
+                open.stdio_reader
+                    .as_ref()
+                    .is_some_and(|reader| !reader.buffer().is_empty())
+            })
+        })
+    }
+
     fn write_raw(&mut self, handle: u32, buf: &[u8]) -> Option<usize> {
+        if let Some(access) = self.null_handles.get(&handle) {
+            return (access & 2 != 0).then_some(buf.len());
+        }
         if let Some(open) = self.ram_handles.get(&handle) {
             let mut open = open.lock().ok()?;
             if open.access == Access::Read {
@@ -1756,35 +1954,11 @@ impl Vfs {
             return Some(buf.len());
         }
         let mut of = self.handles.get(&handle)?.lock().ok()?;
+        of.sync_stdio().ok()?;
         if of.append {
             of.file.seek(SeekFrom::End(0)).ok()?;
         }
         of.file.write(buf).ok()
-    }
-
-    /// FILETIME values for an existing file handle. Zero denotes unavailable
-    /// timestamps (including the RAM filesystem), rather than invented times.
-    pub fn file_times(&self, handle: u32) -> Option<[u64; 3]> {
-        if self.ram_handles.contains_key(&handle) {
-            return Some([0; 3]);
-        }
-        let file = self.handles.get(&handle)?.lock().ok()?;
-        let metadata = file.file.metadata().ok()?;
-        let convert = |time: std::io::Result<std::time::SystemTime>| -> u64 {
-            let Ok(time) = time else {
-                return 0;
-            };
-            let epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(11_644_473_600);
-            time.duration_since(epoch)
-                .ok()
-                .and_then(|d| u64::try_from(d.as_nanos() / 100).ok())
-                .unwrap_or(0)
-        };
-        Some([
-            convert(metadata.created()),
-            convert(metadata.accessed()),
-            convert(metadata.modified()),
-        ])
     }
 
     pub fn size(&mut self, handle: u32) -> Option<u64> {
@@ -1793,6 +1967,19 @@ impl Vfs {
         }
         let of = self.handles.get(&handle)?.lock().ok()?;
         of.file.metadata().ok().map(|m| m.len())
+    }
+
+    /// Query the logical cursor without discarding CRT read-ahead.
+    pub fn position(&mut self, handle: u32) -> Option<u64> {
+        if let Some(open) = self.ram_handles.get(&handle) {
+            return Some(open.lock().ok()?.position);
+        }
+        let mut open = self.handles.get(&handle)?.lock().ok()?;
+        if let Some(reader) = open.stdio_reader.as_mut() {
+            reader.stream_position().ok()
+        } else {
+            open.file.stream_position().ok()
+        }
     }
 
     pub fn seek(&mut self, handle: u32, offset: i64, whence: SeekKind) -> Option<u64> {
@@ -1811,6 +1998,9 @@ impl Vfs {
             return Some(open.position);
         }
         let mut of = self.handles.get(&handle)?.lock().ok()?;
+        // Explicit repositioning also discards stale input after another
+        // stream/handle has updated the file, including a zero-distance seek.
+        of.sync_stdio().ok()?;
         let from = match whence {
             SeekKind::Begin => SeekFrom::Start(u64::try_from(offset).ok()?),
             SeekKind::Current => SeekFrom::Current(offset),
@@ -1820,20 +2010,33 @@ impl Vfs {
     }
 
     pub fn flush(&mut self, handle: u32) -> std::io::Result<()> {
+        if self.console_handles.contains_key(&handle) || self.null_handles.contains_key(&handle) {
+            return Ok(());
+        }
         if self.ram_handles.contains_key(&handle) {
             return Ok(());
         }
         let file = self.handles.get(&handle).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid handle")
         })?;
-        file.lock()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "file lock poisoned"))?
-            .file
-            .flush()
+        let mut file = file
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "file lock poisoned"))?;
+        file.sync_stdio()?;
+        file.file.flush()
     }
 
     /// An opaque shared open description, retaining seek/access/device state.
     pub fn export_handle(&self, handle: u32) -> Option<VfsObject> {
+        if let Some(console) = self.console_handles.get(&handle) {
+            return Some(VfsObject(VfsObjectInner::Console(console.clone()), None));
+        }
+        if let Some(access) = self.null_handles.get(&handle) {
+            return Some(VfsObject(VfsObjectInner::Null(*access), None));
+        }
+        if let Some(stream) = self.htc_sensor_stream(handle) {
+            return Some(VfsObject(VfsObjectInner::HtcSensor(stream), None));
+        }
         if let Some(driver) = self.bluetooth_driver_handles.get(&handle) {
             return Some(VfsObject(
                 VfsObjectInner::BluetoothDriver(driver.clone()),
@@ -1873,6 +2076,12 @@ impl Vfs {
             return false;
         }
         match object.0 {
+            VfsObjectInner::Console(console) => {
+                self.console_handles.insert(handle, console);
+            }
+            VfsObjectInner::Null(access) => {
+                self.null_handles.insert(handle, access);
+            }
             VfsObjectInner::BluetoothDriver(driver) => {
                 self.bluetooth_driver_handles.insert(handle, driver);
             }
@@ -1900,6 +2109,9 @@ impl Vfs {
             VfsObjectInner::Decoder(decoder) => {
                 self.decoders.insert(handle, decoder);
             }
+            VfsObjectInner::HtcSensor(stream) => {
+                self.htc_sensor_handles.insert(handle, stream);
+            }
             VfsObjectInner::Registration => {
                 self.registration.insert(handle);
             }
@@ -1907,7 +2119,9 @@ impl Vfs {
         true
     }
     pub fn is_handle(&self, handle: u32) -> bool {
-        self.vibration_handles.contains_key(&handle)
+        self.console_handles.contains_key(&handle)
+            || self.null_handles.contains_key(&handle)
+            || self.vibration_handles.contains_key(&handle)
             || self.gps_handles.contains_key(&handle)
             || self.camera_handles.contains_key(&handle)
             || self.bluetooth_handles.contains_key(&handle)
@@ -1916,6 +2130,7 @@ impl Vfs {
             || self.volumes.contains_key(&handle)
             || self.decoders.contains_key(&handle)
             || self.registration.contains(&handle)
+            || self.is_htc_sensor(handle)
     }
     pub fn vibration_open(&self, handle: u32) -> Option<Arc<VibrationOpen>> {
         self.vibration_handles.get(&handle).cloned()
@@ -1939,6 +2154,8 @@ impl Vfs {
     pub fn open_handles(&self) -> Vec<u32> {
         self.handles
             .keys()
+            .chain(self.console_handles.keys())
+            .chain(self.null_handles.keys())
             .chain(self.vibration_handles.keys())
             .chain(self.gps_handles.keys())
             .chain(self.camera_handles.keys())
@@ -1948,6 +2165,7 @@ impl Vfs {
             .chain(self.volumes.keys())
             .chain(self.decoders.keys())
             .chain(self.registration.iter())
+            .chain(self.htc_sensor_handles.keys())
             .copied()
             .collect()
     }
@@ -1959,7 +2177,9 @@ impl Vfs {
     }
 
     pub fn close(&mut self, handle: u32) -> bool {
-        self.vibration_handles.remove(&handle).is_some()
+        self.console_handles.remove(&handle).is_some()
+            || self.null_handles.remove(&handle).is_some()
+            || self.vibration_handles.remove(&handle).is_some()
             || self.gps_handles.remove(&handle).is_some()
             || self.camera_handles.remove(&handle).is_some()
             || self.bluetooth_handles.remove(&handle).is_some()
@@ -1969,6 +2189,7 @@ impl Vfs {
             || self.volumes.remove(&handle).is_some()
             || self.decoders.remove(&handle).is_some()
             || self.registration.remove(&handle)
+            || self.htc_sensor_handles.remove(&handle).is_some()
     }
 
     /// Flush and close every open handle, returning how many were closed.
@@ -1985,11 +2206,14 @@ impl Vfs {
             }
         }
         let n = self.handles.len() + self.ram_handles.len();
+        self.console_handles.clear();
+        self.null_handles.clear();
         self.ram_handles.clear();
         self.handles.clear();
         self.volumes.clear();
         self.decoders.clear();
         self.registration.clear();
+        self.htc_sensor_handles.clear();
         self.bluetooth_handles.clear();
         self.bluetooth_driver_handles.clear();
         self.camera_handles.clear();
@@ -2045,6 +2269,21 @@ impl Vfs {
 
     pub fn is_open(&self, handle: u32) -> bool {
         self.ram_handles.contains_key(&handle) || self.handles.contains_key(&handle)
+    }
+
+    pub fn open_htc_sensor(&mut self, stream: AccelerometerStream) -> Option<u32> {
+        let handle = self.next_handle;
+        self.next_handle = handle.checked_add(1)?;
+        self.htc_sensor_handles.insert(handle, stream);
+        Some(handle)
+    }
+
+    pub fn is_htc_sensor(&self, handle: u32) -> bool {
+        self.htc_sensor_handles.contains_key(&handle)
+    }
+
+    pub fn htc_sensor_stream(&self, handle: u32) -> Option<AccelerometerStream> {
+        self.htc_sensor_handles.get(&handle).copied()
     }
 
     /// Whether `handle` came from opening the Gizmondo registration service.
@@ -2862,6 +3101,134 @@ mod tests {
     }
 
     #[test]
+    fn stdio_read_ahead_batches_bytes_and_shares_the_logical_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..40_000).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("stream.bin"), &data).unwrap();
+        let mut v = Vfs::new();
+        v.mount("\\Data\\", dir.path());
+        let h = v.open("\\Data\\stream.bin", Access::Read, false).unwrap();
+        let alias = 0xd2000000;
+        assert!(v.duplicate_file(h, alias));
+        let mut byte = [0];
+        for expected in &data[..1000] {
+            assert_eq!(v.read_stdio(h, &mut byte), Some(1));
+            assert_eq!(byte[0], *expected);
+            assert!(v.has_stdio_read_ahead(alias));
+        }
+        // One host read covers these 1000 CRT requests, without one seek or
+        // metadata query per byte to implement the buffer itself.
+        assert_eq!(
+            v.handles[&h]
+                .lock()
+                .unwrap()
+                .file
+                .stream_position()
+                .unwrap(),
+            16 * 1024
+        );
+        assert_eq!(v.position(alias), Some(1000));
+        assert!(v.has_stdio_read_ahead(alias));
+        assert!(v.close(h));
+        let mut tail = vec![0; data.len() - 1000];
+        assert_eq!(v.read_stdio(alias, &mut tail), Some(tail.len()));
+        assert_eq!(tail, data[1000..]);
+        assert!(!v.has_stdio_read_ahead(alias));
+        assert_eq!(v.read_stdio(alias, &mut byte), Some(0));
+        assert_eq!(v.seek(alias, -5, SeekKind::End), Some(39_995));
+        assert_eq!(v.read_stdio(alias, &mut byte), Some(1));
+        assert_eq!(byte[0], data[39_995]);
+        assert_eq!(v.seek(alias, -1, SeekKind::Current), Some(39_995));
+        assert_eq!(v.read_stdio(alias, &mut byte), Some(1));
+        assert_eq!(byte[0], data[39_995]);
+        assert_eq!(v.seek(alias, -50_000, SeekKind::Current), None);
+        assert_eq!(v.seek(alias, 0, SeekKind::Current), Some(39_996));
+    }
+
+    #[test]
+    fn stdio_read_ahead_synchronizes_raw_io_writes_flush_and_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stream.bin"), b"abcdefgh").unwrap();
+        let mut v = Vfs::new();
+        v.mount("\\Data\\", dir.path());
+        let h = v
+            .open("\\Data\\stream.bin", Access::ReadWrite, false)
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(v.read_stdio(h, &mut byte), Some(1));
+        assert_eq!(&byte, b"a");
+        assert!(v.has_stdio_read_ahead(h));
+        assert_eq!(v.read(h, &mut byte), Some(1));
+        assert_eq!(&byte, b"b");
+        assert!(!v.has_stdio_read_ahead(h));
+        assert_eq!(v.read_stdio(h, &mut byte), Some(1));
+        assert_eq!(&byte, b"c");
+        assert_eq!(v.write(h, b"XY"), Some(2));
+        assert_eq!(v.seek(h, 0, SeekKind::Current), Some(5));
+        assert_eq!(v.read_stdio(h, &mut byte), Some(1));
+        assert_eq!(&byte, b"f");
+        v.flush(h).unwrap();
+        assert!(!v.has_stdio_read_ahead(h));
+        assert_eq!(v.seek(h, 0, SeekKind::Current), Some(6));
+        assert_eq!(v.read_stdio(h, &mut byte), Some(1));
+        assert_eq!(&byte, b"g");
+        assert!(v.set_end_of_file(h));
+        assert_eq!(v.size(h), Some(7));
+        assert_eq!(
+            std::fs::read(dir.path().join("stream.bin")).unwrap(),
+            b"abcXYfg"
+        );
+        assert_eq!(v.read_stdio(h, &mut byte), Some(0));
+    }
+
+    #[test]
+    fn stdio_read_ahead_is_disabled_for_mapped_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stream.bin"), b"abcdef").unwrap();
+        let mut v = Vfs::new();
+        v.mount("\\Data\\", dir.path());
+        let h = v
+            .open_file("\\Data\\stream.bin", 3, 3, 3, false, 0)
+            .unwrap()
+            .handle;
+        let mut byte = [0];
+        assert_eq!(v.read_stdio(h, &mut byte), Some(1));
+        assert!(v.has_stdio_read_ahead(h));
+        let mapping = v.mapping_backing(h, 6, true).unwrap();
+        assert!(!v.has_stdio_read_ahead(h));
+        unsafe {
+            mapping.memory.write(1, b"Z").unwrap();
+        }
+        assert_eq!(v.read_stdio(h, &mut byte), Some(1));
+        assert_eq!(&byte, b"Z");
+        assert_eq!(v.seek(h, 0, SeekKind::Current), Some(2));
+        assert!(!v.has_stdio_read_ahead(h));
+    }
+
+    #[test]
+    fn stdio_explicit_seek_refreshes_input_after_another_handle_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stream.bin"), b"abcdef").unwrap();
+        let mut v = Vfs::new();
+        v.mount("\\Data\\", dir.path());
+        let h = v.open("\\Data\\stream.bin", Access::Read, false).unwrap();
+        let writer = v
+            .open("\\Data\\stream.bin", Access::ReadWrite, false)
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(v.read_stdio(h, &mut byte), Some(1));
+        assert_eq!(&byte, b"a");
+        assert_eq!(v.seek(writer, 1, SeekKind::Begin), Some(1));
+        assert_eq!(v.write(writer, b"Z"), Some(1));
+        assert_eq!(v.position(h), Some(1));
+        assert!(v.has_stdio_read_ahead(h));
+        assert_eq!(v.seek(h, 0, SeekKind::Current), Some(1));
+        assert!(!v.has_stdio_read_ahead(h));
+        assert_eq!(v.read_stdio(h, &mut byte), Some(1));
+        assert_eq!(&byte, b"Z");
+    }
+
+    #[test]
     fn vfs_duplicate_file_shares_position_and_survives_independent_close() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("stream.bin"), b"abcdef").unwrap();
@@ -3002,6 +3369,31 @@ mod tests {
         assert_eq!(
             std::fs::read(saves.path().join("progress.sav")).unwrap(),
             b"old save"
+        );
+    }
+
+    #[test]
+    fn existing_empty_directories_remain_present_in_a_merged_filesystem() {
+        let image = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(image.path().join("Empty")).unwrap();
+        std::fs::create_dir(image.path().join("Filtered")).unwrap();
+        std::fs::write(image.path().join("Filtered/note.txt"), b"original").unwrap();
+        std::fs::create_dir(data.path().join("My Documents")).unwrap();
+        let mut vfs = Vfs::new();
+        vfs.mount_read_only_filesystem("/", image.path());
+        vfs.mount_filesystem("/", data.path());
+        for path in [r"\Empty", r"\My Documents"] {
+            assert_eq!(vfs.list_dir(path), Some(Vec::new()));
+            assert_eq!(vfs.attributes(path).unwrap() & 0x10, 0x10);
+        }
+        assert_eq!(vfs.list_dir(r"\Missing"), None);
+        assert_eq!(vfs.list_dir(r"\Filtered\note.txt"), None);
+        vfs.delete(r"\Filtered\note.txt").unwrap();
+        assert_eq!(vfs.list_dir(r"\Filtered"), Some(Vec::new()));
+        assert_eq!(
+            std::fs::read(image.path().join("Filtered/note.txt")).unwrap(),
+            b"original"
         );
     }
 

@@ -66,12 +66,16 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "CoGetClassObject", co_get_class_object);
     d.register_handler(dll, "OleInitialize", s_ok);
     d.register_handler(dll, "OleUninitialize", void_returning);
+    d.register_handler(dll, "OleRun", crate::ole_run::run);
     d.register_handler(dll, "CoCreateInstance", co_create_instance);
     for &name in &WMP_METHODS {
         d.register_handler(dll, name, wmp_method);
     }
     d.register_handler(dll, WMP_CHILD_METHOD, wmp_child_method);
     crate::directshow::register(d);
+    crate::ole_bind::register(d);
+    crate::ole_stream::register(d);
+    crate::ole_automation::register(d);
     d.register_constant(dll, "CoGetMalloc", 0, zero_returning);
 }
 
@@ -115,6 +119,9 @@ fn alloc_child(ctx: &mut CallCtx<'_>) -> Result<u32, KernelError> {
 }
 
 fn co_create_instance(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let Some(outcome) = crate::native_com::resume(ctx)? {
+        return Ok(outcome);
+    }
     const CLSID_WMP: [u8; 16] = [
         0x52, 0x2a, 0xf5, 0x6b, 0x4a, 0x39, 0xd3, 0x11, 0xb1, 0x53, 0x00, 0xc0, 0x4f, 0x79, 0xfa,
         0xa6,
@@ -142,6 +149,9 @@ fn co_create_instance(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         return Ok(outcome);
     }
     if clsid_bytes != CLSID_WMP || iid_bytes != IID_WMP_PLAYER {
+        if let Some(outcome) = crate::native_com::activate(ctx, true)? {
+            return Ok(outcome);
+        }
         ctx.cpu.write_mem(out, &0u32.to_le_bytes())?;
         return Ok(DispatchOutcome::ReturnedR0(0x8000_4002));
     }
@@ -286,7 +296,7 @@ fn co_create_guid(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn guid_string(bytes: &[u8]) -> String {
+pub(crate) fn guid_string(bytes: &[u8]) -> String {
     let data1 = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let data2 = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
     let data3 = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
@@ -416,11 +426,17 @@ fn clsid_from_string(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 }
 
 fn co_get_class_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let Some(outcome) = crate::native_com::resume(ctx)? {
+        return Ok(outcome);
+    }
     let output = ctx.arg_u32(4)?;
     if output == 0 || ctx.cpu.check_guest_access(output, 4, Prot::WRITE).is_err() {
         return Ok(DispatchOutcome::ReturnedR0(0x8007_0057));
     }
     ctx.cpu.write_mem(output, &0u32.to_le_bytes())?;
+    if let Some(outcome) = crate::native_com::activate(ctx, false)? {
+        return Ok(outcome);
+    }
     // Private shell classes stay in native pceshell. Unavailable host COM
     // classes must fail; S_OK with a null factory crashes the caller.
     Ok(DispatchOutcome::ReturnedR0(0x8004_0111))

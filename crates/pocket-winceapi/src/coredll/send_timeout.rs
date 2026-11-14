@@ -1,7 +1,7 @@
 //! Explorer's taskbar asks another UI thread for WM_GETICON. Synchronous
 //! replies run on the recipient's pump, with a bounded cooperative wait.
 use super::*;
-use pocket_kernel::ce::{PendingSend, SendCallback};
+use pocket_kernel::ce::{PendingSend, SendCallback, SendOperation};
 use std::time::{Duration, Instant};
 
 const MAX_PENDING: usize = 256;
@@ -163,6 +163,7 @@ fn invoke(
     args: [u32; 4],
     pending: Option<u64>,
     output: u32,
+    operation: SendOperation,
 ) -> Result<DispatchOutcome, KernelError> {
     let saved = frame(ctx)?;
     let proc = ctx
@@ -178,6 +179,7 @@ fn invoke(
         pending,
         output,
         builtin: proc.is_none(),
+        operation,
     });
     for (reg, value) in [ArmReg::R0, ArmReg::R1, ArmReg::R2, ArmReg::R3]
         .into_iter()
@@ -186,7 +188,9 @@ fn invoke(
         ctx.cpu.write_reg(reg, value)?;
     }
     ctx.cpu.write_reg(ArmReg::Lr, ctx.thunk.thunk_va)?;
-    if let Some(proc) = proc {
+    if operation == SendOperation::DestroyWindow {
+        destroy_window(ctx)
+    } else if let Some(proc) = proc {
         Ok(DispatchOutcome::JumpTo(proc))
     } else {
         send_message_w(ctx)
@@ -198,7 +202,15 @@ fn invoke(
 pub(super) fn service(ctx: &mut CallCtx<'_>) -> Result<Option<DispatchOutcome>, KernelError> {
     if let Some(index) = callback_at(ctx, true)? {
         let callback = ctx.kernel.ce.send_messages.callbacks.remove(index);
-        if callback.builtin {
+        if callback.operation == SendOperation::DestroyWindow {
+            match destroy_window(ctx)? {
+                DispatchOutcome::ReturnedR0(value) => ctx.cpu.write_reg(ArmReg::R0, value)?,
+                other => {
+                    ctx.kernel.ce.send_messages.callbacks.push(callback);
+                    return Ok(Some(other));
+                }
+            }
+        } else if callback.builtin {
             if let Some(outcome) = resume_notify_builtin(ctx)? {
                 match outcome {
                     DispatchOutcome::ReturnedR0(value) => ctx.cpu.write_reg(ArmReg::R0, value)?,
@@ -223,16 +235,16 @@ pub(super) fn service(ctx: &mut CallCtx<'_>) -> Result<Option<DispatchOutcome>, 
         }) else {
             return Ok(None);
         };
-        let (id, args) = {
+        let (id, args, operation) = {
             let pending = &mut ctx.kernel.ce.send_messages.pending[index];
             pending.delivered = true;
-            (pending.id, pending.args)
+            (pending.id, pending.args, pending.operation)
         };
         if ctx.kernel.ce.send_messages.callbacks.len() >= MAX_CALLBACKS {
             reply(ctx.kernel, id, Err(1816));
             continue;
         }
-        let outcome = invoke(ctx, args, Some(id), 0)?;
+        let outcome = invoke(ctx, args, Some(id), 0, operation)?;
         let value = match outcome {
             DispatchOutcome::ReturnedR0(value) => value,
             DispatchOutcome::ReturnedR0R1(value, _) => value,
@@ -324,7 +336,7 @@ fn send(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         if ctx.kernel.ce.send_messages.callbacks.len() >= MAX_CALLBACKS {
             return fail(ctx, 1816);
         }
-        let outcome = invoke(ctx, args, None, result_pointer)?;
+        let outcome = invoke(ctx, args, None, result_pointer, SendOperation::Message)?;
         let value = match outcome {
             DispatchOutcome::ReturnedR0(value) => value,
             DispatchOutcome::ReturnedR0R1(value, _) => value,
@@ -353,12 +365,86 @@ fn send(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         output: result_pointer,
         recipient,
         args,
+        operation: SendOperation::Message,
         deadline,
         result: None,
         delivered: false,
     });
     wake_window_thread(ctx.kernel, recipient);
     Ok(wait_display_until(ctx, deadline)?.unwrap_or(DispatchOutcome::JumpTo(ctx.thunk.thunk_va)))
+}
+
+/// CE Messenger disposes its startup window from the primary thread. Its
+/// destruction procedure must run on the window thread, so PostQuitMessage
+/// ends that startup pump rather than the application's main UI pump.
+pub(super) fn destroy_on_owner(
+    ctx: &mut CallCtx<'_>,
+) -> Result<Option<DispatchOutcome>, KernelError> {
+    let key = (
+        ctx.kernel.current_thread,
+        ctx.thunk.thunk_va,
+        ctx.cpu.read_reg(ArmReg::Sp)?,
+    );
+    if ctx
+        .kernel
+        .window_destroy_frames
+        .iter()
+        .any(|frame| (frame.thread, frame.thunk, frame.frame.sp) == key)
+    {
+        return Ok(None);
+    }
+    prune(ctx.kernel);
+    if let Some(index) = ctx.kernel.ce.send_messages.pending.iter().position(|p| {
+        (p.sender, p.thunk, p.sp) == key && p.operation == SendOperation::DestroyWindow
+    }) {
+        let pending = &ctx.kernel.ce.send_messages.pending[index];
+        if let Some(result) = pending.result {
+            ctx.kernel.ce.send_messages.pending.remove(index);
+            ctx.kernel.wait_deadlines.remove(&key);
+            return Ok(Some(match result {
+                Ok(value) => DispatchOutcome::ReturnedR0(value),
+                Err(code) => fail(ctx, code)?,
+            }));
+        }
+        let deadline = pending.deadline;
+        return Ok(Some(
+            wait_display_until(ctx, deadline)?
+                .unwrap_or(DispatchOutcome::JumpTo(ctx.thunk.thunk_va)),
+        ));
+    }
+    let hwnd = ctx.arg_u32(0)?;
+    let recipient = window_thread(ctx.kernel, hwnd);
+    if recipient == key.0 || !live(ctx.kernel, hwnd) {
+        return Ok(None);
+    }
+    if !thread_live(ctx.kernel, recipient) {
+        return fail(ctx, 1400).map(Some);
+    }
+    if ctx.kernel.ce.send_messages.pending.len() >= MAX_PENDING {
+        return fail(ctx, 1816).map(Some);
+    }
+    let Some(id) = ctx.kernel.ce.send_messages.next_id.checked_add(1) else {
+        return fail(ctx, 1816).map(Some);
+    };
+    ctx.kernel.ce.send_messages.next_id = id;
+    let deadline = Instant::now() + Duration::from_millis(u64::from(u32::MAX));
+    ctx.kernel.ce.send_messages.pending.push(PendingSend {
+        id,
+        sender: key.0,
+        thunk: key.1,
+        sp: key.2,
+        output: 0,
+        recipient,
+        args: [hwnd, 0, 0, 0],
+        operation: SendOperation::DestroyWindow,
+        deadline,
+        result: None,
+        delivered: false,
+    });
+    wake_window_thread(ctx.kernel, recipient);
+    Ok(Some(
+        wait_display_until(ctx, deadline)?.unwrap_or(DispatchOutcome::JumpTo(ctx.thunk.thunk_va)),
+    ))
 }
 
 #[cfg(test)]
@@ -384,6 +470,69 @@ mod tests {
         kernel.threads.push(GuestThread::new(
             0x2100, 0, 0x9000, 0x1000, 0x2200, 0, 0xdead7c00, [0; 17],
         ));
+    }
+
+    #[test]
+    fn a_foreign_window_destruction_keeps_quit_on_the_window_thread() {
+        let mut cpu = super::super::tests::scanf_cpu();
+        let mut kernel = super::super::tests::fresh_kernel();
+        windows(&mut kernel);
+        kernel.window_classes.insert(0x111, "startup".into());
+        let sender = super::super::tests::dummy_thunk();
+        let mut receiver = sender.clone();
+        receiver.thunk_va += 32;
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut kernel,
+            thunk: &sender,
+        };
+        args(&mut ctx, &[0x111, 0, 0, 0]);
+        ctx.cpu.write_reg(ArmReg::Lr, 0x4455).unwrap();
+        assert_eq!(
+            destroy_window(&mut ctx).unwrap(),
+            DispatchOutcome::JumpTo(sender.thunk_va)
+        );
+        ctx.kernel.current_thread = 1;
+        ctx.thunk = &receiver;
+        args(&mut ctx, &[0x2000, 0, 0, 0]);
+        ctx.cpu.write_reg(ArmReg::Lr, 0x5566).unwrap();
+        assert_eq!(
+            service(&mut ctx).unwrap(),
+            Some(DispatchOutcome::JumpTo(0x2100))
+        );
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R1).unwrap(), WM_DESTROY);
+        ctx.cpu.write_reg(ArmReg::R0, 7).unwrap();
+        post_quit_message(&mut ctx).unwrap();
+        ctx.cpu.write_reg(ArmReg::R0, 0).unwrap();
+        assert_eq!(
+            service(&mut ctx).unwrap(),
+            Some(DispatchOutcome::JumpTo(0x2100))
+        );
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R1).unwrap(), 0x82);
+        ctx.cpu.write_reg(ArmReg::R0, 0).unwrap();
+        assert_eq!(service(&mut ctx).unwrap(), None);
+        assert!(!ctx.kernel.window_rects.contains_key(&0x111));
+        assert_eq!(
+            ctx.kernel.threads[0].messages.front(),
+            Some(&(WM_QUIT, 7, 0))
+        );
+        assert!(!ctx
+            .kernel
+            .posted_messages
+            .iter()
+            .any(|message| message.1 == WM_QUIT));
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R0).unwrap(), 0x2000);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::Lr).unwrap(), 0x5566);
+        ctx.kernel.current_thread = 0;
+        ctx.thunk = &sender;
+        args(&mut ctx, &[0x111, 0, 0, 0]);
+        ctx.cpu.write_reg(ArmReg::Lr, 0x4455).unwrap();
+        assert_eq!(
+            destroy_window(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert!(ctx.kernel.ce.send_messages.pending.is_empty());
+        assert!(ctx.kernel.ce.send_messages.callbacks.is_empty());
     }
 
     #[test]

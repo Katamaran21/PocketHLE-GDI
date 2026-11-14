@@ -149,6 +149,24 @@ pub(super) fn show_state(kernel: &mut KernelState, hwnd: u32, command: u32) -> b
         }
         _ => return false,
     }
+    let event = match command & 0xfff0 {
+        0xf020 if style & 0x20000000 == 0 => {
+            Some(pocket_kernel::system_sound::SystemEvent::Minimize)
+        }
+        0xf030 if style & 0x01000000 == 0 => {
+            Some(pocket_kernel::system_sound::SystemEvent::Maximize)
+        }
+        0xf120 if style & 0x20000000 != 0 => {
+            Some(pocket_kernel::system_sound::SystemEvent::Maximize)
+        }
+        0xf120 if style & 0x01000000 != 0 => {
+            Some(pocket_kernel::system_sound::SystemEvent::Minimize)
+        }
+        _ => None,
+    };
+    if let Some(event) = event {
+        system_sound::window_event(kernel, hwnd, event);
+    }
     true
 }
 

@@ -15,7 +15,9 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(4);
 #[derive(Default)]
 struct Keyboard {
     held: HashSet<Key>,
+    forwarded: HashSet<u16>,
     events: Vec<InputEvent>,
+    text_input: bool,
 }
 
 impl Keyboard {
@@ -30,17 +32,25 @@ impl Keyboard {
             self.held.remove(&key);
         }
         let is_down = self.held.iter().any(|k| virtual_key(*k) == Some(vk));
+        let control = self.held.contains(&Key::LeftCtrl) || self.held.contains(&Key::RightCtrl);
+        let committed_text = self.text_input
+            && !control
+            && (vk == 0x20
+                || (0x30..=0x5a).contains(&vk)
+                || (0x60..=0x6f).contains(&vk)
+                || (0xba..=0xde).contains(&vk));
         if was_down != is_down {
-            self.events.push(if is_down {
-                InputEvent::KeyDown { vk }
-            } else {
-                InputEvent::KeyUp { vk }
-            });
+            if is_down && !committed_text {
+                self.forwarded.insert(vk);
+                self.events.push(InputEvent::KeyDown { vk });
+            } else if !is_down && self.forwarded.remove(&vk) {
+                self.events.push(InputEvent::KeyUp { vk });
+            }
         }
     }
 
     fn release(&mut self) {
-        let mut keys: Vec<_> = self.held.iter().filter_map(|k| virtual_key(*k)).collect();
+        let mut keys: Vec<_> = self.forwarded.drain().collect();
         keys.sort_unstable();
         keys.dedup();
         self.held.clear();
@@ -52,9 +62,12 @@ impl Keyboard {
 struct KeyboardCallback(Rc<RefCell<Keyboard>>);
 impl InputCallback for KeyboardCallback {
     fn add_char(&mut self, character: u32) {
-        // TranslateMessage supplies the ordinary Latin/digit/control WM_CHARs.
-        // Preserve committed Unicode without producing duplicate characters.
-        if let Some(character) = char::from_u32(character).filter(|c| !c.is_ascii()) {
+        // Committed text supplies printable characters in native text mode.
+        // Enter/Backspace/Ctrl+C already have key edges; do not duplicate them.
+        let text_input = self.0.borrow().text_input;
+        if let Some(character) =
+            char::from_u32(character).filter(|c| !c.is_control() && (text_input || !c.is_ascii()))
+        {
             self.0
                 .borrow_mut()
                 .events
@@ -80,6 +93,9 @@ pub struct DisplayHook {
 }
 
 impl DisplayHook {
+    pub fn set_text_input(&mut self, enabled: bool) {
+        self.keyboard.borrow_mut().text_input = enabled;
+    }
     pub fn new(width: u32, height: u32) -> Result<Self> {
         let (w, h) = (width as usize, height as usize);
         let mut window = Window::new(
@@ -176,6 +192,7 @@ impl DisplayHook {
 
 impl FrameHook for DisplayHook {
     fn on_frame(&mut self, state: &mut KernelState) -> FrameAction {
+        self.set_text_input(state.accepts_text_input());
         let counter = state.framebuffer.frame_counter;
         if counter != self.last_frame
             && self
@@ -358,5 +375,37 @@ mod tests {
                 InputEvent::KeyUp { vk: 0x10 }
             ]
         );
+    }
+    #[test]
+    fn native_console_text_avoids_duplicate_controls_and_releases_ctrl_keys_in_order() {
+        let keyboard = Rc::new(RefCell::new(Keyboard {
+            text_input: true,
+            ..Keyboard::default()
+        }));
+        let mut callback = KeyboardCallback(keyboard.clone());
+        callback.set_key_state(Key::A, true);
+        callback.add_char('a' as u32);
+        callback.set_key_state(Key::A, false);
+        callback.set_key_state(Key::Enter, true);
+        callback.add_char(13);
+        callback.set_key_state(Key::Enter, false);
+        callback.set_key_state(Key::LeftCtrl, true);
+        callback.set_key_state(Key::C, true);
+        callback.add_char(3);
+        callback.set_key_state(Key::LeftCtrl, false);
+        callback.set_key_state(Key::C, false);
+        assert_eq!(
+            keyboard.borrow().events,
+            [
+                InputEvent::Text { character: 'a' },
+                InputEvent::KeyDown { vk: 13 },
+                InputEvent::KeyUp { vk: 13 },
+                InputEvent::KeyDown { vk: 0x11 },
+                InputEvent::KeyDown { vk: 0x43 },
+                InputEvent::KeyUp { vk: 0x11 },
+                InputEvent::KeyUp { vk: 0x43 },
+            ]
+        );
+        assert!(keyboard.borrow().forwarded.is_empty());
     }
 }

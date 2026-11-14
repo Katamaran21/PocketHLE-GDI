@@ -27,6 +27,7 @@
 //! exits, which lets the polling loop on the UI thread notice the
 //! session ended and stop calling back in).
 
+use pocket_core::child_jobs::{self, ChildJob};
 use pocket_core::kernel::{
     handles::HandleTable, memory_division::MemoryDivision, ProcessHandleContext,
 };
@@ -323,20 +324,34 @@ fn run_game_to_completion(
         && entry.settings.storage_card_dir.is_some()
         && !card_root.is_dir()
     {
-        return format!("SD Card folder does not exist: {}", card_root.display());
+        let reason = format!("SD Card folder does not exist: {}", card_root.display());
+        let diagnostic =
+            pocket_library::session_diagnostic::startup_failure(reason.clone(), Vec::new());
+        return serde_json::json!({"summary": reason, "diagnostic": diagnostic}).to_string();
     }
     let mut hook = SessionHook::new(Arc::clone(state), input_rx);
-    run_process(
-        library_root,
-        entry,
-        &card_root,
-        None,
-        None,
-        None,
-        None,
-        &mut hook,
-    )
-    .0
+    let ((summary, code), log) = pocket_library::session_diagnostic::capture(|| {
+        run_process(
+            library_root,
+            entry,
+            &card_root,
+            None,
+            None,
+            None,
+            None,
+            &mut hook,
+        )
+    });
+    let diagnostic = pocket_library::session_diagnostic::classify(
+        false,
+        hook.started,
+        code,
+        hook.startup_exit,
+        hook.runtime_error.as_deref(),
+        &summary,
+        log,
+    );
+    serde_json::json!({"summary": summary, "diagnostic": diagnostic}).to_string()
 }
 
 #[derive(Clone)]
@@ -384,10 +399,6 @@ impl Drop for ProcessStartup {
             let _ = ack.send(Err(self.error));
         }
     }
-}
-struct ChildJob {
-    table: HandleTable,
-    thread: JoinHandle<(String, u32)>,
 }
 
 fn run_process(
@@ -449,11 +460,7 @@ fn run_process_inner(
         .unwrap_or(pocket_core::pe::machine::ARM);
     summary_lines.push(format!("Executable: {}", exe.display()));
 
-    // Managed .NET Compact Framework images cannot run on the native
-    // emulation path: there is no CLR to interpret the IL, so the
-    // emulator would sit on a black frame forever. The desktop CLI
-    // (pocket-cli) runs these through a host .NET runtime instead —
-    // tell the user instead of leaving them on a black screen.
+    // Route IL applications through the managed runtime before selecting a native CPU.
     if let Ok(image) = &image {
         if let Some(runtime) = &image.managed_runtime {
             let screen = entry.settings.screen.resolve_image(Some(image));
@@ -470,9 +477,10 @@ fn run_process_inner(
                     0,
                 );
             }
-            summary_lines.push(format!(
-                "Managed image: CLR metadata {runtime} (.NET Compact Framework). Android has no general CLR backend for this title."
-            ));
+            if guest_path.is_none() {
+                return run_compact_framework(&exe, entry, library_root, hook, screen);
+            }
+            summary_lines.push(format!("Unsupported managed child process ({runtime})."));
             return (summary_lines.join("\n"), 0xc0000135);
         }
     }
@@ -551,6 +559,9 @@ fn run_process_inner(
     }
     emu.set_gizmondo_audio_compatibility(is_gizmondo);
     if let Some(process) = emu.process_mut() {
+        if !is_gizmondo {
+            process.state.virtual_tilt_axes = entry.settings.effective_tilt_axes(&launcher_config);
+        }
         process.state.touch_steering.enabled = !is_gizmondo
             && (entry.settings.controls_mode() == pocket_library::stylus_grid::ControlsMode::Zones);
     }
@@ -644,24 +655,29 @@ fn run_process_inner(
             let _ = emu.set_pocketpc_processor("pxa270");
         }
     }
-    emu.set_gpu_renderer(
-        entry
-            .settings
-            .gpu_renderer
-            .unwrap_or(launcher_config.gpu_renderer),
-    );
+    let profile = entry.settings.gpu_compatibility_profile;
+    let programmable = !is_gizmondo
+        && (profile.programmable_gles()
+            || image
+                .as_ref()
+                .is_ok_and(pocket_library::uses_programmable_gles));
+    emu.set_gpu_renderer(launcher_config.gpu_renderer);
     emu.set_gizmondo_goforce_driver(is_gizmondo);
-    emu.set_nv_combiner_allowed(is_gizmondo || launcher_config.pocketpc_nv_combiners);
-    emu.set_intel2700g_depth_bias(!is_gizmondo && launcher_config.pocketpc_intel2700g_depth_bias);
+    emu.set_programmable_gles(programmable);
+    emu.set_goforce_5500_profile(!is_gizmondo && profile.nvidia_combiners());
+    emu.set_nv_combiner_allowed(is_gizmondo || profile.nvidia_combiners());
+    emu.set_intel2700g_depth_bias(!is_gizmondo && profile.intel_depth_bias());
     emu.set_gles_internal_resolution(launcher_config.gles_internal_resolution);
-    emu.set_unimplemented_api_sink(Box::new(crate::unimplemented_log::UnimplementedLog::new(
-        library_root.join("pockethle-unimplemented.log"),
-        entry.display_name.clone(),
-        exe.display().to_string(),
-        Arc::new(std::sync::atomic::AtomicBool::new(
-            launcher_config.log_unimplemented_apis,
-        )),
-    )));
+    emu.set_unimplemented_api_sink(Box::new(
+        pocket_core::winceapi::unimplemented_log::UnimplementedLog::new(
+            library_root.join("pockethle-unimplemented.log"),
+            entry.display_name.clone(),
+            exe.display().to_string(),
+            Arc::new(std::sync::atomic::AtomicBool::new(
+                launcher_config.log_unimplemented_apis,
+            )),
+        ),
+    ));
     log::set_max_level(match launcher_config.verbosity {
         0 => log::LevelFilter::Warn,
         1 => log::LevelFilter::Info,
@@ -672,10 +688,7 @@ fn run_process_inner(
         log::info!(
             "GPU_DIAG session_start game={} requested_gpu={} internal_policy={} filter={} measure_ips={}",
             entry.id,
-            entry
-                .settings
-                .gpu_renderer
-                .unwrap_or(launcher_config.gpu_renderer),
+            programmable || launcher_config.gpu_renderer,
             launcher_config.gles_internal_resolution,
             launcher_config.upscale_filter,
             launcher_config.show_ips
@@ -869,19 +882,22 @@ fn run_process_inner(
             if let Some(process) = emu.process_mut() {
                 process.state.cedb.path = Some(save_dir.join("cedb-contacts.json"));
             }
-            if !is_gizmondo
-                && !paths
-                    .save_prefix
-                    .trim_end_matches('\\')
-                    .eq_ignore_ascii_case(r"\My Documents")
-            {
-                emu.mount_isolated_save_dir(r"\My Documents\", save_dir.join("my-documents"));
-            }
             summary_lines.push(format!(
                 "Save data: {} -> {:?}",
                 save_dir.display(),
                 paths.save_prefix
             ));
+        }
+        if !is_gizmondo {
+            for (prefix, directory) in entry.application_data_mounts(library_root) {
+                emu.mount_isolated_save_dir(&prefix, directory);
+            }
+        }
+        if entry.my_documents_uses_separate_directory(library_root) {
+            emu.mount_isolated_save_dir(
+                r"\My Documents",
+                entry.save_dir(library_root).join("my-documents"),
+            );
         }
         if !is_gizmondo && entry.source_cab.to_ascii_lowercase().ends_with(".cab") {
             if let Some(install_dir) = entry.install_dir.as_deref() {
@@ -1015,7 +1031,14 @@ fn run_process_inner(
             emu.process_mut().unwrap().state.should_stop = true;
         }
     }
+    hook.started = true;
+    let started_at = std::time::Instant::now();
     let run_result = emu.run_with_hook(hook);
+    hook.startup_exit =
+        started_at.elapsed() < pocket_library::session_diagnostic::STARTUP_DIAGNOSTIC_WINDOW;
+    if let Err(error) = &run_result {
+        hook.runtime_error = Some(format!("{error:#}"));
+    }
     match &run_result {
         Ok(()) => summary_lines.push("Emulator exited cleanly.".to_string()),
         Err(e) => summary_lines.push(format!("Emulator stopped: {e:#}")),
@@ -1081,6 +1104,68 @@ fn build_unicorn_for_machine(_machine: u16) -> anyhow::Result<Emulator> {
     ))
 }
 
+fn run_compact_framework(
+    exe: &std::path::Path,
+    entry: &GameEntry,
+    library_root: &std::path::Path,
+    hook: &mut SessionHook,
+    size: (u32, u32),
+) -> (String, u32) {
+    let config = pocket_library::Library::open(library_root)
+        .map(|library| library.config().clone())
+        .unwrap_or_default();
+    let tilt = entry.settings.effective_tilt_axes(&config);
+    let rx = hook.take_input_receiver();
+    let stop_all = Arc::clone(&hook.stop_all);
+    let state = Arc::clone(&hook.state);
+    let mut presented = false;
+    let result = pocket_netcf::host::run(
+        exe,
+        pocket_netcf::host::Options {
+            size,
+            save_root: Some(entry.save_dir(library_root)),
+            guest_path: entry
+                .guest_launch_paths(library_root)
+                .map(|paths| paths.module_path),
+            tilt,
+            gpu_renderer: config.gpu_renderer,
+            gles_internal_resolution: config.gles_internal_resolution,
+            frame_rate_limit: entry.settings.effective_frame_rate_limit(&config),
+        },
+        |events| {
+            if stop_all.load(Ordering::Acquire) {
+                return false;
+            }
+            loop {
+                match rx.try_recv() {
+                    Ok(InputCommand::Input(event)) => events.push(event),
+                    Ok(InputCommand::Stop) | Err(TryRecvError::Disconnected) => return false,
+                    Ok(InputCommand::SystemMedia(_)) => {}
+                    Err(TryRecvError::Empty) => return true,
+                }
+            }
+        },
+        |frame| {
+            push_frame(&state, FrameSnapshot::from_framebuffer(frame));
+            presented = true;
+        },
+        |audio| {
+            if let Ok(mut slot) = state.audio.lock() {
+                *slot = Some(audio.tap());
+            }
+        },
+    );
+    if let Ok(mut slot) = state.audio.lock() {
+        *slot = None;
+    }
+    hook.started = presented;
+    hook.runtime_error = result.as_ref().err().cloned();
+    match result {
+        Ok(()) => ("Compact Framework session ended.".into(), 0),
+        Err(error) => (error, 0xc0000135),
+    }
+}
+
 pub(crate) fn push_frame(state: &Arc<SessionState>, frame: FrameSnapshot) {
     if let Ok(mut stats) = state.presentation_stats.lock() {
         *stats = Some(frame.presentation_stats.clone());
@@ -1135,7 +1220,7 @@ struct SessionHook {
     foreground: Arc<AtomicU32>,
     pid: u32,
     parent_pid: u32,
-    children: Vec<ChildJob>,
+    children: Vec<ChildJob<(String, u32)>>,
     launch_context: Option<LaunchContext>,
     last_frame: u64,
     input_disconnected: bool,
@@ -1143,17 +1228,21 @@ struct SessionHook {
     last_shared: Option<bool>,
     scratch: Vec<u8>,
     saw_non_black: bool,
+    started: bool,
+    startup_exit: bool,
+    runtime_error: Option<String>,
 }
 
 impl SessionHook {
     fn activate_process(&self, pid: u32) {
         if let Some(view) = &self.ce_desktop {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .desktop
-                .activate(pid);
+            let mut view = view.lock().unwrap_or_else(|e| e.into_inner());
+            view.desktop.activate(pid);
+            self.foreground
+                .store(view.desktop.focused_process(), Ordering::Release);
+        } else {
+            self.foreground.store(pid, Ordering::Release);
         }
-        self.foreground.store(pid, Ordering::Release);
     }
     fn retire_desktop_process(&mut self, pid: u32, next: u32) {
         let Some(view) = self.ce_desktop.as_ref() else {
@@ -1208,6 +1297,12 @@ impl SessionHook {
                         self.send_desktop_frame(Err(error));
                         return;
                     }
+                    let owner = shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .desktop
+                        .focused_process();
+                    self.foreground.store(owner, Ordering::Release);
                     self.last_frame = counter;
                     self.last_emit_at = Some(now);
                     if let Some(p) = &self.state.presentation {
@@ -1450,17 +1545,9 @@ impl SessionHook {
     }
 
     fn finish_children(&mut self) {
-        for job in self.children.drain(..) {
-            if !job.table.start_allowed() {
-                job.table
-                    .terminate_remote_process(job.table.process_id(), 0xc0000001);
-                job.table.allow_start();
-            }
-            if let Err(_) = job.thread.join() {
-                self.stop_all.store(true, Ordering::Release);
-            }
-        }
+        child_jobs::finish(&mut self.children, &self.stop_all);
     }
+
     fn reap_children(&mut self) {
         let mut index = 0;
         while index < self.children.len() {
@@ -1528,6 +1615,9 @@ impl SessionHook {
             last_shared: None,
             scratch: Vec::new(),
             saw_non_black: false,
+            started: false,
+            startup_exit: false,
+            runtime_error: None,
         }
     }
 }
@@ -1674,6 +1764,7 @@ impl FrameHook for SessionHook {
                         Ok(frame) => frame.is_all_black(),
                         Err(error) => {
                             log::error!("framebuffer read failed: {error}");
+                            self.runtime_error = Some(format!("framebuffer read failed: {error}"));
                             kernel.should_stop = true;
                             return FrameAction::Stop;
                         }
@@ -1690,6 +1781,7 @@ impl FrameHook for SessionHook {
                             FrameAction::Continue
                         };
                     }
+
                     self.saw_non_black = !black;
 
                     self.last_frame = counter;
@@ -1701,6 +1793,7 @@ impl FrameHook for SessionHook {
                         Ok(frame) => frame,
                         Err(error) => {
                             log::error!("presentation read failed: {error}");
+                            self.runtime_error = Some(format!("presentation read failed: {error}"));
                             kernel.should_stop = true;
                             return FrameAction::Stop;
                         }
@@ -1851,10 +1944,12 @@ mod child_card_tests {
                 &Arc::new(SessionState::new()),
                 rx,
             );
-            assert!(
-                summary.starts_with("SD Card folder does not exist:"),
-                "{summary}"
-            );
+            let body: serde_json::Value = serde_json::from_str(&summary).unwrap();
+            assert!(body["summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("SD Card folder does not exist:"));
+            assert_eq!(body["diagnostic"]["title"], "Could not start the game");
         });
     }
 }
@@ -1994,6 +2089,7 @@ mod deferred_read_tests {
             source_path: "hook-test".into(),
             machine: pocket_core::pe::machine::ARM,
             subsystem: pocket_core::pe::subsystem::WINDOWS_CE_GUI,
+            subsystem_version: (4, 0),
             image_base: 0x10000,
             stack_reserve: 0x10000,
             size_of_image: 0x2000,
@@ -2084,3 +2180,7 @@ mod deferred_read_tests {
         assert!(state.latest_frame.lock().unwrap().as_ref().unwrap().rgb565);
     }
 }
+
+#[cfg(test)]
+#[path = "netcf_session_test.rs"]
+mod netcf_session_test;

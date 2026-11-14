@@ -433,7 +433,7 @@ impl Registry {
         // Despite its name, CE's Mute value enables sound categories. Bit 1
         // enables application audio. Interstellar Flames checks it both at
         // startup and on resume, disabling music/SFX when the value is absent.
-        reg.set_value(r"HKCU\ControlPanel\Volume", "Mute", RegistryValue::Dword(2));
+        reg.set_value(r"HKCU\ControlPanel\Volume", "Mute", RegistryValue::Dword(7));
         // Gizmondo OEMINC.H: range 1..31. Neutral is Colors slider position 2,
         // OnLevel 11 / DimLevel 0 (SDK hardware default is 24). Colors reads
         // OnLevel to initialise its own brightness slider, then writes both
@@ -940,18 +940,19 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn application_audio_default_is_queryable() {
+    fn device_audio_default_is_queryable() {
         let mut registry = Registry::with_device_defaults();
         let handle = registry.open(r"HKCU\ControlPanel\Volume").unwrap();
         let key = registry.path_for(handle).unwrap();
         let value = registry.value(&key, "MUTE").unwrap();
         assert_eq!(value.type_code(), 4);
-        assert_eq!(value.to_bytes(), 2u32.to_le_bytes());
+        // Explorer's CE defaults enable notifications, applications and events.
+        assert_eq!(value.to_bytes(), 7u32.to_le_bytes());
         registry.close(handle);
     }
 
     #[test]
-    fn application_audio_persistence_fills_missing_value_and_preserves_choices() {
+    fn device_audio_persistence_fills_missing_value_and_preserves_choices() {
         let key = r"HKCU\ControlPanel\Volume";
         // No volume key, an empty key, a key with another setting, and saved
         // sound-category masks including an explicit mute must all survive.
@@ -961,6 +962,7 @@ mod tests {
             (true, Some(0)),
             (true, Some(1)),
             (true, Some(2)),
+            (true, Some(4)),
             (true, Some(7)),
         ] {
             for other_setting in [false, true] {
@@ -982,7 +984,7 @@ mod tests {
                 loaded.configure_persistence(&path).unwrap();
                 assert_eq!(
                     loaded.value(key, "Mute"),
-                    Some(RegistryValue::Dword(saved.unwrap_or(2)))
+                    Some(RegistryValue::Dword(saved.unwrap_or(7)))
                 );
                 assert_eq!(
                     loaded.value(key, "Volume"),
@@ -1465,5 +1467,69 @@ mod tests {
         let mut next = Registry::with_device_defaults();
         next.configure_persistence(&path).unwrap();
         assert_eq!(next.value(key, "Owner"), Some(baseline));
+    }
+}
+
+/// Windows Mobile registry subscriptions with a named message queue destination.
+#[derive(Default)]
+pub struct QueueNotifications {
+    next: u32,
+    entries: HashMap<u32, QueueSubscription>,
+}
+
+pub struct QueueSubscription {
+    pub path: String,
+    pub value: String,
+    pub queue: String,
+    pub user_data: u32,
+    pub previous: Option<RegistryValue>,
+}
+
+impl QueueNotifications {
+    pub fn register(&mut self, subscription: QueueSubscription) -> Option<u32> {
+        if self.entries.len() >= 1024 || self.next >= 0x000f_ffff {
+            return None;
+        }
+        self.next += 1;
+        let handle = 0xda80_0000 + self.next;
+        self.entries.insert(handle, subscription);
+        Some(handle)
+    }
+
+    pub fn close(&mut self, handle: u32) -> bool {
+        self.entries.remove(&handle).is_some()
+    }
+
+    pub fn deliver(&mut self, registry: &Registry, queues: &mut HashMap<u32, crate::MsgQueue>) {
+        for (&handle, subscription) in &mut self.entries {
+            let value = registry.value(&subscription.path, &subscription.value);
+            if value == subscription.previous {
+                continue;
+            }
+            let Some(queue) = queues.values_mut().find(|queue| {
+                queue.read_access
+                    && queue
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name == subscription.queue)
+            }) else {
+                continue;
+            };
+            let bytes = value
+                .as_ref()
+                .map_or_else(Vec::new, RegistryValue::to_bytes);
+            if queue.messages.len() >= queue.max_messages as usize
+                || 12 + bytes.len() > queue.max_message_size as usize
+            {
+                continue;
+            }
+            let mut message = Vec::with_capacity(12 + bytes.len());
+            message.extend_from_slice(&handle.to_le_bytes());
+            message.extend_from_slice(&subscription.user_data.to_le_bytes());
+            message.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            message.extend_from_slice(&bytes);
+            queue.messages.push_back(message);
+            subscription.previous = value;
+        }
     }
 }

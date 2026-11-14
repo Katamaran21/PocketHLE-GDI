@@ -494,8 +494,12 @@ fn serve_inline_arithmetic64(
     address: u32,
     operation: crate::arithmetic64::Arithmetic64,
 ) -> Result<(), ::unicorn_engine::uc_error> {
-    let n = uc.reg_read(RegisterARM::R0)? as u32 as u64
-        | ((uc.reg_read(RegisterARM::R1)? as u32 as u64) << 32);
+    let low = uc.reg_read(RegisterARM::R0)? as u32 as u64;
+    if operation == crate::arithmetic64::Arithmetic64::SingleSquareRoot {
+        uc.reg_write(RegisterARM::R0, operation.evaluate(low, 0))?;
+        return uc.reg_write(RegisterARM::PC, u64::from(address.wrapping_add(4)));
+    }
+    let n = low | ((uc.reg_read(RegisterARM::R1)? as u32 as u64) << 32);
     let d = if operation.unary() {
         0
     } else {
@@ -1890,7 +1894,52 @@ mod tests {
         assert_eq!(cpu.read_reg(ArmReg::R0).unwrap(), 20);
     }
     #[test]
-    fn inline_conversion_callbacks_preserve_guest_rounding_and_exception_state() {
+    fn inline_single_square_root_preserves_the_guest_registers_and_fpscr() {
+        use crate::arithmetic64::Arithmetic64;
+        let mut cpu = UnicornCpu::new_for_arch(Arch::Arm).unwrap();
+        cpu.map_region(0x1000, 0x1000, Prot::ALL).unwrap();
+        cpu.write_mem(0x1200, &[0x1e, 0xff, 0x2f, 0xe1, 0x1e, 0xff, 0x2f, 0xe1])
+            .unwrap();
+        cpu.add_code_hook(0x1100).unwrap();
+        assert!(cpu
+            .install_inline_arithmetic64(0x1200, Arithmetic64::SingleSquareRoot)
+            .unwrap());
+        for input in [
+            0,
+            0x8000_0000,
+            1,
+            0x4080_0000,
+            0x7f80_0000,
+            0xbf80_0000,
+            0x7f80_0001,
+        ] {
+            for thumb in [false, true] {
+                cpu.write_reg(ArmReg::R0, input).unwrap();
+                cpu.write_reg(ArmReg::R1, 0x8765_4321).unwrap();
+                cpu.write_reg(ArmReg::Lr, 0x1100 | u32::from(thumb))
+                    .unwrap();
+                let fpscr = 0x03c0_001f;
+                cpu.write_fpscr(fpscr).unwrap();
+                assert_eq!(
+                    cpu.run_until_hook(0x1200, 0).unwrap(),
+                    StopReason::Hook(0x1100)
+                );
+                let actual = f32::from_bits(cpu.read_reg(ArmReg::R0).unwrap());
+                let expected = f32::from_bits(input).sqrt();
+                if expected.is_nan() {
+                    assert!(actual.is_nan());
+                } else {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+                assert_eq!(cpu.read_reg(ArmReg::R1).unwrap(), 0x8765_4321);
+                assert_eq!(cpu.read_fpscr().unwrap(), fpscr);
+                assert_eq!(cpu.read_reg(ArmReg::Cpsr).unwrap() & 0x20 != 0, thumb);
+            }
+        }
+    }
+
+    #[test]
+    fn inline_numeric_callbacks_preserve_guest_rounding_and_exception_state() {
         use crate::arithmetic64::Arithmetic64;
         let mut cpu = UnicornCpu::new_for_arch(Arch::Arm).unwrap();
         cpu.map_region(0x1000, 0x1000, Prot::ALL).unwrap();
@@ -1908,8 +1957,17 @@ mod tests {
             f64::NEG_INFINITY.to_bits(),
             (-1.5f64).to_bits(),
             1.5f64.to_bits(),
+            (-0.0f64).to_bits(),
+            f64::MIN_POSITIVE.to_bits(),
+            4.0f64.to_bits(),
+            f64::MAX.to_bits(),
+            std::f64::consts::FRAC_PI_2.to_bits(),
+            0x7ff0_0000_0000_0001, // signalling NaN
         ];
         for operation in [
+            Arithmetic64::DoubleSquareRoot,
+            Arithmetic64::DoubleSine,
+            Arithmetic64::DoubleCosine,
             Arithmetic64::SignedToDouble,
             Arithmetic64::UnsignedToDouble,
             Arithmetic64::DoubleToSigned,
@@ -1918,23 +1976,42 @@ mod tests {
             cpu.install_inline_arithmetic64(0x1200, operation).unwrap();
             for rounding in [0, 0x00400000, 0x00800000, 0x00c00000] {
                 for value in values {
-                    cpu.write_reg(ArmReg::R0, value as u32).unwrap();
-                    cpu.write_reg(ArmReg::R1, (value >> 32) as u32).unwrap();
-                    cpu.write_reg(ArmReg::R2, 0x12345678).unwrap();
-                    cpu.write_reg(ArmReg::R3, 0xabcdef01).unwrap();
-                    cpu.write_reg(ArmReg::Lr, 0x1100).unwrap();
-                    let fpscr = 0x0200001f | rounding;
-                    cpu.write_fpscr(fpscr).unwrap();
-                    assert_eq!(
-                        cpu.run_until_hook(0x1200, 0).unwrap(),
-                        StopReason::Hook(0x1100)
-                    );
-                    let actual = u64::from(cpu.read_reg(ArmReg::R0).unwrap())
-                        | (u64::from(cpu.read_reg(ArmReg::R1).unwrap()) << 32);
-                    assert_eq!(actual, operation.evaluate(value, 0));
-                    assert_eq!(cpu.read_fpscr().unwrap(), fpscr);
-                    assert_eq!(cpu.read_reg(ArmReg::R2).unwrap(), 0x12345678);
-                    assert_eq!(cpu.read_reg(ArmReg::R3).unwrap(), 0xabcdef01);
+                    for thumb in [false, true] {
+                        cpu.write_reg(ArmReg::R0, value as u32).unwrap();
+                        cpu.write_reg(ArmReg::R1, (value >> 32) as u32).unwrap();
+                        cpu.write_reg(ArmReg::R2, 0x12345678).unwrap();
+                        cpu.write_reg(ArmReg::R3, 0xabcdef01).unwrap();
+                        cpu.write_reg(ArmReg::Lr, 0x1100 | u32::from(thumb))
+                            .unwrap();
+                        let fpscr = 0x0200001f | rounding;
+                        cpu.write_fpscr(fpscr).unwrap();
+                        assert_eq!(
+                            cpu.run_until_hook(0x1200, 0).unwrap(),
+                            StopReason::Hook(0x1100)
+                        );
+                        let actual = u64::from(cpu.read_reg(ArmReg::R0).unwrap())
+                            | (u64::from(cpu.read_reg(ArmReg::R1).unwrap()) << 32);
+                        let arg = f64::from_bits(value);
+                        let expected = match operation {
+                            Arithmetic64::DoubleSquareRoot => Some(arg.sqrt()),
+                            Arithmetic64::DoubleSine => Some(arg.sin()),
+                            Arithmetic64::DoubleCosine => Some(arg.cos()),
+                            _ => None,
+                        };
+                        if let Some(expected) = expected {
+                            if expected.is_nan() {
+                                assert!(f64::from_bits(actual).is_nan());
+                            } else {
+                                assert_eq!(actual, expected.to_bits());
+                            }
+                        } else {
+                            assert_eq!(actual, operation.evaluate(value, 0));
+                        }
+                        assert_eq!(cpu.read_fpscr().unwrap(), fpscr);
+                        assert_eq!(cpu.read_reg(ArmReg::R2).unwrap(), 0x12345678);
+                        assert_eq!(cpu.read_reg(ArmReg::R3).unwrap(), 0xabcdef01);
+                        assert_eq!(cpu.read_reg(ArmReg::Cpsr).unwrap() & 0x20 != 0, thumb);
+                    }
                 }
             }
         }

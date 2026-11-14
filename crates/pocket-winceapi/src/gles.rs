@@ -4,6 +4,7 @@
 //! in [`register`] by iterating the ordinal tables, mirroring what
 //! [`super::WinCeDispatcher::new`] does for `coredll.dll`.
 
+mod color_capture;
 mod egl_config;
 mod egl_context;
 mod es11;
@@ -162,6 +163,7 @@ struct EglImage {
 }
 struct EglSurfaces {
     initialized: bool,
+    goforce_5500: bool,
     rgba8888_only: bool,
     config_locked: bool,
     contexts: HashMap<u32, EglContext>,
@@ -202,6 +204,7 @@ impl EglSurfaces {
         );
         Self {
             initialized: false,
+            goforce_5500: false,
             rgba8888_only: false,
             config_locked: false,
             contexts: HashMap::new(),
@@ -347,6 +350,11 @@ pub fn uses_nv_combiner(image: &pocket_pe::LoadedImage) -> bool {
     })
 }
 
+/// Select the PocketPC GoForce 5500 extension and EGL configuration list.
+pub fn set_goforce_5500_profile(enabled: bool) {
+    SURFACES.with(|s| s.borrow_mut().goforce_5500 = enabled);
+}
+
 /// Set the session capability gate without changing client detection.
 pub fn set_nv_combiner_allowed(allowed: bool) {
     let apply = |c: &mut Context| {
@@ -419,6 +427,7 @@ pub fn set_gpu_renderer(enabled: bool) {
 }
 
 pub(crate) fn release_gpu() {
+    crate::gles2::set_enabled(false);
     with_ctx(|c| c.release_gpu());
     SURFACES.with(|s| {
         for image in s.borrow_mut().images.values_mut() {
@@ -433,6 +442,8 @@ pub(crate) fn release_gpu() {
 /// runs reusing the same host thread. Dropping the old Context frees all
 /// host-side GL resources; guest memory belongs to the new kernel/CPU.
 pub(crate) fn reset_for_session() {
+    crate::gles2::set_enabled(false);
+    color_capture::reset();
     egl_context::set_thread(0);
     SHARED_WINDOW.with(|s| s.take());
     SHARED_HANDOFF_SEEN.with(|s| s.set(0));
@@ -450,6 +461,7 @@ pub(crate) struct SuspendedGles {
     pack: usize,
     unpack: usize,
     surfaces: EglSurfaces,
+    programmable: Option<crate::gles2::Session>,
 }
 
 pub(crate) fn suspend() -> SuspendedGles {
@@ -466,10 +478,12 @@ pub(crate) fn suspend() -> SuspendedGles {
         pack,
         unpack,
         surfaces,
+        programmable: crate::gles2::take_session(),
     }
 }
 
 pub(crate) fn resume(saved: SuspendedGles) {
+    crate::gles2::restore_session(saved.programmable);
     egl_context::set_thread(saved.surfaces.thread);
     CTX.with(|slot| *slot.borrow_mut() = saved.context);
     SURFACES.with(|slot| *slot.borrow_mut() = saved.surfaces);
@@ -1681,7 +1695,13 @@ fn gl_capability(pname: u32) -> Option<Vec<f32>> {
         pocket_gles::GL_MAX_MODELVIEW_STACK_DEPTH
         | pocket_gles::GL_MAX_PROJECTION_STACK_DEPTH
         | pocket_gles::GL_MAX_TEXTURE_STACK_DEPTH => vec![16.],
-        pocket_gles::GL_DEPTH_BITS => vec![with_ctx(|c| c.state.depth_bits() as f32)],
+        pocket_gles::GL_DEPTH_BITS => vec![with_ctx(|c| {
+            if c.target.depth.is_empty() {
+                0.
+            } else {
+                c.state.depth_bits() as f32
+            }
+        })],
         pocket_gles::GL_STENCIL_BITS => vec![0.],
         pocket_gles::GL_ALPHA_BITS => vec![with_ctx(|c| if c.target.rgb565 { 0. } else { 8. })],
         pocket_gles::GL_RED_BITS | pocket_gles::GL_BLUE_BITS => {
@@ -1712,40 +1732,47 @@ fn gl_get_string(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let name = ctx.arg_u32(0)?;
     let text = match name {
         pocket_gles::GL_VENDOR => "PocketHLE",
-        pocket_gles::GL_RENDERER => with_ctx(|c| {
-            if c.gpu_active() {
-                "PocketHLE GPU rasterizer"
-            } else {
-                "PocketHLE Software Rasterizer"
-            }
-        }),
+        pocket_gles::GL_RENDERER => {
+            let renderer = with_ctx(|c| c.renderer_name().to_owned());
+            return Ok(DispatchOutcome::ReturnedR0(intern_string(ctx, &renderer)?));
+        }
         pocket_gles::GL_VERSION => "OpenGL ES-CL 1.1",
         // The ARB combine tokens and operations are identical to GLES 1.1 core.
         // Older clients (including OGLESVirgin) still query the extension name.
         pocket_gles::GL_EXTENSIONS => {
-            "GL_ARB_texture_env_combine GL_AMD_compressed_ATC_texture GL_ATI_texture_compression_atitc GL_EXT_texture_compression_dxt1 GL_ANGLE_texture_compression_dxt3 GL_ANGLE_texture_compression_dxt5 GL_EXT_texture_lod_bias GL_SGIS_texture_lod GL_OES_compressed_paletted_texture GL_OES_query_matrix GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format"
+            "GL_ARB_texture_env_combine GL_IMG_texture_compression_pvrtc GL_AMD_compressed_ATC_texture GL_ATI_texture_compression_atitc GL_EXT_texture_compression_dxt1 GL_ANGLE_texture_compression_dxt3 GL_ANGLE_texture_compression_dxt5 GL_EXT_texture_lod_bias GL_SGIS_texture_lod GL_OES_compressed_paletted_texture GL_OES_query_matrix GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format"
         }
         _ => {
             with_ctx(|c| c.set_error(pocket_gles::GL_INVALID_ENUM));
             return Ok(DispatchOutcome::ReturnedR0(0));
         }
     };
-    if name == pocket_gles::GL_EXTENSIONS && pocket_gles::graphics_diagnostic::enabled() {
-        nv_combiner::diagnostic_extensions();
-    }
-    if name == pocket_gles::GL_EXTENSIONS && nv_combiner::enabled() {
-        let extensions = format!("{text} GL_NV_combiner_program");
-        return Ok(DispatchOutcome::ReturnedR0(intern_string(
-            ctx,
-            &extensions,
-        )?));
+    if name == pocket_gles::GL_EXTENSIONS {
+        if pocket_gles::graphics_diagnostic::enabled() {
+            nv_combiner::diagnostic_extensions();
+        }
+        let vbo = goforce_5500_enabled();
+        let combiners = nv_combiner::enabled();
+        if vbo || combiners {
+            let mut extensions = text.to_owned();
+            if vbo {
+                extensions.push_str(" GL_OES_vertex_buffer_object");
+            }
+            if combiners {
+                extensions.push_str(" GL_NV_combiner_program");
+            }
+            return Ok(DispatchOutcome::ReturnedR0(intern_string(
+                ctx,
+                &extensions,
+            )?));
+        }
     }
     Ok(DispatchOutcome::ReturnedR0(intern_string(ctx, text)?))
 }
 
 /// Copy `text` into guest memory as NUL-terminated ASCII, reusing the
 /// same allocation for repeated queries of the same string.
-fn intern_string(ctx: &mut CallCtx<'_>, text: &str) -> Result<u32, KernelError> {
+pub(super) fn intern_string(ctx: &mut CallCtx<'_>, text: &str) -> Result<u32, KernelError> {
     if let Some(va) = ctx.kernel.gles_strings.get(text).copied() {
         return Ok(va);
     }
@@ -1910,10 +1937,18 @@ fn gl_compressed_tex_image_2d(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, 
     }) else {
         return Ok(VOID);
     };
-    if size as usize != needed {
+    // Some legacy ATC uploaders pass the RGB565 allocation size even
+    // though the ATC image at its start occupies only half that space.
+    let padded_atc = matches!(
+        format,
+        pocket_gles::GL_ATC_RGBA_EXPLICIT_ALPHA_AMD
+            | pocket_gles::GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD
+    ) && needed.checked_mul(2) == Some(size as usize);
+    if size as usize != needed && !padded_atc {
         with_ctx(|c| c.set_error(pocket_gles::GL_INVALID_VALUE));
         return Ok(VOID);
     }
+    let size = needed as u32;
     let bytes = if data == 0 || size == 0 {
         Vec::new()
     } else {
@@ -1924,6 +1959,17 @@ fn gl_compressed_tex_image_2d(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, 
         bytes
     };
     with_ctx(|c| c.compressed_tex_image_2d(target, level, width, height, format, &bytes));
+    Ok(VOID)
+}
+
+fn gl_current_palette_matrix(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let index = ctx.arg_u32(0)?;
+    with_ctx(|c| c.set_palette_index(index));
+    Ok(VOID)
+}
+
+fn gl_load_palette_from_modelview(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    with_ctx(|c| c.load_palette_from_modelview());
     Ok(VOID)
 }
 
@@ -2022,6 +2068,7 @@ const DISPLAY_HANDLE: u32 = 0x4547_0001;
 /// The RGB565 configuration; the optional profile exposes only RGBA8888.
 const CONFIG_HANDLE: u32 = 0x4547_0002;
 const CONFIG_RGBA_HANDLE: u32 = 0x4547_0005;
+const CONFIG_RGBA_COLOR_PBUFFER: u32 = 0x4547_0006;
 /// First window surface; later windows receive fresh handles.
 const SURFACE_HANDLE: u32 = 0x4547_0003;
 /// First context handle; subsequent creations receive distinct handles.
@@ -2223,6 +2270,10 @@ fn egl_create_window_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
     if !egl_surface_args(ctx)? {
         return Ok(DispatchOutcome::ReturnedR0(EGL_NO_SURFACE));
     }
+    if ctx.arg_u32(1)? == CONFIG_RGBA_COLOR_PBUFFER {
+        set_egl_error(pocket_gles::EGL_BAD_MATCH);
+        return Ok(DispatchOutcome::ReturnedR0(EGL_NO_SURFACE));
+    }
     // The 2005-10-13 GoForce driver never reads attrib_list here (including
     // its address). Keep that device behavior: applications can reuse their
     // eglChooseConfig list. Other profiles retain EGL attribute validation.
@@ -2268,8 +2319,10 @@ fn egl_create_window_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
             set_egl_error(pocket_gles::EGL_BAD_ALLOC);
             return 0;
         }
-        let handle = if !s.window_issued {
-            s.window_issued = true;
+        let first_window = !std::mem::replace(&mut s.window_issued, true);
+        // A probe can terminate EGL before the first window is created.
+        // The backing image may still be active while pending deletion.
+        let handle = if first_window && s.images.get(&SURFACE_HANDLE).is_none_or(|i| !i.deleted) {
             SURFACE_HANDLE
         } else {
             let h = s.next;
@@ -2373,13 +2426,8 @@ fn egl_query_context(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
         set_egl_error(pocket_gles::EGL_BAD_PARAMETER);
         return Ok(DispatchOutcome::ReturnedR0(EGL_FALSE));
     }
-    let id: i32 = SURFACES.with(|s| {
-        if s.borrow().contexts[&handle].config == CONFIG_HANDLE {
-            1
-        } else {
-            2
-        }
-    });
+    let config = SURFACES.with(|s| s.borrow().contexts[&handle].config);
+    let id = egl_config::Config::id(config);
     ctx.cpu.write_mem(out, &id.to_le_bytes())?;
     Ok(DispatchOutcome::ReturnedR0(EGL_TRUE))
 }
@@ -2425,6 +2473,10 @@ fn allocate_surface(width: u32, height: u32, pixmap: Option<u32>, config: u32) -
                 deleted: false,
                 buffers: Some(if config == CONFIG_HANDLE {
                     SurfaceBuffers::new_rgb565(width, height)
+                } else if config == CONFIG_RGBA_COLOR_PBUFFER {
+                    let mut buffers = SurfaceBuffers::new(width, height);
+                    buffers.target.depth.clear();
+                    buffers
                 } else {
                     SurfaceBuffers::new(width, height)
                 }),
@@ -2487,7 +2539,7 @@ fn egl_create_pixmap(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     if !egl_surface_args(ctx)? {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    if ctx.arg_u32(1)? == CONFIG_RGBA_HANDLE {
+    if ctx.arg_u32(1)? != CONFIG_HANDLE {
         set_egl_error(pocket_gles::EGL_BAD_MATCH);
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
@@ -2771,13 +2823,7 @@ fn egl_query_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     let value: i32 = match attribute {
         pocket_gles::EGL_WIDTH => w as i32,
         pocket_gles::EGL_HEIGHT => h as i32,
-        EGL_CONFIG_ID => {
-            if config == CONFIG_HANDLE {
-                1
-            } else {
-                2
-            }
-        }
+        EGL_CONFIG_ID => egl_config::Config::id(config),
         pocket_gles::EGL_LARGEST_PBUFFER => largest as i32,
         0x3080 | 0x3081 => 0x305c, // NO_TEXTURE
         0x3082 => mipmap as i32,
@@ -2803,55 +2849,12 @@ fn egl_query_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     Ok(DispatchOutcome::ReturnedR0(EGL_TRUE))
 }
 
-/// `eglSwapBuffers` — the only place GL output becomes visible.
-/// Converts the RGBA8888 render target down to the kernel
-/// framebuffer's RGB565 and marks it dirty so the frontend picks it up.
-pub(crate) fn egl_swap_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let _diagnostic = graphics_diagnostic::Span::new(graphics_diagnostic::Stage::Swap);
-    if !egl_config_display(ctx)? {
-        return Ok(DispatchOutcome::ReturnedR0(EGL_FALSE));
-    }
-    let surface = ctx.arg_u32(1)?;
-    let valid = SURFACES.with(|s| {
-        let s = s.borrow();
-        s.bound && s.images.contains_key(&surface) && (s.draw == surface || s.read == surface)
-    });
-    if !valid {
-        set_egl_error(pocket_gles::EGL_BAD_SURFACE);
-        return Ok(DispatchOutcome::ReturnedR0(EGL_FALSE));
-    }
-    let draw = surface;
-    if !SURFACES.with(|s| s.borrow().images[&draw].window.is_some()) {
-        flush_pixmap(ctx, draw)?;
-        with_ctx(|c| c.sync_gpu());
-        return Ok(DispatchOutcome::ReturnedR0(EGL_TRUE));
-    }
-    // Frontend snapshot throttling does not pace guest execution. Battlestations
-    // runs its simulation too quickly once GPU rendering removes the incidental
-    // software rasterization cost. Use the same modeled 60 Hz LCD as DirectDraw,
-    // including cooperative retries and one-shot credit for explicit blank waits.
-    // Offscreen swaps above are synchronization, not display presentations.
-    if let Some(outcome) = crate::ddraw::wait_display(ctx, None)? {
-        return Ok(outcome);
-    }
-    let active = SURFACES.with(|s| {
-        let mut s = s.borrow_mut();
-        let active = s.active;
-        with_ctx(|c| s.select(c, surface));
-        active
-    });
-    let (w, h) = (ctx.kernel.framebuffer.width, ctx.kernel.framebuffer.height);
-    SURFACES.with(|s| {
-        if let Some(image) = s.borrow_mut().images.get_mut(&surface) {
-            image.width = w;
-            image.height = h;
-        }
-    });
-    with_ctx(|c| {
-        if (c.target.width, c.target.height) != (w, h) {
-            c.target.resize(w, h);
-        }
-    });
+/// Publish through the same immutable window-frame handoff for both guest APIs.
+pub(crate) fn publish_shared_window(
+    ctx: &mut CallCtx<'_>,
+    snapshot: impl FnOnce(&SharedContextSource) -> Option<SharedFrame>,
+) -> Result<bool, KernelError> {
+    let (w, h) = ctx.kernel.framebuffer.logical_size();
     let enabled = SHARED_EXPORT.with(|s| {
         s.borrow()
             .as_ref()
@@ -2866,7 +2869,7 @@ pub(crate) fn egl_swap_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
     let measure_ips = ctx.kernel.framebuffer.ips_enabled();
     let shared = if enabled && !measure_ips && (!ctx.kernel.fb_mapped || mapped_defer) {
         pocket_gles::gpu::configured_shared_context_source().and_then(|source| {
-            let frame = with_ctx(|c| c.snapshot_shared_frame())?;
+            let frame = snapshot(&source)?;
             let provider =
                 deferred_frame::GlesCpuPixelSource::new(frame.clone(), source, (w, h)).ok()?;
             let provider: std::sync::Arc<dyn pocket_kernel::framebuffer::deferred::CpuPixelSource> =
@@ -2918,7 +2921,72 @@ pub(crate) fn egl_swap_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
             Some("swap_snapshot_unavailable_or_publication_rejected")
         });
     });
-    if shared.is_none() {
+    let published = shared.is_some();
+    SHARED_WINDOW.with(|s| {
+        s.replace(shared.map(|(frame, identity)| {
+            (
+                ctx.kernel.framebuffer.frame_counter,
+                ctx.kernel.framebuffer.authority_epoch(),
+                frame,
+                identity,
+            )
+        }));
+    });
+    Ok(published)
+}
+
+/// `eglSwapBuffers` — the only place GL output becomes visible.
+/// Converts the RGBA8888 render target down to the kernel
+/// framebuffer's RGB565 and marks it dirty so the frontend picks it up.
+pub(crate) fn egl_swap_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _diagnostic = graphics_diagnostic::Span::new(graphics_diagnostic::Stage::Swap);
+    if !egl_config_display(ctx)? {
+        return Ok(DispatchOutcome::ReturnedR0(EGL_FALSE));
+    }
+    let surface = ctx.arg_u32(1)?;
+    let valid = SURFACES.with(|s| {
+        let s = s.borrow();
+        s.bound && s.images.contains_key(&surface) && (s.draw == surface || s.read == surface)
+    });
+    if !valid {
+        set_egl_error(pocket_gles::EGL_BAD_SURFACE);
+        return Ok(DispatchOutcome::ReturnedR0(EGL_FALSE));
+    }
+    let draw = surface;
+    if !SURFACES.with(|s| s.borrow().images[&draw].window.is_some()) {
+        flush_pixmap(ctx, draw)?;
+        with_ctx(|c| c.sync_gpu());
+        return Ok(DispatchOutcome::ReturnedR0(EGL_TRUE));
+    }
+    // Frontend snapshot throttling does not pace guest execution. Battlestations
+    // runs its simulation too quickly once GPU rendering removes the incidental
+    // software rasterization cost. Use the same modeled 60 Hz LCD as DirectDraw,
+    // including cooperative retries and one-shot credit for explicit blank waits.
+    // Offscreen swaps above are synchronization, not display presentations.
+    if let Some(outcome) = crate::ddraw::wait_display(ctx, None)? {
+        return Ok(outcome);
+    }
+    let active = SURFACES.with(|s| {
+        let mut s = s.borrow_mut();
+        let active = s.active;
+        with_ctx(|c| s.select(c, surface));
+        active
+    });
+    let (w, h) = (ctx.kernel.framebuffer.width, ctx.kernel.framebuffer.height);
+    SURFACES.with(|s| {
+        if let Some(image) = s.borrow_mut().images.get_mut(&surface) {
+            image.width = w;
+            image.height = h;
+        }
+    });
+    with_ctx(|c| {
+        if (c.target.width, c.target.height) != (w, h) {
+            c.target.resize(w, h);
+        }
+    });
+    let color_capture = color_capture::begin();
+    let shared = publish_shared_window(ctx, |_| with_ctx(|c| c.snapshot_shared_frame()))?;
+    if !shared {
         pocket_kernel::framebuffer::gapi_memory::discard(ctx.cpu)?;
         // Full replacement: never materialize a previous retained image only
         // to overwrite it with this new swap (disabled policy/backpressure).
@@ -2930,16 +2998,6 @@ pub(crate) fn egl_swap_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
         });
         ctx.kernel.framebuffer.observe_ips();
     }
-    SHARED_WINDOW.with(|s| {
-        s.replace(shared.map(|(frame, identity)| {
-            (
-                ctx.kernel.framebuffer.frame_counter,
-                ctx.kernel.framebuffer.authority_epoch(),
-                frame,
-                identity,
-            )
-        }));
-    });
     // The conversion above replaces the framebuffer, including any video
     // composed by the message pump. Invalidate that presentation before
     // DirectShow checks its cached frame, even if no new video frame is due.
@@ -2969,6 +3027,9 @@ pub(crate) fn egl_swap_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
     ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
     ctx.kernel.framebuffer.directdraw.last_present = Some(std::time::Instant::now());
     ctx.kernel.framebuffer.presentation_stats.record_present();
+    if let Some(capture) = color_capture {
+        color_capture::finish(capture, ctx.kernel);
+    }
     // Ancillary buffers are not preserved by a window swap. In particular a
     // HUD may leave DepthMask(FALSE); that must not preserve previous-frame Z.
     // Do this only after the actual presentation, never on cooperative retry
@@ -3132,8 +3193,26 @@ fn egl_no_surface(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     Ok(DispatchOutcome::ReturnedR0(EGL_NO_SURFACE))
 }
 
+fn goforce_5500_enabled() -> bool {
+    SURFACES.with(|s| s.borrow().goforce_5500)
+}
+
 /// Resolve only known callable GLES thunks, without modifying ordinal tables.
 fn egl_get_proc_address(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    egl_get_proc_address_for(
+        ctx,
+        &[
+            pocket_kernel::GLES_CM_MODULE_HANDLE,
+            pocket_kernel::GLES_CL_MODULE_HANDLE,
+            pocket_kernel::EGL_MODULE_HANDLE,
+        ],
+    )
+}
+
+pub(crate) fn egl_get_proc_address_for(
+    ctx: &mut CallCtx<'_>,
+    modules: &[u32],
+) -> Result<DispatchOutcome, KernelError> {
     let pointer = ctx.arg_u32(0)?;
     if pointer == 0 {
         return Ok(DispatchOutcome::ReturnedR0(0));
@@ -3150,20 +3229,19 @@ fn egl_get_proc_address(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
     if name.ends_with("NV") && nv_combiner::is_entry_point(&name) && !nv_combiner::enabled() {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    let address = [
-        pocket_kernel::GLES_CM_MODULE_HANDLE,
-        pocket_kernel::GLES_CL_MODULE_HANDLE,
-        pocket_kernel::EGL_MODULE_HANDLE,
-    ]
-    .into_iter()
-    .find_map(|module| {
-        ctx.kernel
-            .dynamic_exports
-            .get(&module)
-            .and_then(|exports| exports.get(name.as_ref()))
-            .copied()
-    })
-    .unwrap_or(0);
+    if GOFORCE_5500_VBO_EXPORTS.contains(&name.as_ref()) && !goforce_5500_enabled() {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let address = modules
+        .iter()
+        .find_map(|module| {
+            ctx.kernel
+                .dynamic_exports
+                .get(module)
+                .and_then(|exports| exports.get(name.as_ref()))
+                .copied()
+        })
+        .unwrap_or(0);
     Ok(DispatchOutcome::ReturnedR0(address))
 }
 
@@ -3190,13 +3268,7 @@ fn query_matrix_parts(values: &[f32]) -> ([i32; 16], [i32; 16], u32) {
 fn gl_query_matrix_x_oes(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let output = ctx.arg_u32(0)?;
     let powers = ctx.arg_u32(1)?;
-    let values = with_ctx(|c| match c.matrix_mode {
-        pocket_gles::matrix::MatrixMode::Modelview => c.modelview.current().to_vec(),
-        pocket_gles::matrix::MatrixMode::Projection => c.projection.current().to_vec(),
-        pocket_gles::matrix::MatrixMode::Texture => c.texture_matrix[c.active_texture as usize]
-            .current()
-            .to_vec(),
-    });
+    let values = with_ctx(|c| *c.current_matrix());
     let (mantissa, exponent, status) = query_matrix_parts(&values);
     for index in 0..16 {
         ctx.cpu
@@ -3250,10 +3322,10 @@ fn handler_for(name: &str) -> Option<crate::Handler> {
         "glGetBooleanv" => es11::get_boolean,
         "glGetFixedv" => es11::get_fixed,
         "glGetPointerv" => es11::get_pointer,
-        "glGetBufferParameteriv" => es11::get_buffer,
+        "glGetBufferParameteriv" | "glGetBufferParameterivOES" => es11::get_buffer,
         "glIsEnabled" => es11::is_enabled,
         "glIsTexture" => es11::is_texture,
-        "glIsBuffer" => es11::is_buffer,
+        "glIsBuffer" | "glIsBufferOES" => es11::is_buffer,
         "glColor4ub" => es11::color4ub,
         "glClipPlanef" => es11::clip_f,
         "glClipPlanex" => es11::clip_x,
@@ -3368,19 +3440,20 @@ fn handler_for(name: &str) -> Option<crate::Handler> {
         "glReadPixels" => gl_read_pixels,
 
         // buffer objects
-        "glGenBuffers" => gl_gen_buffers,
-        "glDeleteBuffers" => gl_delete_buffers,
-        "glBindBuffer" => gl_bind_buffer,
-        "glBufferData" => gl_buffer_data,
-        "glBufferSubData" => gl_buffer_sub_data,
+        "glGetBufferSubDataOES" => es11::get_buffer_sub_data,
+        "glGetBufferPointervOES" => es11::get_buffer_pointer,
+        "glGenBuffers" | "glGenBuffersOES" => gl_gen_buffers,
+        "glDeleteBuffers" | "glDeleteBuffersOES" => gl_delete_buffers,
+        "glBindBuffer" | "glBindBufferOES" => gl_bind_buffer,
+        "glBufferData" | "glBufferDataOES" => gl_buffer_data,
+        "glBufferSubData" | "glBufferSubDataOES" => gl_buffer_sub_data,
 
         // Matrix-palette skinning (OES_matrix_palette). The rasterizer
         // transforms by the modelview alone, so a skinned mesh renders
         // in its bind pose rather than not at all.
-        "glMatrixIndexPointerOES"
-        | "glWeightPointerOES"
-        | "glCurrentPaletteMatrixOES"
-        | "glLoadPaletteFromModelViewMatrixOES" => gl_ignored,
+        "glMatrixIndexPointerOES" | "glWeightPointerOES" => gl_ignored,
+        "glCurrentPaletteMatrixOES" => gl_current_palette_matrix,
+        "glLoadPaletteFromModelViewMatrixOES" => gl_load_palette_from_modelview,
         "glPointSizePointerOES" => gl_point_size_pointer,
 
         "glLightf" => gl_lightf,
@@ -3555,6 +3628,30 @@ const EXTRA_NAMED_EXPORTS: [&str; 45] = [
     "eglSwapIntervalNV",
 ];
 
+// Names used by the early GoForce VBO extension before the core GLES 1.1 spelling.
+const GOFORCE_5500_VBO_EXPORTS: [&str; 9] = [
+    "glGetBufferParameterivOES",
+    "glIsBufferOES",
+    "glGenBuffersOES",
+    "glDeleteBuffersOES",
+    "glBindBufferOES",
+    "glBufferDataOES",
+    "glBufferSubDataOES",
+    "glGetBufferSubDataOES",
+    "glGetBufferPointervOES",
+];
+
+fn goforce_5500_vbo(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if !goforce_5500_enabled() {
+        with_ctx(|c| c.set_error(pocket_gles::GL_INVALID_OPERATION));
+        return Ok(VOID);
+    }
+    let pocket_pe::ImportBinding::Name(name) = &ctx.thunk.binding else {
+        return Ok(VOID);
+    };
+    handler_for(name).unwrap()(ctx)
+}
+
 const EGL_NAMED_EXPORTS: &[&str] = &[
     "eglGetDisplay",
     "eglInitialize",
@@ -3614,6 +3711,9 @@ pub fn register(d: &mut WinCeDispatcher) {
                 continue;
             };
             d.register_handler(dll, name, handler);
+        }
+        for name in GOFORCE_5500_VBO_EXPORTS {
+            d.register_handler(dll, name, goforce_5500_vbo);
         }
         // Games import these libraries purely by ordinal, so the
         // ordinal spellings the loader produces need to reach the same
@@ -4069,6 +4169,118 @@ mod tests {
     pub(super) const SCRATCH: u32 = 0x2000_0000;
 
     #[test]
+    fn advertised_pvrtc_formats_accept_uploads_and_whole_level_replacement() {
+        use pocket_gles::*;
+        let _g = guard();
+        reset_for_test(16, 16);
+        let mut cpu = fresh_cpu();
+        let mut kernel = fresh_kernel();
+        for format in [
+            GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG,
+            GL_COMPRESSED_RGB_PVRTC_2BPPV1_IMG,
+            GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+            GL_COMPRESSED_RGBA_PVRTC_2BPPV1_IMG,
+        ] {
+            let size = texture::compressed_image_size(format, 16, 8).unwrap() as u32;
+            cpu.write_mem(SCRATCH, &vec![0; size as usize]).unwrap();
+            call(
+                &mut cpu,
+                &mut kernel,
+                gl_compressed_tex_image_2d,
+                &[GL_TEXTURE_2D, 0, format, 16, 8, 0, size, SCRATCH],
+            );
+            assert_eq!(call(&mut cpu, &mut kernel, gl_get_error, &[]), GL_NO_ERROR);
+            call(
+                &mut cpu,
+                &mut kernel,
+                gl_compressed_tex_sub_image_2d,
+                &[GL_TEXTURE_2D, 0, 0, 0, 16, 8, format, size, SCRATCH],
+            );
+            assert_eq!(call(&mut cpu, &mut kernel, gl_get_error, &[]), GL_NO_ERROR);
+            call(
+                &mut cpu,
+                &mut kernel,
+                gl_compressed_tex_sub_image_2d,
+                &[GL_TEXTURE_2D, 0, 0, 0, 8, 8, format, size, SCRATCH],
+            );
+            assert_eq!(
+                call(&mut cpu, &mut kernel, gl_get_error, &[]),
+                GL_INVALID_OPERATION
+            );
+            let mip_size = texture::compressed_image_size(format, 1, 1).unwrap() as u32;
+            call(
+                &mut cpu,
+                &mut kernel,
+                gl_compressed_tex_image_2d,
+                &[GL_TEXTURE_2D, 1, format, 1, 1, 0, mip_size, SCRATCH],
+            );
+            assert_eq!(call(&mut cpu, &mut kernel, gl_get_error, &[]), GL_NO_ERROR);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires native OpenGL; renderer identity and backend transitions"]
+    fn native_renderer_query_preserves_guest_pointers_and_emulated_capabilities() {
+        let _g = guard();
+        reset_for_test(16, 16);
+        let mut cpu = fresh_cpu();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x5000_0000, 0x10000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let software = call(
+            &mut cpu,
+            &mut kernel,
+            gl_get_string,
+            &[pocket_gles::GL_RENDERER],
+        );
+        set_gpu_renderer(true);
+        assert!(with_ctx(|c| c.gpu_active()));
+        let expected = with_ctx(|c| c.renderer_name().to_owned());
+        assert!(!expected.is_empty());
+        assert_ne!(expected, "PocketHLE Software Rasterizer");
+        let gpu = call(
+            &mut cpu,
+            &mut kernel,
+            gl_get_string,
+            &[pocket_gles::GL_RENDERER],
+        );
+        assert_ne!(gpu, software);
+        let mut bytes = expected.into_bytes();
+        bytes.push(0);
+        assert_eq!(cpu.read_mem(gpu, bytes.len() as u32).unwrap(), bytes);
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                gl_get_string,
+                &[pocket_gles::GL_RENDERER]
+            ),
+            gpu
+        );
+        for (query, text) in [
+            (pocket_gles::GL_VENDOR, "PocketHLE"),
+            (pocket_gles::GL_VERSION, "OpenGL ES-CL 1.1"),
+        ] {
+            let ptr = call(&mut cpu, &mut kernel, gl_get_string, &[query]);
+            assert_eq!(
+                cpu.read_mem(ptr, text.len() as u32 + 1).unwrap(),
+                [text.as_bytes(), &[0]].concat()
+            );
+        }
+        set_gpu_renderer(false);
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                gl_get_string,
+                &[pocket_gles::GL_RENDERER]
+            ),
+            software
+        );
+        assert_eq!(cpu.read_mem(gpu, bytes.len() as u32).unwrap(), bytes);
+    }
+
+    #[test]
     fn compressed_format_queries_and_extension_names_match_decoders() {
         use pocket_gles::*;
         let _g = guard();
@@ -4085,6 +4297,7 @@ mod tests {
             .find(|s| s.contains("GL_EXT_texture_compression_dxt1"))
             .unwrap();
         let names: std::collections::HashSet<_> = text.split_whitespace().collect();
+        assert!(names.contains("GL_IMG_texture_compression_pvrtc"));
         assert!(names.contains("GL_ANGLE_texture_compression_dxt3"));
         assert!(names.contains("GL_ANGLE_texture_compression_dxt5"));
         assert!(!names.contains("GL_EXT_texture_compression_s3tc"));
@@ -4230,6 +4443,35 @@ mod tests {
         assert_eq!(
             call(&mut cpu, &mut kernel, gl_get_error, &[]),
             GL_INVALID_OPERATION
+        );
+    }
+
+    #[test]
+    fn legacy_atc_upload_uses_the_encoded_length_of_a_padded_buffer() {
+        use pocket_gles::*;
+        let _guard = guard();
+        reset_for_test(16, 16);
+        let mut cpu = fresh_cpu();
+        let mut kernel = fresh_kernel();
+        cpu.write_mem(SCRATCH, &[0; 16]).unwrap();
+        let mut args = [
+            GL_TEXTURE_2D,
+            0,
+            GL_ATC_RGBA_EXPLICIT_ALPHA_AMD,
+            4,
+            4,
+            0,
+            32,
+            SCRATCH,
+        ];
+        call(&mut cpu, &mut kernel, gl_compressed_tex_image_2d, &args);
+        assert_eq!(call(&mut cpu, &mut kernel, gl_get_error, &[]), GL_NO_ERROR);
+        assert_eq!(with_ctx(|c| c.textures[&0].compressed[&0].bytes.len()), 16);
+        args[6] = 33;
+        call(&mut cpu, &mut kernel, gl_compressed_tex_image_2d, &args);
+        assert_eq!(
+            call(&mut cpu, &mut kernel, gl_get_error, &[]),
+            GL_INVALID_VALUE
         );
     }
 
@@ -6480,6 +6722,59 @@ mod tests {
     }
 
     #[test]
+    fn egl_window_after_probe_termination_uses_a_live_surface() {
+        let _g = guard();
+        reset_for_session();
+        let (mut cpu, mut kernel) = (fresh_cpu(), fresh_kernel());
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                egl_initialize,
+                &[DISPLAY_HANDLE, 0, 0]
+            ),
+            EGL_TRUE
+        );
+        assert_eq!(
+            call(&mut cpu, &mut kernel, egl_terminate, &[DISPLAY_HANDLE]),
+            EGL_TRUE
+        );
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                egl_initialize,
+                &[DISPLAY_HANDLE, 0, 0]
+            ),
+            EGL_TRUE
+        );
+        let context = call(
+            &mut cpu,
+            &mut kernel,
+            egl_create_context,
+            &[DISPLAY_HANDLE, CONFIG_HANDLE, 0, 0],
+        );
+        let surface = call(
+            &mut cpu,
+            &mut kernel,
+            egl_create_window_surface,
+            &[DISPLAY_HANDLE, CONFIG_HANDLE, 0x1234, 0],
+        );
+        assert_ne!(surface, EGL_NO_SURFACE);
+        assert_ne!(surface, SURFACE_HANDLE);
+        assert_eq!(
+            call(
+                &mut cpu,
+                &mut kernel,
+                egl_make_current,
+                &[DISPLAY_HANDLE, surface, surface, context]
+            ),
+            EGL_TRUE
+        );
+        assert!(SURFACES.with(|s| !s.borrow().images.contains_key(&SURFACE_HANDLE)));
+    }
+
+    #[test]
     fn egl_release_thread_preserves_display_objects_and_client_state() {
         let _g = guard();
         reset_for_test(8, 8);
@@ -7427,6 +7722,7 @@ mod tests {
             ),
             pointer
         );
+        assert!(!with_ctx(|c| c.gpu_active()));
     }
 
     #[test]
@@ -7775,10 +8071,12 @@ mod tests {
             &[pocket_gles::GL_RENDERER],
         );
         assert_ne!(renderer, 0);
+        let mut expected_renderer = with_ctx(|c| c.renderer_name().as_bytes().to_vec());
+        expected_renderer.push(0);
         assert_eq!(
-            cpu.read_mem(renderer, b"PocketHLE GPU rasterizer\0".len() as u32)
+            cpu.read_mem(renderer, expected_renderer.len() as u32)
                 .unwrap(),
-            b"PocketHLE GPU rasterizer\0".to_vec()
+            expected_renderer
         );
 
         let vertices: [f32; 9] = [-0.9, -0.9, 0., 0.9, -0.9, 0., 0., 0.9, 0.];

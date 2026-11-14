@@ -1,4 +1,4 @@
-// Cross-platform desktop launcher GUI for PocketHLE.
+// Cross-platform desktop launcher GUI for PocketHLE-Reborn.
 //
 // Targets Linux and Windows. The interface is deliberately modeled
 // after [`j2me-loader`](https://github.com/nikita36078/j2me-loader): a
@@ -15,7 +15,6 @@ mod controller_ui;
 mod deck_navigation;
 mod desktop_pointer;
 mod file_dialog;
-mod frame_pacing;
 mod fullscreen_layout;
 mod gamepad;
 mod controller_labels;
@@ -35,7 +34,6 @@ mod runner;
 mod screenshot;
 mod smaa;
 mod toolbar_ui;
-mod unimplemented_log;
 
 use anyhow::{Context, Result};
 
@@ -127,7 +125,26 @@ fn init_logging(library_root: &std::path::Path) -> Option<std::path::PathBuf> {
         *LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
         builder.target(env_logger::Target::Pipe(Box::new(Tee)));
     }
-    builder.init();
+    struct SessionLogger(env_logger::Logger);
+    impl log::Log for SessionLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            self.0.enabled(metadata)
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            pocket_library::session_diagnostic::record(record);
+            self.0.log(record);
+        }
+
+        fn flush(&self) {
+            self.0.flush();
+        }
+    }
+    let logger = builder.build();
+    let level = logger.filter();
+    if log::set_boxed_logger(Box::new(SessionLogger(logger))).is_ok() {
+        log::set_max_level(level);
+    }
     result
 }
 
@@ -136,7 +153,7 @@ fn main() -> Result<()> {
     if let Err(error) = &result {
         log::error!("{error:#}");
         rfd::MessageDialog::new()
-            .set_title("PocketHLE startup error")
+            .set_title("PocketHLE-Reborn startup error")
             .set_description(format!("{error:#}"))
             .set_level(rfd::MessageLevel::Error)
             .show();
@@ -151,7 +168,7 @@ fn run_launcher() -> Result<()> {
         println!("{}", launch_args::HELP);
         #[cfg(windows)]
         rfd::MessageDialog::new()
-            .set_title("PocketHLE command line")
+            .set_title("PocketHLE-Reborn command line")
             .set_description(launch_args::HELP)
             .show();
         return Ok(());
@@ -161,12 +178,13 @@ fn run_launcher() -> Result<()> {
     let launch = startup.launch;
     let mut ce_launch = startup.ce_launch;
     let title = if steam_deck {
-        "PocketHLE — Steam Deck"
+        "PocketHLE-Reborn — Steam Deck"
     } else {
-        "PocketHLE"
+        "PocketHLE-Reborn"
     };
     let library_root = default_library_root();
     let log_path = init_logging(&library_root);
+    log::info!("PocketHLE GUI version {}", env!("CARGO_PKG_VERSION"));
     log::info!("Using library root: {}", library_root.display());
     if let Some(path) = log_path {
         log::info!("Logging to {}", path.display());
@@ -193,10 +211,11 @@ fn run_launcher() -> Result<()> {
         })
         .transpose()? };
     let explicit_fullscreen = startup.ce_fullscreen.or_else(||launch.as_ref().and_then(|a| a.fullscreen));
-    let fullscreen = launch_args::startup_fullscreen(explicit_fullscreen);
+    let minimized = startup.minimized;
+    let fullscreen = !minimized && launch_args::startup_fullscreen(explicit_fullscreen);
 
     let icon = image::load_from_memory(include_bytes!("../assets/pockethle_logo.png"))
-        .context("decoding PocketHLE logo")?
+        .context("decoding PocketHLE-Reborn logo")?
         .to_rgba8();
     let ui_vsync = library.config().desktop_vsync;
     log::info!(
@@ -216,6 +235,8 @@ fn run_launcher() -> Result<()> {
             .with_maximized(false)
             .with_min_inner_size([640.0, 420.0])
             .with_fullscreen(fullscreen)
+            .with_active(!minimized)
+            .with_visible(!minimized)
             .with_title(title),
         ..Default::default()
     };
@@ -231,7 +252,7 @@ fn run_launcher() -> Result<()> {
             }
             // Reapply after native window creation/restoration. Do this once;
             // the user can subsequently leave fullscreen using the normal controls.
-            app.request_startup_window(fullscreen);
+            app.request_startup_window(fullscreen, minimized);
             Box::new(app) as Box<dyn eframe::App>
         }),
     )

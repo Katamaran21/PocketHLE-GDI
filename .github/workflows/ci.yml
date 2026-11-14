@@ -128,11 +128,11 @@ jobs:
             cmake build-essential libclang-dev clang lld python3
       - name: build static FFmpeg
         run: bash tools/build-ffmpeg.sh x86_64-unknown-linux-gnu 4
-      - run: cargo build --workspace --release --locked
+      - run: cargo build --workspace --release --locked --features pocket-winceapi/unicorn-tests
       - name: run workspace tests sequentially
-        # Includes launcher profiles/controller navigation. Executable ARM
-        # diagnostics require the non-default arm-diagnostics feature.
-        run: cargo test --workspace --release --locked --no-fail-fast -- --test-threads=1
+        # Includes launcher navigation and synthetic ARM/Thumb callback ABI
+        # regressions. HARDWARE DIAG fixtures remain a separate opt-in feature.
+        run: cargo test --workspace --release --locked --features pocket-winceapi/unicorn-tests --no-fail-fast -- --test-threads=1
 
   build-unicorn:
     name: build with unicorn-engine
@@ -181,20 +181,20 @@ jobs:
           cargo build --release --locked -p pocket-desktop
       - name: stage artifacts
         run: |
-          mkdir -p dist/PocketHLE-linux
-          cp -R frontends/pocket-desktop/licenses dist/PocketHLE-linux/
-          cp LICENSE LICENSE-APACHE LICENSE-MIT dist/PocketHLE-linux/
-          cp target/cargo/release/pockethle dist/PocketHLE-linux/
-          cp target/cargo/release/pockethle-gui dist/PocketHLE-linux/
-          cp tools/install-desktop-entry.sh dist/PocketHLE-linux/
-          cp frontends/pocket-desktop/assets/pockethle-256.png dist/PocketHLE-linux/pockethle.png
-          cp README.md dist/PocketHLE-linux/
-          cp -f README.ru.md dist/PocketHLE-linux/ 2>/dev/null || true
-          tar -C dist -czf PocketHLE-linux-x86_64.tar.gz PocketHLE-linux
+          mkdir -p dist/PocketHLE-GDI-linux
+          cp -R frontends/pocket-desktop/licenses dist/PocketHLE-GDI-linux/
+          cp LICENSE LICENSE-APACHE LICENSE-MIT dist/PocketHLE-GDI-linux/
+          cp target/cargo/release/pockethle dist/PocketHLE-GDI-linux/
+          cp target/cargo/release/pockethle-gui dist/PocketHLE-GDI-linux/
+          cp tools/install-desktop-entry.sh dist/PocketHLE-GDI-linux/
+          cp frontends/pocket-desktop/assets/pockethle-256.png dist/PocketHLE-GDI-linux/pockethle.png
+          cp README.md dist/PocketHLE-GDI-linux/
+          cp -f README.ru.md dist/PocketHLE-GDI-linux/ 2>/dev/null || true
+          tar -C dist -czf PocketHLE-GDI-linux-x86_64.tar.gz PocketHLE-GDI-linux
       - uses: actions/upload-artifact@v4
         with:
-          name: PocketHLE-linux-x86_64
-          path: PocketHLE-linux-x86_64.tar.gz
+          name: PocketHLE-GDI-linux-x86_64
+          path: PocketHLE-GDI-linux-x86_64.tar.gz
 
   build-windows:
     name: build windows release artifacts
@@ -239,26 +239,27 @@ jobs:
       - name: stage artifacts
         shell: bash
         run: |
-          mkdir -p dist/PocketHLE-windows
-          cp -R frontends/pocket-desktop/licenses dist/PocketHLE-windows/
-          cp LICENSE LICENSE-APACHE LICENSE-MIT dist/PocketHLE-windows/
-          cp target/cargo/release/pockethle.exe dist/PocketHLE-windows/
-          cp target/cargo/release/pockethle-gui.exe dist/PocketHLE-windows/
-          cp README.md dist/PocketHLE-windows/
-          cp docs/STEAMDECK.md dist/PocketHLE-windows/README-SteamDeck.md
-          cp docs/WINDOWS-CE.md dist/PocketHLE-windows/README-Windows-CE.md
-          mkdir -p dist/PocketHLE-windows/profiles
-          cp profiles/wince6-portable.json dist/PocketHLE-windows/profiles/
-          cp profiles/wince6-native.json profiles/wince6-native-cerf.json dist/PocketHLE-windows/profiles/
-          cp -f README.ru.md dist/PocketHLE-windows/ 2>/dev/null || true
+          mkdir -p dist/PocketHLE-GDI-windows
+          cp -R frontends/pocket-desktop/licenses dist/PocketHLE-GDI-windows/
+          cp LICENSE LICENSE-APACHE LICENSE-MIT dist/PocketHLE-GDI-windows/
+          cp target/cargo/release/pockethle.exe dist/PocketHLE-GDI-windows/
+          cp target/cargo/release/pockethle-gui.exe dist/PocketHLE-GDI-windows/
+          cp README.md dist/PocketHLE-GDI-windows/
+          cp docs/STEAMDECK.md dist/PocketHLE-GDI-windows/README-SteamDeck.md
+          cp docs/WINDOWS-CE.md dist/PocketHLE-GDI-windows/README-Windows-CE.md
+          mkdir -p dist/PocketHLE-GDI-windows/profiles
+          cp profiles/wince6-portable.json dist/PocketHLE-GDI-windows/profiles/
+          cp profiles/wince6-native.json profiles/wince6-native-cerf.json dist/PocketHLE-GDI-windows/profiles/
+          cp profiles/wince6-cmd.json dist/PocketHLE-GDI-windows/profiles/
+          cp -f README.ru.md dist/PocketHLE-GDI-windows/ 2>/dev/null || true
       - name: zip artifacts
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/PocketHLE-windows/* -DestinationPath PocketHLE-windows-x86_64.zip
+          Compress-Archive -Path dist/PocketHLE-GDI-windows/* -DestinationPath PocketHLE-GDI-windows-x86_64.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: PocketHLE-windows-x86_64
-          path: PocketHLE-windows-x86_64.zip
+          name: PocketHLE-GDI-windows-x86_64
+          path: PocketHLE-GDI-windows-x86_64.zip
   build-android:
     name: build android APK
     runs-on: ubuntu-24.04
@@ -310,8 +311,8 @@ jobs:
           POCKETHLE_KEY_PASSWORD: ${{ secrets.POCKETHLE_KEY_PASSWORD }}
       - uses: actions/upload-artifact@v4
         with:
-          name: PocketHLE-android
-          path: dist/android/PocketHLE-*.apk
+          name: PocketHLE-GDI-android
+          path: dist/android/PocketHLE-GDI-*.apk
           if-no-files-found: error
 
   wince-source-and-profile:

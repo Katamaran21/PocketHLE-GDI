@@ -5,7 +5,13 @@ contracts, not a delivery log. Graphics authority and presentation are specified
 in [GPU.md](GPU.md); UI policy belongs to [FRONTENDS.md](FRONTENDS.md).
 The numbered contracts below retain their original numbers so references to
 sections in source comments remain meaningful. Missing historical numbers are
-preserved in [implementation notes](IMPLEMENTATION-NOTES.md#history-agents).
+preserved in [implementation notes](history/IMPLEMENTATION-NOTES.md#history-agents).
+
+Quick navigation: [invariants](#1-non-negotiable-invariants),
+[crate graph](#2-crate-graph), [contributor workflow](#14-working-on-this-repo),
+[CPU optimizations](#always-on-execution-optimizations),
+[primary references](#reference-resources). Build commands and publishing are
+maintained in [Build and release](BUILD.md).
 
 ## Documentation authority and scope
 
@@ -55,7 +61,7 @@ refactor.
    answer into the guest's IAT. A handler that needs to observe mutable
    state cannot be a constant.
 3. **The guest entry point is entered with `WinMain` arguments already in
-   registers.** The CE loader does this, so PocketHLE does too:
+   registers.** The CE loader does this, so PocketHLE-Reborn does too:
    `r0 = hInstance` (`PROCESS_INSTANCE_HANDLE`), `r1 = 0`,
    `r2 = lpCmdLine`, `r3 = nCmdShow` (`SW_SHOWNORMAL`). `lpCmdLine` is
    **always a valid pointer** — empty `L""` when there are no arguments,
@@ -139,6 +145,7 @@ frontends/  pocket-cli      pocket-desktop (egui)   pocket-android-jni
 | `pocket-winceapi` | The guest-facing API surface. One module per emulated DLL; registers handlers into `WinCeDispatcher`. |
 | `pocket-gles` | OpenGL ES 1.x emulation with software and native GPU backends: geometry, rasterization, textures, fixed-point and matrix math. Host-side only — knows nothing about guest memory. |
 | `pocket-core` | Wires loader + CPU + kernel + dispatcher into an `Emulator` the frontends drive. |
+| `pocket-netcf` | Executes supported Compact Framework IL and adapts managed APIs to shared host services. |
 | `pocket-library` | Game catalog: identifies titles, tracks install state and per-game metadata. |
 
 Frontends: `pocket-cli` (headless, scriptable — the one to use for
@@ -190,8 +197,8 @@ often ships one executable per 3D chip and leaves the choice to a setup
 DLL that runs at install time. Call of Duty 2's `SETUPDLL.999` probes
 `Software\NVIDIA Corporation\GFSDK` and `\Windows\wmv9decoder2700g.dll`,
 then renames `cod2_goforce.exe` or `cod2_gles.exe` over the `cod2.exe`
-its shortcut points at. PocketHLE runs no install-time DLLs, so following
-the shortcut lands on the software renderer — a correct run at 13.7 fps
+its shortcut points at. The isolated CAB registry setup cannot rename files,
+so following the shortcut lands on the software renderer — a correct run at 13.7 fps
 where the GoForce build does 39.1 fps on the same scenario, with the
 whole GL ES layer sitting unused.
 `pocket_library::accelerated_renderer_build` makes the choice the setup
@@ -205,6 +212,11 @@ answers `\Program Files\COD2\cod2.exe`. Pinned by
 `a_cabinet_that_ships_a_hardware_renderer_build_launches_it` and
 `the_driver_the_cabinet_ships_decides_between_two_hardware_builds`.
 
+CAB registry setup can execute ARM and Thumb callbacks with a staged registry
+and read-only package files. Check the dispatched API, since an installer can
+import functions it never invokes. Commit registry changes only after the
+callbacks complete successfully.
+
 `Process::map_into` (`crates/pocket-kernel/src/lib.rs:1453`) is the whole
 load path. In order:
 
@@ -214,7 +226,7 @@ load path. In order:
    the slot-0 alias window.
 3. Map the thunk pool, one `THUNK_STRIDE`-byte slot per import.
 4. Map the User KData page and prime the tick fields.
-5. For each import, pick **one** of the three strategies below and write
+5. For each import, pick **one** of the four strategies below and write
    the resulting address into `iat_va`.
 6. Register dynamic exports so `GetProcAddress` can resolve names that
    were never in the import directory.
@@ -223,14 +235,14 @@ The strategies, in the order they are tried:
 
 | Order | Strategy | Condition | Cost |
 | --- | --- | --- | --- |
-| 1 | **Native ARM/VFP code** written into the thunk slot | `native_thunks::native_thunk_for` returns code. Gated on `dll.eq_ignore_ascii_case("coredll.dll")` (`native_thunks.rs:225`) and **never** used for MIPS. | Zero host round-trips. `memcpy`, `strlen`, float helpers. |
+| 1 | **Native guest code** written into the thunk slot | The architecture-specific thunk generator supports the import. ARM COREDLL helpers can use ARM/VFP instructions; MIPS has its own native thunk table. | The native path runs without a host round trip. Hybrid memory helpers trap only on the fallback path. |
 | 2 | **Constant return**: `mov r0, #imm; bx lr` | Native declined *and* `cpu.arch() == Arm` *and* `Dispatcher::constant_for` answers. | Zero host round-trips. Derby's imports hit this ~33% of the time. |
-| 3 | **CPU-local exact 64-bit arithmetic** | ARM COREDLL `__rt_{s,u}{div,rem}64by64` on supported backends; static, ordinal and dynamic imports share installation. | Unicorn stops internally, calculates while stopped, resumes through padded `bx lr`, skipping kernel dispatch. Preserve the original slice deadline and clear hooks on unmap. |
+| 3 | **CPU-local register arithmetic** | ARM COREDLL wide division, remainder and conversion helpers, plus double-precision `sqrt`, `sin` and `cos`, on supported backends. | A Unicorn code callback computes the result and continues through a padded `bx lr` within the same backend run. The original slice deadline and guest floating-point state are preserved. Hooks are removed with their mappings. |
 | 4 | **`bx lr` + code hook** → Rust `Handler` | Everything else. `ARM_BX_LR` = `[0x1e, 0xff, 0x2f, 0xe1]`; MIPS gets `MIPS_JR_RA`. | One host call per guest call. |
 
 Strategy 2 is why invariant 2 exists: `constant_for` is consulted once,
-at load time, and its answer is frozen into guest memory. A handler whose
-return value depends on mutable state must be strategy 4.
+at load time, and its answer is frozen into guest memory. Reserve this strategy
+for answers that are independent of mutable state.
 
 The dynamic-export DLL list in step 6 is hard-coded at
 `crates/pocket-kernel/src/lib.rs:1620`: `coredll.dll`, `commctrl.dll`,
@@ -261,7 +273,7 @@ A handler returns a `DispatchOutcome` (`:521`):
 | `ReturnedR0(u32)` | Normal return. `void` handlers return 0; the guest ignores it. |
 | `ReturnedR0R1(u32, u32)` | 64-bit return, low word in r0. |
 | `JumpTo(va)` | Resume the guest at `va` instead of `LR`. Used to block modally by re-entering the same thunk — see `message_box_w`. |
-| `Halt(reason)` | Stop the run loop. `ExitProcess`, `TerminateProcess`. |
+| `Halt` | Stop the run loop. `ExitProcess`, `TerminateProcess`; the handler logs a reason and records the guest exit code separately. |
 
 **`resolve_handler` memoizes by `thunk_va` and import identity, including negative results**
 (`crates/pocket-winceapi/src/lib.rs:280`). Runtime DLL slots may be reused after `FreeLibrary`: the cached DLL,
@@ -290,7 +302,7 @@ One module per emulated DLL in `crates/pocket-winceapi/src/`: `aygshell`,
 
 ## 7. Two guest toolchains
 
-PocketHLE loads images from both the MSVC-era official toolchains and the
+PocketHLE-Reborn loads images from both the MSVC-era official toolchains and the
 open-source CeGCC / mingw32ce one. They differ in ways that reach the
 loader:
 
@@ -532,6 +544,12 @@ file and `resolve` would otherwise fail them.
 independent paths that mix together. Which one a game uses decides where
 a silence bug lives.
 
+CE system sounds use private wave streams, including on the AudioTap/Android
+path. `MessageBeep` is stateful, never an IAT constant. Preserve positional
+REG_MULTI_SZ silent slots, EventMask, and the independent application/event
+enable bits. PlaySound stop and wave-device closure must not flush unrelated
+audio. See [CE sound settings](WINDOWS-CE.md#desktop-behavior-and-control-panel).
+
 The WinMM mixer API exposes one virtual PCM mixer with a speaker destination,
 a connected stereo wave-output source and volume control. The implementation
 is `coredll/mixer.rs`: device enumeration, ID/open/close, capabilities, line and
@@ -663,8 +681,21 @@ object on every level change.
 **Voice groups.** `play_voice_with` takes `VoiceParams { looped, group,
 volume }`. The groups exist so `stopMusics` can silence music without
 cutting the sound effects that are still playing — JumpyBall calls it on
-every level change. Voice mixing is `#[cfg(feature = "audio-cpal")]`;
-without that feature `play_voice` degrades to `push_samples`.
+every level change. Voice mixing is shared by CPAL and Android's `AudioTap`:
+each voice retains its own sample rate and channel count and is resampled to the
+output format.
+Do not route PlaySound/HSS voices through the untyped legacy PCM ring. Fade
+alternates 22050 Hz menu effects and 8000 Hz sounds; interpreting both at the
+first announced output rate changes pitch and duration after a menu transition.
+Looping, gain, group pause/stop and channel configuration use the same mixer on
+both outputs. A waveOut-only flush preserves the output format while independent
+voices remain. Full engine flush clears those voices as well.
+
+The regression tests exercise the Android pull path without a physical device:
+repeat an effect after a lower-rate clip, mix mono/stereo sources and waveOut,
+preview without consumption, and preserve loop/group controls and cleanup.
+Source capture alone cannot validate this: it records each clip's input format,
+whereas the defect was in the samples delivered at the announced output rate.
 
 **`--dump-audio-to` records at submission time**, inside
 `add_voice`/`push_samples` — not as a real-time mixdown. A capture WAV
@@ -775,6 +806,13 @@ fixups, then discards the section payloads in Process.image. That object
 retains section metadata; resources move to KernelState.resources. The CPU
 keeps backing bytes only for pages not yet committed; see §19. MIPS and
 CPU wrappers without deferred-page support retain the eager fallback.
+
+For a CE Thumb-tagged image, valid packed `.pdata` function records select
+the entry's ARM/Thumb mode before falling back to instruction heuristics.
+CE's 8-byte function-table format must not be applied to ARMNT unwind records.
+The process retains the chosen mode before releasing section payloads; the main
+loop must not recompute it from the now-empty PE. CalNot's pimres.dll has an ARM
+leaf entry without a normal prologue despite its Thumb machine tag.
 
 Runtime modules retain their exact section and thunk mappings in
 `LoadedModule.resident_regions`. `FreeLibrary` decrements the load count;
@@ -891,14 +929,17 @@ new dependencies beside the importing DLL first (case-insensitive filename),
 then through the existing module search. Publish exports before traversing
 imports so cycles bind without allocating duplicate copies. Forwarder exports
 resolve through the complete native/HLE graph by name or ordinal, with bounded
-recursion and cycle detection. Invalid targets fail transactionally; static EXE
-import loading is not added by this runtime loader. Image page commitment follows §19.
+recursion and cycle detection. Invalid targets fail transactionally. Image page
+commitment follows §19.
+ARM EXEs with imports into supplied native DLL data sections use the same
+loader before entry. Bind their IAT slots and complete PROCESS_ATTACH before
+executing the EXE. Native function-only imports retain lazy dispatch.
 
 LoadedModule.dependencies stores unique native import edges. Its refcount
 counts explicit LoadLibrary references, not imported edges. A dependency first
 loaded by an import starts with zero explicit references. A cached explicit
 LoadLibrary adds one, even when the module originally came from an import.
-FreeLibrary collects modules unreachable from remaining explicit roots;
+FreeLibrary collects modules unreachable from remaining explicit or main-image roots;
 cycles are therefore reclaimed together without leaking reference counts.
 Resource satellites retain their existing owner-reference contract.
 
@@ -1021,10 +1062,13 @@ at teardown. No production instrumentation or game-name special case is added.
 
 Generic CreateProcessW launches a CPU/kernel on its own host thread. A shared
 handle domain assigns unique process/thread IDs and provides a gate around
-API dispatch and teardown. Do not hold this gate during guest CPU execution,
-frame hooks or startup acknowledgement: recursive SDCreateProcess and remote
-startup would deadlock. SDCreateProcess retains the preserved-parent foreground
-handoff, independent of the generic CreateProcessW behavior.
+API dispatch and teardown. A guest CPU slice also takes the gate when the
+process has mapped file views, because the CPU can access shared pages directly.
+Processes with private CPU mappings can run instruction slices in parallel.
+Frame hooks and startup acknowledgement run outside the gate so recursive
+SDCreateProcess and remote startup can proceed. SDCreateProcess retains the
+preserved-parent foreground handoff, independent of the generic CreateProcessW
+behavior.
 
 Creation is transactional: resolve/validate the image, construct the child,
 attach shared handles and physical RAM, initialize WinMain/GetCommandLineW,
@@ -1069,6 +1113,11 @@ and rejects nonempty directories. Rename must not overwrite a destination.
 Respect the most specific mount and canonical path boundary, including read-only
 overlays and symlinks. Find records carry the same attributes as attribute queries.
 Extra attributes are shared session state, not persistent filesystem metadata.
+
+VFS resolves exact paths across the eligible mounts before trying the recursive
+fallback. A read-only mount lazily keeps a list of candidate files for repeated
+fallback lookups. The ranking and ambiguity checks still run on the candidates.
+Exact lookups and writable mounts continue to observe the live filesystem.
 
 Flash Disk has a 32 MiB logical file-data quota, independent of physical RAM and
 the object store. Serialize size-growth validation with writes/truncation; count
@@ -1201,7 +1250,7 @@ Do not manufacture a message or FALSE return to yield. A main pump with parked
 live workers uses the bounded wait_display_until continuation after due-message
 processing and normal handoff. Existing single-thread behavior remains separate.
 The original experiment and its limited headless measurements are retained in
-[implementation notes](IMPLEMENTATION-NOTES.md#history-message-pump).
+[implementation notes](history/IMPLEMENTATION-NOTES.md#history-message-pump).
 
 Combined `MsgWaitForMultipleObjects[Ex]` waits retain their object handles,
 WAITALL policy and queue wake mask while parked. ANY wakes for either a ready
@@ -1240,6 +1289,16 @@ persistence regression. Full Android/desktop native builds and device gameplay
 remain to be checked. No build dependencies or lockfile changes.
 
 
+## CE device sessions
+
+The CE device context also shares reserved filesystem names, password-active
+metadata and virtual suspend generations between parent and child processes.
+`PowerOffSystem` pauses guest CPU slices while frontend stop/input polling remains
+available outside the execution gate. New key, stylus-down or text input resumes
+the device; stale queued input and pointer movement do not. Keep the waiting
+call's continuation until its original suspend generation finishes. Owner teardown
+releases its namespace and suspend state. See [CE services](WINDOWS-CE.md#ce-device-and-service-boundaries).
+
 ## Optional executable ARM diagnostics
 
 The `arm-diagnostics` feature on pocket-core, pocket-desktop and
@@ -1251,3 +1310,197 @@ CI retains unit tests, production CPU builds, native recording validation and
 the downloadable HARDWARE DIAG ZIP. It does not execute diagnostic ARM suites,
 run diagnostic Python ARM smoke tests, or ship fixtures between build jobs.
 Synthetic unit tests of CPU/API contracts remain ordinary unit tests.
+
+## Always-on execution optimizations
+
+Host optimizations are always active on desktop, Steam Deck and Android. There
+are no optimization switches in the settings, configuration model or execution
+policies. Legacy `optimizations` JSON members are ignored and dropped on save.
+These changes do not change the emulated CPU speed, FPS limit or FPS counter.
+
+| Optimization | Fixed behavior |
+| --- | --- |
+| Fast memory access | Repeated writes to private RAM without translated code use the fast path. Permissions, hooks, shared-memory handling and code invalidation still apply. |
+| Extended memory translation cache | Start with 4,096 entries and use a 4,096-entry resize floor. Allocation failure handling is preserved. |
+| Responsive thread scheduling | Recheck ready guest workers promptly when the main thread blocks in `GetMessageW`, using the existing wait continuation. |
+| Extended jump cache | Always use the build's full jump cache, consistently for lookup, insertion and invalidation. Standard builds have 65,536 entries. |
+| Batched image page loading | Deferred image accesses always use the batch materializer, retaining page budgets, permissions and unload behavior. |
+
+The old private Unicorn optimization control, conservative RAM flag, legacy jump
+execution/helper routines and message-pump specialization have been removed.
+
+MIPS uses the virtual TLB for flat process mappings when Unicorn accepts
+PocketHLE-Reborn's private mapping-only callback contract. The callback resolves page
+permissions without restoring guest branch state during a successful refill.
+Faults still restore the faulting instruction state, and MIPS page permissions
+remain explicit. Kernel segments, including the cached and uncached aliases
+of physical memory, still use architectural translation. Older native
+libraries fall back to the architectural TLB for all addresses.
+Set `POCKETHLE_CPU_TLB=1` before launch to force that fallback for diagnosis.
+ARM-only direct block chaining and lazy image paging remain architecture-guarded.
+
+`POCKETHLE_JUMP_CACHE_BITS=12`, `14` or `16` remains a build-time cache capacity,
+not a runtime switch.
+
+### Focused validation
+
+`tools/tests/unicorn-optimizations.c` verifies the fixed native path, including
+memory hooks, write protection, self-modifying code and shared host-RAM aliases.
+Its header contains a standalone build command. Rust CPU tests cover the ARM
+virtual-TLB integration, MIPS execution and image-page lifecycle/budget behavior.
+Configuration tests verify that old optimization switches are discarded.
+
+### Retained ARM-specific optimizations
+
+These are architecture-guarded fast paths, not user switches:
+
+- Recompute dynamic ARM/Thumb/IT/VFP inputs for the ARM TB lookup key; retain
+  fallback for XScale, M-profile, debugging and AArch64 states.
+- Use the finite normal float32-to-int32 truncation fast path only in its checked
+  magnitude range, preserving inexact flags and generic exceptional/boundary cases.
+- Permit inter-page direct ARM chaining only after the identity virtual-TLB
+  contract is installed. TLB-mode changes clear the contract and flush blocks.
+  CPU-TLB fallback and indirect calls keep their established behavior.
+- Keep Win64 link/unlink pointer atomics 64-bit. Preserve guest-code store,
+  permissions, unmap/remap and explicit host-code invalidation requirements.
+
+- Keep bounded ARM memory helpers in guest code. `memcpy` and `memmove`
+  handle up to 16 bytes and use a word-copy path for aligned 32-, 48- and
+  64-byte blocks. The larger fast path handles overlap in either direction.
+  Alignment failures, page-boundary cases, framebuffer destinations and
+  other sizes use the hooked host tail with the original arguments. Small
+  `memset` operations also use a bounded guest path.
+- On x86-64 hosts translating ARM32, emit the common stop check in translated
+  code. Test both the CPU-local exit flag and Unicorn's persistent stop
+  request. Actual exits still call the helper with a return address in the
+  translated block so Unicorn can restore the guest PC. The helper keeps
+  its own common return path separate from exit handling. Other host
+  backends keep the ordinary helper call.
+
+The private 0x5049 identity-mapping control is a retained optimization contract;
+the temporary 0x5048 profiling control, timing fields, sampling module and
+Cpu::take_backend_diagnostics are not production dependencies. Rejected division
+lowering and cache/hash experiments are not retained optimizations.
+
+Historical synthetic gains and original validation counts are recorded in
+[implementation notes](history/IMPLEMENTATION-NOTES.md#history-cpu). They are not a
+promise of the same speedup on games, Windows, Android or MIPS.
+
+### WinCE heap free-list coalescing
+
+The free list remains sorted by guest address and allocations keep first-fit
+order. Freeing a block merges only its immediate neighbours in the usual
+coalesced list. Adding a separately mapped arena can leave adjacent entries,
+so the next free retains the full coalescing pass in place. Page accounting,
+allocation addresses and guest-visible zero filling keep their established
+behavior.
+
+[Local Electopia and GLBenchmark measurements](history/VALIDATION.md#electopia-and-glbenchmark-optimization-validation)
+record the workload, renderer and experimental variants used during development.
+
+### Code-hook lookup cache
+
+The bundled Unicorn engine caches the first and last matching code-hook list
+nodes for repeated guest addresses. It retains registration order and the
+existing bounds/deletion checks. Hook addition, deletion and deferred cleanup
+invalidate the cache. A hook that mutates the list during its callback resumes
+the original traversal rather than skipping newly appended hooks.
+
+The cache is per engine, has 256 entries and is used only for non-sentinel code
+notifications with at least 16 code hooks. Smaller lists, other hook types and
+instruction-counter sentinel notifications retain the ordinary traversal. Full
+64-bit addresses and generations are checked; hash collisions cause a lookup,
+never a callback substitution. Nested callbacks use local bounds so a colliding
+inner lookup cannot replace the outer notification's remaining hooks.
+
+This changes host lookup work, not ARM arithmetic, translated-block validity,
+thread scheduling, guest timing or the presentation policy. It applies without
+application detection or settings. Storage costs 8 KiB per engine on 64-bit
+hosts (6 KiB with 32-bit pointers). Cold lookups can do more work than the old
+stop-at-first-callback walk; repeated import/helper addresses are the target.
+
+`tools/tests/unicorn-code-hooks.c` checks registration order, overlapping hooks,
+callback-time insertion/deletion, stop requests, deletion/re-registration, count
+mode, Thumb IT, wildcard hooks, independent engines, nested execution, full-width
+address collisions, AArch64 and MIPS. Its throughput test checks the same number
+of callbacks and is not a prediction of application FPS.
+
+Historical Q3CE measurements and their original validation limits are retained
+in [the validation archive](history/VALIDATION.md#q3ce-validation-2026-11-07).
+
+### Graphics paths
+
+Native shared-texture caching, stable-channel framebuffer feedback batching and
+NV sampler/uniform preparation are maintained in [GPU.md](GPU.md#nv-combiner-execution).
+They apply automatically when their rendering path is used. Renderer choice and
+the PocketPC NV extension compatibility gate remain separate supported settings;
+these optimizations do not add game-specific overrides or change frame limits.
+
+## Reference resources
+
+This document collects external resources that are useful when working on
+PocketHLE-Reborn — Windows Mobile / Pocket PC emulators, SDKs, and the relevant ARM
+and PE/COFF specifications.
+
+The links here are **for reference only**. Nothing in this repository
+distributes any Microsoft binary, SDK or game asset. Users have to supply
+their own legally obtained copies.
+
+### Microsoft emulators and SDKs
+
+These images / installers contain official Microsoft device emulators and
+Pocket PC / Windows Mobile SDKs that are useful for cross-checking PocketHLE-Reborn's
+behaviour against the real platform (e.g. running the same `.cab` inside the
+official Microsoft Device Emulator and comparing API behaviour).
+
+- Microsoft ARM WinCE 6 Emulator (+ random apps):
+  <https://archive.org/details/win-ce-6-emulator>
+- Microsoft Windows Mobile 2003 SE SDK with emulator:
+  <https://archive.org/details/PocketPC2003SDK>
+- Microsoft Windows Mobile 5 SDK with emulator:
+  <https://archive.org/details/WindowsMobile5.0PocketPCSDKAndEmulator>
+- Microsoft Windows Mobile 6.1 emulator:
+  <https://archive.org/details/WM614Emulator>
+- Microsoft Windows Mobile 6.5 Developer Toolkit:
+  <https://legacyupdate.net/download-center/download/17284/windows-mobile-6.5-developer-tool-kit>
+- Microsoft x86 WinCE 5 Emulator:
+  <https://archive.org/details/win-ce-5-emulator-fixed>
+- Windows CE Platform SDK (H/PC) 2.0 02/98:
+  <https://archive.org/details/MPLATSDK.20>
+
+### ARM architecture
+
+PocketHLE-Reborn runs ARMv4T / ARMv5TE code (the variants supported by Pocket PC
+2002, 2003 and Windows Mobile 5/6 devices). Pocket PC 2003 binaries make
+heavy use of the Thumb instruction set, so both manuals matter.
+
+- ARM Architecture Reference Manual (ARMv5TE):
+  <https://developer.arm.com/documentation/ddi0100/latest>
+- Thumb instruction set (PPC2003 code uses Thumb extensively):
+  <https://developer.arm.com/documentation/ddi0210/latest>
+- Calling convention / ABI overview (AAPCS for WinCE — note: differs slightly
+  from Linux EABI):
+  <https://learn.microsoft.com/en-us/cpp/build/overview-of-arm-abi-conventions>
+
+### PE / COFF on ARM WinCE
+
+PocketHLE-Reborn distinguishes ARM (`0x01C0`), THUMB (`0x01C2`) and ARMNT (`0x01C4`)
+PE machine tags. A machine tag alone does not determine the instruction mode
+of every function; preserve entry-point and interworking handling.
+
+- PE / COFF specification (includes `IMAGE_FILE_MACHINE_ARM = 0x01C0`):
+  <https://learn.microsoft.com/en-us/windows/win32/debug/pe-format>
+
+### Graphics and UI primary sources
+
+- [Khronos OpenGL ES registry](https://registry.khronos.org/OpenGL/index_es.php):
+  use the applicable ES 1.0/1.1 specification and extension contracts; a vendor
+  driver's observed behavior is separate compatibility evidence.
+- [egui 0.27.2 published source](https://docs.rs/crate/egui/0.27.2/source/):
+  inspect the pinned version rather than assuming current egui APIs match it.
+- [CERF design comparison](history/IMPLEMENTATION-NOTES.md#history-cerf): retained HLE
+  boundaries, VFS ideas and features explicitly not adopted.
+
+These links identify sources, not a claim that they were all fetched or verified
+online during this documentation-only review. No SDK/game/driver binaries are
+added by this change.

@@ -133,6 +133,13 @@ pub(crate) fn ensure_fb_mapped(ctx: &mut CallCtx<'_>) -> Result<(), KernelError>
             )?;
         }
     }
+    ctx.kernel.gx_readback_scratch.clone_from(
+        &ctx.kernel
+            .framebuffer
+            .cpu()
+            .map_err(KernelError::Dispatch)?
+            .pixels,
+    );
     ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
     ctx.kernel.fb_mapped = true;
     Ok(())
@@ -251,6 +258,13 @@ fn gx_begin_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
                 )?;
             }
         }
+        ctx.kernel.gx_readback_scratch.clone_from(
+            &ctx.kernel
+                .framebuffer
+                .cpu()
+                .map_err(KernelError::Dispatch)?
+                .pixels,
+        );
         ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
     }
     ctx.kernel.gx_draw_active = true;
@@ -555,16 +569,19 @@ pub(crate) mod tests {
             pending_startup: std::collections::VecDeque::new(),
             framebuffer: pocket_kernel::framebuffer::deferred::DeferredFramebuffer::default(),
             gdi: GdiState::new(),
+            console: pocket_kernel::console::State::default(),
             ce: pocket_kernel::ce::State::default(),
             resources: vec![],
             image_base: 0,
             image_size: 0,
             image_entry: 0,
+            image_version: 0x0004_0000,
             dynamic_exports: std::collections::HashMap::new(),
             image_imports: Vec::new(),
             gles_local_ordinals: std::collections::HashMap::new(),
             runtime_thunks: std::collections::HashMap::new(),
             module_attach_frames: Vec::new(),
+            static_module_roots: Vec::new(),
             dll_notification_frame: None,
             next_module_handle: 0x1000_0001,
             modules: Vec::new(),
@@ -575,6 +592,7 @@ pub(crate) mod tests {
             guest_fb_pitch: 0,
             direct_fb_frames: 0,
             gx_readback_scratch: Vec::new(),
+            gx_previous_readback: Vec::new(),
             gx_layout_scratch: Vec::new(),
             gapi_column_major: false,
             mem_op_scratch: Vec::new(),
@@ -641,6 +659,7 @@ pub(crate) mod tests {
             pending_input: std::collections::VecDeque::new(),
             stylus_stick: Default::default(),
             touch_steering: Default::default(),
+            virtual_tilt_axes: None,
             gapi_keys_queried: false,
             pocketpc_processor: None,
             gapi_action_key: pocket_kernel::gapi::VK_A,
@@ -656,11 +675,13 @@ pub(crate) mod tests {
             notification_icons: Default::default(),
             winsock_last_errors: Default::default(),
             crt_new_handler: 0,
+            crt_new_mode: 0,
             cpp_new_handler: 0,
             worker_schedule_cursor: 0,
             worker_round_seen: Vec::new(),
             worker_preempt_after_ms: 0,
             wait_deadlines: std::collections::HashMap::new(),
+            wait_retry_delay: None,
             guest_fpscr: std::collections::HashMap::new(),
             timer_period_requests: std::collections::BTreeMap::new(),
             critical_sections: std::collections::HashMap::new(),
@@ -691,7 +712,10 @@ pub(crate) mod tests {
             posted_messages: Default::default(),
             msg_queues: std::collections::HashMap::new(),
             next_msg_queue_handle: 0xDEAD_E500,
+            registry_notifications: Default::default(),
             power_notifications: Default::default(),
+            device_notification_queues: Default::default(),
+            next_device_notification: 0xda80_0000,
             battery_alerts: Default::default(),
             menus: std::collections::HashMap::new(),
             menu_items: std::collections::HashMap::new(),

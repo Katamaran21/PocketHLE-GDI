@@ -24,13 +24,15 @@ pub mod icon;
 pub use icon::{icon_from_pe_bytes, IconImage};
 
 pub mod resources;
+pub mod typelib;
 pub use resources::{collect_resources, ResourceEntry, ResourceKey};
 
 pub mod machine {
     /// Legacy ARM (`IMAGE_FILE_MACHINE_ARM`). Used by Pocket PC 2002 / 2003
     /// and most Windows Mobile 5/6 binaries — typically ARMv4T or ARMv5TE.
     pub const ARM: u16 = 0x01c0;
-    /// ARMv7 Thumb-2 (`IMAGE_FILE_MACHINE_THUMB`). Rare in WinCE.
+    /// ARM with Thumb interworking (`IMAGE_FILE_MACHINE_THUMB`).
+    /// CE images can still use an ARM entry stub with this machine tag.
     pub const THUMB: u16 = 0x01c2;
     /// `IMAGE_FILE_MACHINE_ARMNT` — Windows Phone 8 / WinRT.
     pub const ARMNT: u16 = 0x01c4;
@@ -119,6 +121,8 @@ pub struct LoadedImage {
     pub source_path: String,
     pub machine: u16,
     pub subsystem: u16,
+    /// Minimum subsystem version requested by the PE, used by GetProcessVersion.
+    pub subsystem_version: (u16, u16),
     pub image_base: u32,
     pub size_of_image: u32,
     /// Primary-thread stack reservation from the PE optional header.
@@ -140,6 +144,46 @@ pub struct LoadedImage {
 }
 
 impl LoadedImage {
+    /// CE's packed `.pdata` records describe the instruction set per function.
+    /// CalNot loads a Thumb-tagged pimres.dll whose DllMain is an ARM leaf;
+    /// its `cmp r1, #0` entry is not recognizable as a usual ARM prologue.
+    /// ARMNT uses a different unwind format and must keep its existing path.
+    pub fn ce_pdata_entry_uses_thumb(&self) -> Option<bool> {
+        if self.machine != machine::THUMB
+            || self.subsystem != subsystem::WINDOWS_CE_GUI
+            || self.entry_point == 0
+        {
+            return None;
+        }
+        let entry = self.image_base.checked_add(self.entry_point & !1)?;
+        let image_end = self.image_base.checked_add(self.size_of_image)?;
+        for section in &self.sections {
+            if section.name != ".pdata" {
+                continue;
+            }
+            let size = (section.virtual_size as usize).min(section.data.len());
+            for record in section.data[..size].chunks_exact(8) {
+                let start = LittleEndian::read_u32(&record[..4]) & !1;
+                let packed = LittleEndian::read_u32(&record[4..]);
+                let length = (packed >> 8) & 0x003f_ffff;
+                let arm = packed & (1 << 30) != 0;
+                let bytes = length.checked_mul(if arm { 4 } else { 2 })?;
+                let Some(end) = start.checked_add(bytes) else {
+                    continue;
+                };
+                if length != 0
+                    && start >= self.image_base
+                    && end <= image_end
+                    && entry >= start
+                    && entry < end
+                {
+                    return Some(!arm);
+                }
+            }
+        }
+        None
+    }
+
     pub fn entry_va(&self) -> u32 {
         let va = self.image_base.wrapping_add(self.entry_point);
         if self.machine == machine::THUMB || self.machine == machine::ARMNT {
@@ -198,6 +242,29 @@ pub fn file_resource<'a>(
     else {
         return Ok(None);
     };
+    resource_bytes(bytes, &pe, &entry).map(Some)
+}
+
+/// Read all resources of a named type without constructing a guest image.
+/// CE profile initialization uses embedded TYPELIB metadata to reconstruct
+/// missing registrations in its private registry, including Messenger's /2.
+pub fn file_resources<'a>(
+    bytes: &'a [u8],
+    ty: &ResourceKey,
+) -> Result<Vec<(ResourceKey, &'a [u8])>, LoadError> {
+    let pe = parse_wince_pe(bytes)?;
+    resources::collect_resources(bytes, &pe)?
+        .into_iter()
+        .filter(|entry| entry.ty == *ty)
+        .map(|entry| resource_bytes(bytes, &pe, &entry).map(|data| (entry.name, data)))
+        .collect()
+}
+
+fn resource_bytes<'a>(
+    bytes: &'a [u8],
+    pe: &PE<'_>,
+    entry: &ResourceEntry,
+) -> Result<&'a [u8], LoadError> {
     let invalid = || LoadError::SectionOob("resource outside file section".into());
     let section = pe
         .sections
@@ -216,7 +283,7 @@ pub fn file_resource<'a>(
         .checked_add(offset)
         .ok_or_else(invalid)? as usize;
     let end = start.checked_add(entry.size as usize).ok_or_else(invalid)?;
-    bytes.get(start..end).map(Some).ok_or_else(invalid)
+    bytes.get(start..end).ok_or_else(invalid)
 }
 
 /// Parse and lay out a PE32 image from raw bytes.
@@ -299,7 +366,9 @@ fn load_bytes_inner(
         {
             let camera_repaired = repair_arm_camera_preview(&mut data, va);
             if camera_repaired != 0 {
-                log::info!("enabled continuous camera preview in the matched Catapult ARM routine");
+                log::debug!(
+                    "enabled continuous camera preview in the matched Catapult ARM routine"
+                );
             }
             let repaired = repair_patched_arm_packed_eof(&mut data, va);
             if repaired != 0 {
@@ -323,6 +392,10 @@ fn load_bytes_inner(
         source_path: String::new(),
         machine,
         subsystem: subsys,
+        subsystem_version: (
+            oh.windows_fields.major_subsystem_version,
+            oh.windows_fields.minor_subsystem_version,
+        ),
         image_base,
         size_of_image,
         stack_reserve: oh.windows_fields.size_of_stack_reserve as u32,
@@ -966,6 +1039,7 @@ mod tests {
             source_path: String::new(),
             machine: machine::ARM,
             subsystem: subsystem::WINDOWS_CE_GUI,
+            subsystem_version: (4, 0),
             image_base: 0x100000,
             stack_reserve: 0x10000,
             size_of_image: 0x2000,
@@ -1084,6 +1158,7 @@ mod tests {
             source_path: "x".into(),
             machine: machine::ARM,
             subsystem: subsystem::WINDOWS_CE_GUI,
+            subsystem_version: (4, 0),
             image_base: 0x10000,
             stack_reserve: 0x10000,
             size_of_image: 0,

@@ -26,6 +26,7 @@ struct Window {
     nonclient: Option<Bitmap>,
     children: Vec<u32>,
     icon: Option<crate::imaging::Image>,
+    caret: Option<crate::caret::Caret>,
 }
 
 impl KernelState {
@@ -184,6 +185,17 @@ impl KernelState {
                     nonclient,
                     children,
                     icon: self.window_icon(hwnd).cloned(),
+                    caret: self
+                        .ce
+                        .carets
+                        .threads
+                        .values()
+                        .find(|caret| {
+                            caret.hwnd == hwnd
+                                && self.controls.focus == hwnd
+                                && caret.shown(std::time::Instant::now(), self.ce.carets.blink_ms)
+                        })
+                        .cloned(),
                 },
             );
         }
@@ -235,6 +247,10 @@ impl KernelState {
         for id in ids {
             let w = &windows[&id];
             (w.parent, w.rect, w.origin, w.style, &w.title, &w.menu).hash(&mut hash);
+            w.caret
+                .as_ref()
+                .map(|caret| (caret.position, caret.size, caret.gray, &caret.mask))
+                .hash(&mut hash);
             if let Some(icon) = &w.icon {
                 (
                     icon.width,
@@ -452,6 +468,9 @@ fn render_window(
             w.size.0.max(0) as u32,
             w.size.1.max(0) as u32,
         );
+    }
+    if let Some(caret) = &w.caret {
+        caret.render(s, w.origin);
     }
     let mut children = w.children.clone();
     children.sort_unstable();

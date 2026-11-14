@@ -32,9 +32,9 @@ internal data class GridInput(val source:String,val name:String) {
     })
     fun conflict(fullscreen:String?):String? {
         val input=canonical()
-        if(source=="keyboard" && input.name in listOf("ESCAPE","F7","F8","F9","F10","F11","F12")) return "This input is reserved by PocketHLE (Escape / F7–F12)."
-        if(source=="controller" && DeckInputPolicy.reserved(input.name,false)) return "This input is reserved by PocketHLE."
-        if(source=="controller" && fullscreen!=null && input==GridInput("controller",fullscreen).canonical()) return "This input is assigned to fullscreen in PocketHLE settings."
+        if(source=="keyboard" && input.name in listOf("ESCAPE","F7","F8","F9","F10","F11","F12")) return "This input is reserved by PocketHLE-Reborn (Escape / F7–F12)."
+        if(source=="controller" && DeckInputPolicy.reserved(input.name,false)) return "This input is reserved by PocketHLE-Reborn."
+        if(source=="controller" && fullscreen!=null && input==GridInput("controller",fullscreen).canonical()) return "This input is assigned to fullscreen in PocketHLE-Reborn settings."
         return null
     }
 }
@@ -47,25 +47,37 @@ internal class StylusGridConfig(var columns:Int=5,var rows:Int=4,val bindings:Mu
         }) }})
     }
     fun cellFor(input:GridInput,fullscreen:String?):Int? {
-        if((columns to rows) !in sizes || input.conflict(fullscreen)!=null) return null
+        if(!supports(columns, rows) || input.conflict(fullscreen)!=null) return null
         return bindings.firstOrNull{it.input.canonical()==input.canonical() && it.cell in 0 until columns*rows}?.cell
+    }
+    fun orient(portrait: Boolean) {
+        if (!supports(columns, rows) || (columns < rows) == portrait) return
+        bindings.removeAll { it.cell !in 0 until columns * rows }
+        for (index in bindings.indices) {
+            val binding = bindings[index]
+            bindings[index] = binding.copy(cell = (binding.cell % columns) * rows + binding.cell / columns)
+        }
+        val previousColumns = columns
+        columns = rows
+        rows = previousColumns
     }
     fun point(cell:Int)=( ((cell%columns)*2+1)*10000/(columns*2) ) to ( ((cell/columns)*2+1)*10000/(rows*2) )
     fun bind(cell:Int,input:GridInput,fullscreen:String?):String? {
+        if(!supports(columns, rows) || cell !in 0 until columns*rows) return "Invalid grid cell."
         input.conflict(fullscreen)?.let{return it}
-        if((columns to rows) !in sizes || cell !in 0 until columns*rows) return "Invalid grid cell."
         val canonical=input.canonical()
         bindings.removeAll {it.cell==cell || it.input.canonical()==canonical}
         bindings.add(GridBinding(cell,canonical));return null
     }
     companion object {
-        val sizes=listOf(4 to 3,5 to 4,6 to 5)
+        val sizes=listOf(4 to 3,5 to 4,6 to 5,7 to 6)
+        private fun supports(columns: Int, rows: Int) = (maxOf(columns, rows) to minOf(columns, rows)) in sizes
         fun parse(raw:String):StylusGridConfig {
             val obj=runCatching{JSONObject(raw)}.getOrDefault(JSONObject())
             val c=obj.optInt("columns",5);val r=obj.optInt("rows",4)
-            val grid=if((c to r) in sizes) StylusGridConfig(c,r) else StylusGridConfig()
+            val grid=if(supports(c, r)) StylusGridConfig(c,r) else StylusGridConfig()
             val list=obj.optJSONArray("bindings") ?: return grid
-            for(i in 0 until minOf(list.length(),30)) {
+            for(i in 0 until minOf(list.length(), grid.columns * grid.rows)) {
                 val b=list.optJSONObject(i) ?: continue;val input=b.optJSONObject("input") ?: continue
                 val source=input.optString("source");val name=input.optString("name")
                 if(source in listOf("keyboard","controller") && name.isNotEmpty()) grid.bind(b.optInt("cell",-1),GridInput(source,name),null)

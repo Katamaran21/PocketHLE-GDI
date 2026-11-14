@@ -3,6 +3,7 @@
 //! SDK ordinals and owned shell window identities.
 
 mod gesture;
+mod registry_notify;
 
 use pocket_kernel::gdi::STOCK_SYSTEM_FONT;
 use pocket_kernel::{DispatchOutcome, KernelError};
@@ -20,6 +21,7 @@ const SPI_GETSIPINFO: u32 = 0xE1;
 
 pub fn register(d: &mut WinCeDispatcher) {
     let dll = "aygshell.dll";
+    registry_notify::register(d);
     for f in [
         "SHInitExtraControls",
         "SHFindMenuBar",
@@ -78,7 +80,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // real handlers in the PPC2002 block below, which still answers
     // TRUE for 9 — so Pocket DeathMatch keeps the return value its
     // startup path checks.
-    for ord in [12u16, 13, 14, 21, 49, 50, 65, 71, 72, 80, 84, 341, 344] {
+    for ord in [12u16, 13, 14, 21, 49, 50, 65, 71, 72, 80, 84, 344] {
         d.register_handler(dll, &format!("ord:{ord}"), ok);
     }
     for (ordinal, handler) in [
@@ -404,6 +406,7 @@ fn sh_create_menu_bar(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             owner: parent,
             menu,
             sip: flags & 8 == 0 && !ctx.kernel.gdi.shell_menus.sip_button_hidden,
+            close_button: false,
             background,
         },
     );
@@ -432,8 +435,21 @@ pub(crate) fn menu_input(
     ctx.kernel.framebuffer.mark_dirty();
     use pocket_kernel::shell_menu::Action;
     match action {
-        Action::Command(owner, id) => Some(Some((owner, 0x111, id, 0))),
-        Action::Open(owner, menu) => Some(Some((owner, 0x117, menu, 0))),
+        Action::Close(owner) => Some(Some((owner, 0x10, 0, 0))),
+        Action::Command(owner, id) => {
+            crate::coredll::system_sound::play_event(
+                ctx.kernel,
+                pocket_kernel::system_sound::SystemEvent::MenuSelect,
+            );
+            Some(Some((owner, 0x111, id, 0)))
+        }
+        Action::Open(owner, menu) => {
+            crate::coredll::system_sound::play_event(
+                ctx.kernel,
+                pocket_kernel::system_sound::SystemEvent::MenuPopup,
+            );
+            Some(Some((owner, 0x117, menu, 0)))
+        }
         Action::Sip => {
             crate::shell_keyboard::sip_show(ctx, !ctx.kernel.shell_keyboard.visible);
             Some(None)
@@ -1095,6 +1111,7 @@ mod resource_and_focus_tests {
         kernel.resources.push(ResourceEntry {
             ty: ResourceKey::Name("GIF".into()),
             name: ResourceKey::Id(106),
+            native_leaves: Vec::new(),
             data_rva: 0x1000,
             size: bytes.len() as u32,
             codepage: 0,
@@ -1144,6 +1161,7 @@ mod resource_and_focus_tests {
         kernel.resources.push(ResourceEntry {
             ty: ResourceKey::Id(2),
             name: ResourceKey::Id(7),
+            native_leaves: Vec::new(),
             data_rva: 0x1000,
             size: dib.len() as u32,
             codepage: 0,
