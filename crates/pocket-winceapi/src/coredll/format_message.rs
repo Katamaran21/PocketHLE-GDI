@@ -697,6 +697,7 @@ mod tests {
             ty: ResourceKey::Id(11),
             name: ResourceKey::Id(1),
             data_rva: 0x2500,
+            native_leaves: Vec::new(),
             size: table.len() as u32,
             codepage: 0,
         });

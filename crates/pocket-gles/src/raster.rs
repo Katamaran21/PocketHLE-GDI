@@ -282,7 +282,48 @@ impl Default for PipelineState {
     }
 }
 
+const INTEL2700G_DEPTH_TOLERANCE_UNITS: f32 = 16.;
+
 impl PipelineState {
+    /// Empirical 2700G tolerance for nearly coplanar opaque fragments, including
+    /// reversed depth. THPS2 submits fixed-point projected decals whose depth
+    /// crosses their backing surface as the camera moves. This is a profile
+    /// approximation, not a measured MBX register value. Preserve the nearest
+    /// real depth and reject translucent fragments to avoid blending twice.
+    pub fn intel2700g_depth_color_pass(&self) -> Option<Self> {
+        if !self.intel2700g_depth_bias
+            || !self.depth_test
+            || !self.depth_write
+            || self.depth_range != (0., 1.)
+            || !matches!(self.depth_func, CompareFunc::Lequal | CompareFunc::Gequal)
+            || self.logic_op
+            || self.polygon_offset
+            || (self.blend
+                && (self.blend_src != BlendFactor::SrcAlpha
+                    || self.blend_dst != BlendFactor::OneMinusSrcAlpha))
+            || (self.alpha_test
+                && !self
+                    .alpha_func
+                    .test(255., (self.alpha_ref.clamp(0., 1.) * 255. + 0.5).floor()))
+            || !self.color_mask.iter().any(|enabled| *enabled)
+        {
+            return None;
+        }
+        let mut pass = self.clone();
+        pass.depth_write = false;
+        pass.alpha_test = true;
+        pass.alpha_func = CompareFunc::Equal;
+        pass.alpha_ref = 1.;
+        pass.polygon_offset = true;
+        pass.polygon_factor = 0.;
+        pass.polygon_units = if self.depth_func == CompareFunc::Gequal {
+            INTEL2700G_DEPTH_TOLERANCE_UNITS
+        } else {
+            -INTEL2700G_DEPTH_TOLERANCE_UNITS
+        };
+        Some(pass)
+    }
+
     /// The reference WinCE CL driver ignores factor and arithmetic-shifts its
     /// signed 16.16 units before encoding a sign + 16-bit magnitude register.
     pub fn polygon_offset_parameters(&self) -> (f32, f32) {
@@ -290,6 +331,16 @@ impl PipelineState {
             (0., self.polygon_units.floor().clamp(-65535., 65535.))
         } else {
             (self.polygon_factor, self.polygon_units)
+        }
+    }
+
+    /// Model the bias in the 16.16 domain of the 2700G primitive input,
+    /// independently of the precision advertised for its depth attachment.
+    pub fn polygon_offset_resolution(&self) -> f32 {
+        if self.intel2700g_depth_bias {
+            65536.
+        } else {
+            65535.
         }
     }
 
@@ -341,7 +392,11 @@ impl RenderTarget {
         if width == self.width && height == self.height {
             return;
         }
+        let has_depth = !self.depth.is_empty();
         *self = Self::with_format(width, height, self.rgb565);
+        if !has_depth {
+            self.depth.clear();
+        }
     }
 
     /// `glClear(GL_COLOR_BUFFER_BIT)` honouring the scissor box.
@@ -406,6 +461,9 @@ impl RenderTarget {
 
     /// `glClear(GL_DEPTH_BUFFER_BIT)` honouring the scissor box.
     pub fn clear_depth(&mut self, value: f32, scissor: Option<(i32, i32, i32, i32)>) {
+        if self.depth.is_empty() {
+            return;
+        }
         match self.scissor_bounds(scissor) {
             None => {}
             Some((x0, y0, x1, y1)) if self.covers_all(x0, y0, x1, y1) => {
@@ -536,9 +594,13 @@ fn evaluate_combiner(
     primary: [f32; 4],
     constants: [[f32; 4]; 4],
     framebuffer: [f32; 4],
-    coordinate: impl Fn(usize) -> (f32, f32, [f32; 4]),
+    coordinates: (
+        impl Fn(usize) -> (f32, f32, [f32; 4]),
+        impl Fn(usize, usize) -> f32,
+    ),
 ) -> Option<[f32; 4]> {
-    program.evaluate_fragment(primary, constants, framebuffer, |route| {
+    let (coordinate, interpolant) = coordinates;
+    program.evaluate_fragment(primary, constants, framebuffer, interpolant, |route| {
         let Some(stage) = stages.iter().find(|stage| stage.unit == route.texture) else {
             return [0., 0., 0., 1.];
         };
@@ -834,11 +896,7 @@ fn raster_clipped(
             - (sv[2].x - sv[0].x) * (sv[1].z - sv[0].z))
             / area;
         let (factor, units) = state.polygon_offset_parameters();
-        let resolution = if state.intel2700g_depth_bias {
-            16777215.
-        } else {
-            65535.
-        };
+        let resolution = state.polygon_offset_resolution();
         factor * dx.abs().max(dy.abs()) + units / resolution
     } else {
         0.
@@ -921,7 +979,10 @@ fn raster_clipped(
             // Coplanar UI layers otherwise fail LEQUAL at scattered pixels.
             let z = (sv[2].z + w0 * (sv[0].z - sv[2].z) + w1 * (sv[1].z - sv[2].z) + offset)
                 .clamp(0., 1.);
-            if state.depth_test && !state.depth_func.test(z, target.depth[idx]) {
+            if !target.depth.is_empty()
+                && state.depth_test
+                && !state.depth_func.test(z, target.depth[idx])
+            {
                 continue;
             }
 
@@ -954,12 +1015,13 @@ fn raster_clipped(
             // rather than up front, because an unused unit's coordinate
             // set must not cost anything per fragment.
             let primary = frag;
+            let interpolant = |unit: usize, c: usize| {
+                p0 * sv[0].texcoord[unit][c]
+                    + p1 * sv[1].texcoord[unit][c]
+                    + p2 * sv[2].texcoord[unit][c]
+            };
             let coordinate = |unit: usize| {
-                let uv = |c: usize| {
-                    p0 * sv[0].texcoord[unit][c]
-                        + p1 * sv[1].texcoord[unit][c]
-                        + p2 * sv[2].texcoord[unit][c]
-                };
+                let uv = |c: usize| interpolant(unit, c);
                 let inv_q = if projective_units & (1 << unit) == 0 {
                     1.
                 } else {
@@ -992,9 +1054,15 @@ fn raster_clipped(
                 } else {
                     [0.; 4]
                 };
-                let Some(color) =
-                    evaluate_combiner(program, sample, stages, primary, constants, dst, coordinate)
-                else {
+                let Some(color) = evaluate_combiner(
+                    program,
+                    sample,
+                    stages,
+                    primary,
+                    constants,
+                    dst,
+                    (coordinate, interpolant),
+                ) else {
                     continue;
                 };
                 frag = color;
@@ -1091,7 +1159,7 @@ fn write_fragment(
     if target.rgb565 {
         target.color[ci + 3] = 255;
     }
-    if state.depth_test && state.depth_write {
+    if !target.depth.is_empty() && state.depth_test && state.depth_write {
         target.depth[idx] = z;
     }
     true
@@ -1143,7 +1211,8 @@ fn primitive_fragment(
     sprite: Option<([f32; 2], f32)>,
 ) -> bool {
     let idx = y as usize * target.width as usize + x as usize;
-    if state.depth_test && !state.depth_func.test(z, target.depth[idx]) {
+    if !target.depth.is_empty() && state.depth_test && !state.depth_func.test(z, target.depth[idx])
+    {
         return false;
     }
     let coordinate = |unit: usize| {
@@ -1172,7 +1241,7 @@ fn primitive_fragment(
             } else {
                 [0.; 4]
             },
-            coordinate,
+            (coordinate, |unit, component| v.texcoord[unit][component]),
         ) else {
             return false;
         };
@@ -1535,6 +1604,58 @@ mod tests {
     }
 
     #[test]
+    fn intel_depth_tolerance_preserves_explicit_and_translucent_policies() {
+        let base = PipelineState {
+            depth_test: true,
+            depth_func: CompareFunc::Gequal,
+            intel2700g_depth_bias: true,
+            blend: true,
+            blend_src: BlendFactor::SrcAlpha,
+            blend_dst: BlendFactor::OneMinusSrcAlpha,
+            ..Default::default()
+        };
+        let pass = base.intel2700g_depth_color_pass().unwrap();
+        assert!(!pass.depth_write);
+        assert_eq!(
+            pass.polygon_units / pass.polygon_offset_resolution(),
+            1. / 4096.
+        );
+        assert_eq!(pass.alpha_func, CompareFunc::Equal);
+        assert_eq!(pass.alpha_ref, 1.);
+        assert!(pass.intel2700g_depth_color_pass().is_none());
+        for change in 0..10 {
+            let mut state = base.clone();
+            match change {
+                0 => state.intel2700g_depth_bias = false,
+                1 => state.depth_test = false,
+                2 => state.depth_write = false,
+                3 => state.depth_range = (0.2, 0.8),
+                4 => state.depth_func = CompareFunc::Greater,
+                5 => state.logic_op = true,
+                6 => state.polygon_offset = true,
+                7 => state.blend_dst = BlendFactor::One,
+                8 => {
+                    state.alpha_test = true;
+                    state.alpha_func = CompareFunc::Less;
+                    state.alpha_ref = 1.;
+                }
+                9 => state.color_mask = [false; 4],
+                _ => unreachable!(),
+            }
+            assert!(
+                state.intel2700g_depth_color_pass().is_none(),
+                "case {change}"
+            );
+        }
+        let mut forward = base;
+        forward.depth_func = CompareFunc::Lequal;
+        assert_eq!(
+            forward.intel2700g_depth_color_pass().unwrap().polygon_units,
+            -16.
+        );
+    }
+
+    #[test]
     fn intel2700g_depth_bias_matches_original_driver_integer_vectors() {
         let mut state = PipelineState::default();
         assert!(!state.intel2700g_depth_bias);
@@ -1590,6 +1711,43 @@ mod tests {
         }
         assert_eq!(scene(true), [0, 0, 255, 255]);
         assert_eq!(scene(false), [255, 0, 255, 255]);
+    }
+
+    #[test]
+    fn intel2700g_bias_uses_fixed_input_precision_not_depth_storage_precision() {
+        let mut target = RenderTarget::new(32, 32);
+        let mut state = PipelineState {
+            viewport: (0, 0, 32, 32),
+            depth_test: true,
+            intel2700g_depth_bias: true,
+            ..Default::default()
+        };
+        assert_eq!(state.depth_bits(), 24);
+        assert_eq!(state.polygon_offset_resolution(), 65536.);
+        let triangle = |z, color| {
+            [(-0.9, -0.9), (0.9, -0.9), (0., 0.9)].map(|(x, y)| primitive_vertex(x, y, z, color))
+        };
+        draw_triangle(
+            &mut target,
+            &state,
+            &|_, _, _| None,
+            &[],
+            triangle(0., [0., 0., 1., 1.]),
+        );
+        state.polygon_offset = true;
+        state.polygon_factor = -512.;
+        state.polygon_units = -32.;
+        draw_triangle(
+            &mut target,
+            &state,
+            &|_, _, _| None,
+            &[],
+            triangle(1. / 2048., [0., 1., 0., 1.]),
+        );
+        let pixel = (16 * 32 + 16) * 4;
+        assert_eq!(&target.color[pixel..pixel + 4], &[0, 255, 0, 255]);
+        state.intel2700g_depth_bias = false;
+        assert_eq!(state.polygon_offset_resolution(), 65535.);
     }
 
     #[test]

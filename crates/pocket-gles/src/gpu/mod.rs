@@ -1,5 +1,7 @@
 //! OpenGL 2.1 / GLES 2 offscreen rasterizer. Guest pointers never reach a driver.
+mod depth_bias;
 mod diagnostic;
+mod fixed_vertices;
 mod platform;
 mod readback;
 mod resolve;
@@ -9,7 +11,9 @@ mod transfer;
 pub use platform::PersistentSharedContext;
 pub use platform::SharedConsumer;
 pub use readback::SharedReadback;
-pub use shared::{SharedFrame, RGB565_DISPLAY_FRAGMENT, SHARED_DISPLAY_FRAGMENT};
+pub use shared::{
+    ProgrammableFrameExport, SharedFrame, RGB565_DISPLAY_FRAGMENT, SHARED_DISPLAY_FRAGMENT,
+};
 #[cfg(all(test, unix))]
 mod shared_display_tests;
 #[cfg(all(test, unix))]
@@ -30,6 +34,7 @@ use crate::{
 pub use platform::ExternalContext as ExternalGpuContext;
 #[cfg(unix)]
 pub use platform::ExternalContext as ExternalEglContext;
+pub use platform::Host as ProgrammableHost;
 use platform::Host;
 use std::cell::RefCell;
 thread_local! {
@@ -1387,6 +1392,7 @@ enum SpecializedShader {
 type ProgramState = (u32, HashMap<String, i32>, HashMap<i32, Vec<u32>>);
 
 pub struct Renderer {
+    renderer_name: String,
     diagnostic: Option<std::rc::Rc<RefCell<diagnostic::Timer>>>,
     host: Host,
     gl: Gl,
@@ -1427,6 +1433,7 @@ pub struct Renderer {
     color: u32,
     depth: u32,
     depth_format: u32,
+    depth_bias_step: Option<(u32, f32)>,
     white: u32,
     width: u32,
     height: u32,
@@ -1461,13 +1468,22 @@ pub struct Renderer {
     pub max_viewport: [i32; 2],
     pub subpixel_bits: i32,
 }
-fn render_scale_for(policy: u8, width: u32, height: u32) -> u32 {
-    match policy {
+const MAX_RENDER_DIMENSION: u32 = 8192;
+
+pub fn render_scale_for(policy: u8, width: u32, height: u32) -> u32 {
+    let scale = match policy {
         2 => 2,
+        6 => 3,
+        7 => 4,
         3 if matches!((width, height), (320, 240) | (240, 320)) => 2,
         4 if matches!((width, height), (320, 240) | (240, 320)) => 3,
         5 if matches!((width, height), (320, 240) | (240, 320)) => 4,
         _ => 1,
+    };
+    if width.max(height) > MAX_RENDER_DIMENSION / scale {
+        1
+    } else {
+        scale
     }
 }
 
@@ -1608,6 +1624,7 @@ impl Renderer {
             let compressed_formats = formats.into_iter().map(|n| n as u32).collect();
             let diagnostic = diagnostic::Timer::new(&host, &gl);
             let mut r = Self {
+                renderer_name: String::new(),
                 diagnostic,
                 host,
                 gl,
@@ -1645,6 +1662,7 @@ impl Renderer {
                 color: 0,
                 depth: 0,
                 depth_format: if depth24 { 0x81a6 } else { 0x81a5 },
+                depth_bias_step: None,
                 white: 0,
                 width: 0,
                 height: 0,
@@ -1808,10 +1826,36 @@ impl Renderer {
                 CStr::from_ptr(p.cast()).to_string_lossy().into_owned()
             };
             log::info!("GLES host OpenGL renderer: {label}");
+            r.renderer_name = label;
             r.check()?;
+            if r.native_fixed {
+                // An advertised format is insufficient: some hosts move exact
+                // 16.16 clip-boundary coordinates outside the visible volume.
+                // Keep the existing float conversion when native fetch differs.
+                r.native_fixed = match fixed_vertices::validate(&mut r) {
+                    Ok(valid) => valid,
+                    Err(error) => {
+                        log::warn!("Native GL_FIXED validation unavailable: {error}");
+                        false
+                    }
+                };
+                log::info!(
+                    "GLES GL_FIXED vertex conversion: {}",
+                    if r.native_fixed {
+                        "native (validated)"
+                    } else {
+                        "CPU float conversion (native validation failed)"
+                    }
+                );
+            }
             Ok(r)
         }
     }
+    /// Driver identity captured while this renderer's host context was current.
+    pub fn renderer_name(&self) -> &str {
+        &self.renderer_name
+    }
+
     unsafe fn compile_program(&mut self, vertex: &str, fragment: &str) -> Result<u32, String> {
         let program = (self.gl.CreateProgram)();
         if program == 0 {
@@ -2238,7 +2282,7 @@ impl Renderer {
         ]
     }
 
-    /// Policy 1=native, 2=double all, 3=double QVGA only, 4=triple QVGA only, 5=quadruple QVGA only. Guest sizes stay logical.
+    /// Apply the host resolution policy while keeping guest dimensions logical.
     pub fn set_render_scale(&mut self, policy: u8) -> Result<(), String> {
         self.render_policy = policy;
         let (w, h) = (
@@ -2268,7 +2312,7 @@ impl Renderer {
         let scale = render_scale_for(self.render_policy, logical_w, logical_h);
         let w = logical_w.checked_mul(scale).ok_or("GPU width overflow")?;
         let h = logical_h.checked_mul(scale).ok_or("GPU height overflow")?;
-        if w == 0 || h == 0 || w > 8192 || h > 8192 {
+        if w == 0 || h == 0 || w > MAX_RENDER_DIMENSION || h > MAX_RENDER_DIMENSION {
             return Err("unsupported GPU target size".into());
         }
         self.host.make_current()?;
@@ -2881,6 +2925,29 @@ impl Renderer {
         self.last_wide_draw = wide_draw;
         self.resize(target.width, target.height)?;
         self.host.make_current()?;
+        let (offset_factor, mut offset_units) = state.polygon_offset_parameters();
+        let compatibility_pass = (self.combiner.is_none()
+            && matches!(mode, GL_TRIANGLES | GL_TRIANGLE_STRIP | GL_TRIANGLE_FAN))
+        .then(|| state.intel2700g_depth_color_pass())
+        .flatten();
+        let mut replay_offset_units = compatibility_pass
+            .as_ref()
+            .filter(|pass| pass.polygon_offset)
+            .map_or(0., |pass| pass.polygon_offset_parameters().1);
+        if state.intel2700g_depth_bias
+            && ((state.polygon_offset && offset_units != 0.) || replay_offset_units != 0.)
+        {
+            let step = match self.depth_bias_step {
+                Some((format, step)) if format == self.depth_format => step,
+                _ => {
+                    let step = unsafe { depth_bias::measure(self)? };
+                    self.depth_bias_step = Some((self.depth_format, step));
+                    step
+                }
+            };
+            offset_units /= state.polygon_offset_resolution() * step;
+            replay_offset_units /= state.polygon_offset_resolution() * step;
+        }
         let _gpu_diagnostic = diagnostic::Timer::scope(&self.diagnostic);
         self.scratch.clear();
         // Packed guest streams already retain their native component count.
@@ -2929,6 +2996,7 @@ impl Renderer {
             && !state.logic_op
             && affine_texture_coordinates(vertices, stages, transforms, stream);
         let simple_eligible = self.simple_available
+            && replay_offset_units == 0.
             && affine
             && target.rgb565
             && !state.fog
@@ -2959,6 +3027,7 @@ impl Renderer {
             self.select_simple_program(false)?;
         }
         let untextured = combiner.is_none()
+            && replay_offset_units == 0.
             && !simple
             && stages.is_empty()
             && target.rgb565
@@ -3180,7 +3249,7 @@ impl Renderer {
                     h.saturating_mul(k),
                 );
                 self.scissor(state.scissor);
-                self.toggle(GL_DEPTH_TEST, state.depth_test);
+                self.toggle(GL_DEPTH_TEST, state.depth_test && !target.depth.is_empty());
                 (self.gl.DepthFunc)(compare(state.depth_func));
                 (self.gl.DepthMask)(state.depth_write as u8);
                 self.toggle(GL_BLEND, state.blend && !state.logic_op);
@@ -3205,13 +3274,7 @@ impl Renderer {
                     state.color_mask[3] as u8,
                 );
                 self.toggle(GL_POLYGON_OFFSET_FILL, state.polygon_offset);
-                let (factor, mut units) = state.polygon_offset_parameters();
-                // Preserve the virtual 24-bit constant bias on ES2 hosts that
-                // only provide a 16-bit depth attachment.
-                if state.intel2700g_depth_bias && self.depth_format == 0x81a5 {
-                    units *= 65535. / 16777215.;
-                }
-                (self.gl.PolygonOffset)(factor, units);
+                (self.gl.PolygonOffset)(offset_factor, offset_units);
                 self.pipeline = Some(state.clone());
             }
             let lighting = transforms.filter(|t| t.lighting.enabled);
@@ -3703,6 +3766,46 @@ impl Renderer {
                     (self.gl.DrawArrays)(draw_mode, 0, count as i32);
                 }
             }
+            if compatibility_pass.is_some() {
+                // Reuse uploaded vertices, indices, textures and shader uniforms.
+                // The nearest unbiased depth from the first pass remains intact.
+                (self.gl.DepthMask)(0);
+                if replay_offset_units != 0. {
+                    self.toggle(GL_POLYGON_OFFSET_FILL, true);
+                    (self.gl.PolygonOffset)(0., replay_offset_units);
+                    self.uniform_1i(self.loc("alphaMode"), 2);
+                    self.uniform_1f(self.loc("alphaRef"), 255.);
+                }
+                if indexed {
+                    let count = stream.map_or(self.indices.len(), |s| s.indices.len());
+                    (self.gl.DrawElements)(
+                        draw_mode,
+                        count as i32,
+                        GL_UNSIGNED_SHORT,
+                        std::ptr::null(),
+                    );
+                } else {
+                    let count = stream.map_or(self.scratch.len() / layout.floats, |s| s.count);
+                    (self.gl.DrawArrays)(draw_mode, 0, count as i32);
+                }
+                (self.gl.DepthMask)(state.depth_write as u8);
+                if replay_offset_units != 0. {
+                    self.toggle(GL_POLYGON_OFFSET_FILL, state.polygon_offset);
+                    (self.gl.PolygonOffset)(offset_factor, offset_units);
+                    self.uniform_1i(
+                        self.loc("alphaMode"),
+                        if state.alpha_test {
+                            compare(state.alpha_func) as i32 - GL_NEVER as i32
+                        } else {
+                            7
+                        },
+                    );
+                    self.uniform_1f(
+                        self.loc("alphaRef"),
+                        (state.alpha_ref.clamp(0., 1.) * 255. + 0.5).floor(),
+                    );
+                }
+            }
             self.dirty = true;
             // NVIDIA drivers can stall in glGetError after each draw. Check at
             // exports/reads/finish and explicit guest queries instead.
@@ -3769,10 +3872,10 @@ impl Renderer {
         Some((self.width, self.height))
     }
 
-    /// Publish top-down RGBA directly, preserving the old RGB565 display precision.
+    /// Publish top-down opaque RGBA at the actual surface precision.
     /// Uses the existing readback; introduces no GL call or synchronization.
     pub fn scaled_display_rgba_into(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
-        if self.render_scale == 1
+        if self.render_scale == 1 && self.rgb565
             || self.dirty
             || self.readback.len() != (self.width * self.height * 4) as usize
         {
@@ -3791,6 +3894,10 @@ impl Renderer {
             .zip(out.chunks_exact_mut(stride))
         {
             for (src, dst) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                if !self.rgb565 {
+                    dst.copy_from_slice(&[src[0], src[1], src[2], 255]);
+                    continue;
+                }
                 let r = src[0] >> 3;
                 let g = src[1] >> 2;
                 let b = src[2] >> 3;
@@ -4307,6 +4414,26 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::raster;
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires native OpenGL/GLES; cached host renderer identity"]
+    fn host_renderer_identity_matches_the_current_desktop_and_es_driver() {
+        for es in [false, true] {
+            let renderer = if es {
+                Renderer::new_es_for_test(8, 8).unwrap()
+            } else {
+                Renderer::new(8, 8).unwrap()
+            };
+            unsafe {
+                let ptr = (renderer.gl.GetString)(0x1f01);
+                assert!(!ptr.is_null());
+                let expected = CStr::from_ptr(ptr.cast()).to_string_lossy();
+                assert!(!expected.is_empty());
+                assert_eq!(renderer.renderer_name(), expected);
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     #[ignore = "requires native OpenGL/GLES; specialized fragment equivalence"]
@@ -6445,6 +6572,9 @@ mod tests {
                         GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT,
                     )
                     .unwrap();
+                    // Neither the profile alone nor an unbiased draw needs
+                    // any host resolution measurement.
+                    let previous_step = gpu.depth_bias_step;
                     let foreground = triangle([0., 0., 1., 1.], -0.2);
                     gpu.draw(
                         &target,
@@ -6456,6 +6586,7 @@ mod tests {
                         [0; 6],
                     )
                     .unwrap();
+                    assert_eq!(gpu.depth_bias_step, previous_step);
                     let mut light = triangle([1., 0., 0., 1.], 0.3);
                     light[0].pos[2] = 0.2;
                     light[1].pos[2] = 0.4;
@@ -6502,6 +6633,52 @@ mod tests {
                         &[0, 255, 0, 255],
                         "coplanar es={es} format={format:x} scale={scale}"
                     );
+                    let measured = gpu.depth_bias_step;
+                    assert_eq!(measured.map(|x| x.0), Some(format));
+                    // A slightly separated decal needs fixed-input bias, not
+                    // merely an offset large enough to separate identical Z.
+                    state.polygon_units = -32.;
+                    let light = triangle([1., 0., 0., 1.], -0.2 + 1. / 2048.);
+                    // Clear the earlier green triangle's biased depth and
+                    // repeat against the original unbiased surface.
+                    gpu.clear(
+                        32,
+                        32,
+                        &state,
+                        [0.; 4],
+                        1.,
+                        GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT,
+                    )
+                    .unwrap();
+                    state.polygon_offset = false;
+                    gpu.draw(
+                        &target,
+                        &state,
+                        GL_TRIANGLES,
+                        &foreground,
+                        &[],
+                        &HashMap::new(),
+                        [0; 6],
+                    )
+                    .unwrap();
+                    state.polygon_offset = true;
+                    gpu.draw(
+                        &target,
+                        &state,
+                        GL_TRIANGLES,
+                        &light,
+                        &[],
+                        &HashMap::new(),
+                        [0; 6],
+                    )
+                    .unwrap();
+                    gpu.read(&mut target).unwrap();
+                    assert_eq!(
+                        &target.color[pixel..pixel + 4],
+                        &[255, 0, 0, 255],
+                        "separated es={es} format={format:x} scale={scale}"
+                    );
+                    assert_eq!(gpu.depth_bias_step, measured);
                 }
             }
         }
@@ -7664,6 +7841,167 @@ mod tests {
         gpu.read(&mut target).unwrap();
         assert_eq!(target.color.len(), 64 * 48 * 4);
     }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires native GL/GLES; Intel opaque depth tolerance and state restoration"]
+    fn host_intel_depth_tolerance_preserves_depth_alpha_and_scaling() {
+        for es in [false, true] {
+            for format in [0x81a5, 0x81a6] {
+                for scale in [1, 2] {
+                    for rgb565 in [false, true] {
+                        for reversed in [false, true] {
+                            let mut gpu = if es {
+                                Renderer::with_host(Host::es_for_test().unwrap(), 32, 32).unwrap()
+                            } else {
+                                Renderer::new(32, 32).unwrap()
+                            };
+                            gpu.depth_format = format;
+                            gpu.resize(16, 16).unwrap();
+                            gpu.resize(32, 32).unwrap();
+                            gpu.set_render_scale(scale).unwrap();
+                            gpu.set_surface_rgb565(rgb565).unwrap();
+                            let error = if rgb565 { 5 } else { 1 };
+                            let mut state = PipelineState {
+                                viewport: (0, 0, 32, 32),
+                                depth_test: true,
+                                depth_func: if reversed {
+                                    CompareFunc::Gequal
+                                } else {
+                                    CompareFunc::Lequal
+                                },
+                                intel2700g_depth_bias: true,
+                                blend: true,
+                                blend_src: BlendFactor::SrcAlpha,
+                                blend_dst: BlendFactor::OneMinusSrcAlpha,
+                                ..Default::default()
+                            };
+                            let mut cpu = RenderTarget::with_format(32, 32, rgb565);
+                            let mut native = RenderTarget::with_format(32, 32, rgb565);
+                            let clear = if reversed { 0. } else { 1. };
+                            cpu.clear_depth(clear, None);
+                            gpu.clear(
+                                32,
+                                32,
+                                &state,
+                                [0.; 4],
+                                clear,
+                                GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT,
+                            )
+                            .unwrap();
+                            let sign = if reversed { -1. } else { 1. };
+                            // The color replay can expose the slightly separated decal,
+                            // but cannot move stored depth or accumulate the tolerance.
+                            // A half-transparent overlay must blend only once.
+                            for (z, color, expected) in [
+                                (0., [0., 0., 1., 1.], [0, 0, 255]),
+                                (sign * 0.0003, [1., 0., 0., 1.], [255, 0, 0]),
+                                (sign * 0.0007, [0., 1., 0., 1.], [255, 0, 0]),
+                                (sign * 0.0003, [0., 1., 0., 0.5], [255, 0, 0]),
+                                (0., [0., 1., 0., 0.5], [128, 128, 0]),
+                            ] {
+                                let vertices = triangle(color, z);
+                                raster::draw_triangle(
+                                    &mut cpu,
+                                    &state,
+                                    &|_, _, _| None,
+                                    &[],
+                                    vertices,
+                                );
+                                let pass = state.intel2700g_depth_color_pass().unwrap();
+                                raster::draw_triangle(
+                                    &mut cpu,
+                                    &pass,
+                                    &|_, _, _| None,
+                                    &[],
+                                    vertices,
+                                );
+                                gpu.draw(
+                                    &native,
+                                    &state,
+                                    GL_TRIANGLES,
+                                    &vertices,
+                                    &[],
+                                    &HashMap::new(),
+                                    [0; 6],
+                                )
+                                .unwrap();
+                                gpu.read(&mut native).unwrap();
+                                let at = (16 * 32 + 16) * 4;
+                                for (actual, label) in [
+                                    (&cpu.color[at..at + 3], "software"),
+                                    (&native.color[at..at + 3], "native"),
+                                ] {
+                                    for (a, e) in actual.iter().zip(expected) {
+                                        assert!(a.abs_diff(e)<=error,"{label} rgb565={rgb565} es={es} format={format:x} scale={scale} reversed={reversed} z={z} actual={actual:?}");
+                                    }
+                                }
+                                assert_eq!(cpu.depth[16 * 32 + 16], 0.5);
+                            }
+                            // The extra pass must restore depth writes, alpha testing,
+                            // polygon offset and uniform state before an ordinary draw.
+                            state.intel2700g_depth_bias = false;
+                            let nearer = triangle([0., 0., 1., 0.5], -sign * 0.01);
+                            let hidden = triangle([1., 1., 1., 1.], -sign * 0.005);
+                            for vertices in [nearer, hidden] {
+                                raster::draw_triangle(
+                                    &mut cpu,
+                                    &state,
+                                    &|_, _, _| None,
+                                    &[],
+                                    vertices,
+                                );
+                                gpu.draw(
+                                    &native,
+                                    &state,
+                                    GL_TRIANGLES,
+                                    &vertices,
+                                    &[],
+                                    &HashMap::new(),
+                                    [0; 6],
+                                )
+                                .unwrap();
+                            }
+                            gpu.read(&mut native).unwrap();
+                            let at = (16 * 32 + 16) * 4;
+                            let result = native.color[at..at + 3].to_vec();
+                            // Compare against ordinary coplanar draws on the same
+                            // format. Sequential RGB565 blends round differently
+                            // from RGBA8 and from software's intermediate rounding.
+                            gpu.clear(
+                                32,
+                                32,
+                                &state,
+                                [0.; 4],
+                                clear,
+                                GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT,
+                            )
+                            .unwrap();
+                            for vertices in [
+                                triangle([0., 0., 1., 1.], 0.),
+                                triangle([1., 0., 0., 1.], 0.),
+                                triangle([0., 1., 0., 0.5], 0.),
+                                nearer,
+                                hidden,
+                            ] {
+                                gpu.draw(
+                                    &native,
+                                    &state,
+                                    GL_TRIANGLES,
+                                    &vertices,
+                                    &[],
+                                    &HashMap::new(),
+                                    [0; 6],
+                                )
+                                .unwrap();
+                            }
+                            gpu.read(&mut native).unwrap();
+                            assert_eq!(result, native.color[at..at + 3]);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7681,6 +8019,8 @@ mod resolution_policy_tests {
         ] {
             assert_eq!(render_scale_for(1, size.0, size.1), 1);
             assert_eq!(render_scale_for(2, size.0, size.1), 2);
+            assert_eq!(render_scale_for(6, size.0, size.1), 3);
+            assert_eq!(render_scale_for(7, size.0, size.1), 4);
             assert_eq!(
                 render_scale_for(3, size.0, size.1),
                 if matches!(size, (320, 240) | (240, 320)) {
@@ -7707,6 +8047,8 @@ mod resolution_policy_tests {
             );
             assert_eq!(render_scale_for(99, size.0, size.1), 1);
         }
+        assert_eq!(render_scale_for(7, 2048, 1080), 4);
+        assert_eq!(render_scale_for(7, 2560, 1440), 1);
     }
     #[cfg(unix)]
     #[test]
@@ -7733,6 +8075,10 @@ mod resolution_policy_tests {
             assert_eq!((gpu.width, gpu.height), (480, 640));
             gpu.set_render_scale(2).unwrap();
             assert_eq!((gpu.width, gpu.height), (960, 1280));
+            gpu.set_render_scale(6).unwrap();
+            assert_eq!((gpu.width, gpu.height), (1440, 1920));
+            gpu.set_render_scale(7).unwrap();
+            assert_eq!((gpu.width, gpu.height), (1920, 2560));
             gpu.set_render_scale(1).unwrap();
             assert_eq!((gpu.width, gpu.height), (480, 640));
         }

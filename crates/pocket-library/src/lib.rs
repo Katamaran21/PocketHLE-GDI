@@ -31,9 +31,13 @@ use std::path::{Path, PathBuf};
 
 pub mod add_data;
 pub mod backup;
+pub mod cab_cleanup;
 pub mod center_tap;
 pub mod colors_save;
+pub mod frame_pacing;
 pub mod frame_rate;
+pub mod gpu_profile;
+pub mod import_setup;
 pub mod input_gestures;
 pub use frame_rate::FrameRateLimit;
 
@@ -49,6 +53,7 @@ pub use analysis::{analyze_game, detect_gizmondo_title_id, game_gizmondo_title_i
 pub mod gizmondo_titles;
 pub mod keybindings;
 pub mod save_data;
+pub mod session_diagnostic;
 pub mod stylus;
 pub mod stylus_grid;
 pub mod updates;
@@ -175,14 +180,17 @@ pub struct GameEntry {
 /// the card by an exact `GZxx######` directory, including empty serial
 /// directories in repacks. The legacy Alien Hominid repack is retained as a narrow fallback.
 pub fn is_gizmondo_game(entry: &GameEntry, library_root: &Path) -> bool {
+    is_gizmondo_at(entry, &entry.extracted_dir(library_root))
+}
+
+fn is_gizmondo_at(entry: &GameEntry, extracted: &Path) -> bool {
     if let Some(platform) = entry.platform {
         return platform == GamePlatform::Gizmondo;
     }
-    let extracted = entry.extracted_dir(library_root);
     entry.source_cab.starts_with("demo-card:")
         || entry.source_cab.starts_with("gzga-collection:")
         || is_gizmondo_title_id(&entry.id)
-        || has_gizmondo_marker(&extracted)
+        || has_gizmondo_marker(extracted)
         || (entry
             .source_cab
             .to_ascii_lowercase()
@@ -504,6 +512,9 @@ impl GameEntry {
     /// [`accelerated_renderer_build`].
     pub fn launch_path(&self, library_root: &Path) -> PathBuf {
         let exe = self.executable_path(library_root);
+        if self.settings.import_executable_selected {
+            return exe;
+        }
         accelerated_renderer_build(&exe).unwrap_or(exe)
     }
 
@@ -573,10 +584,71 @@ impl GameEntry {
         })
     }
 
+    /// CAB application-data directories need writable per-game storage
+    /// over the original files, even when the CAB has no SaveDir value.
+    pub fn application_data_mounts(&self, library_root: &Path) -> Vec<(String, PathBuf)> {
+        let save_prefix = self
+            .guest_launch_paths(library_root)
+            .map(|paths| paths.save_prefix);
+        self.install_dirs
+            .iter()
+            .filter_map(|prefix| {
+                if save_prefix.as_ref().is_some_and(|save| {
+                    save.trim_end_matches('\\')
+                        .eq_ignore_ascii_case(prefix.trim_end_matches('\\'))
+                }) {
+                    return None;
+                }
+                let prefix = prefix.trim_matches('\\');
+                let (root, suffix) = prefix.split_once('\\')?;
+                if !root.eq_ignore_ascii_case("Application Data") {
+                    return None;
+                }
+                let relative = backup::safe_path(&suffix.replace('\\', "/")).ok()?;
+                let path = self
+                    .save_dir(library_root)
+                    .join("application-data")
+                    .join(relative);
+                Some((format!("\\{prefix}\\"), path))
+            })
+            .collect()
+    }
+
+    pub fn my_documents_uses_separate_directory(&self, library_root: &Path) -> bool {
+        self.guest_launch_paths(library_root).is_none_or(|paths| {
+            !paths
+                .save_prefix
+                .trim_end_matches('\\')
+                .eq_ignore_ascii_case(r"\My Documents")
+        })
+    }
+
     pub fn guest_save_prefix(&self) -> Option<String> {
         self.save_prefix
             .clone()
             .or_else(|| self.guest_install_prefix())
+    }
+}
+
+/// Source of the PocketPC accelerometer readings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TiltInput {
+    #[default]
+    Accelerometer,
+    LeftRight,
+    FourDirections,
+}
+
+impl TiltInput {
+    pub const ALL: [Self; 3] = [Self::Accelerometer, Self::LeftRight, Self::FourDirections];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Accelerometer => "Use physical accelerometer",
+            Self::LeftRight => "Simulate left/right tilt",
+            Self::FourDirections => "Simulate tilt in four directions",
+        }
     }
 }
 
@@ -599,6 +671,8 @@ pub struct GameSettings {
     /// Display-relative arrows hold fixed touch zones; left-stick tilt controls position.
     #[serde(default)]
     pub pocketpc_touch_steering: bool,
+    #[serde(default)]
+    pub pocketpc_tilt_input: Option<TiltInput>,
     /// None migrates the legacy touch-steering checkbox without changing old games.
     #[serde(default)]
     pub pocketpc_controls: Option<stylus_grid::ControlsMode>,
@@ -632,9 +706,11 @@ pub struct GameSettings {
     /// Offer only RGBA8888 EGL surfaces. Opt-in PocketPC compatibility profile.
     #[serde(default)]
     pub pocketpc_egl_rgba8888_only: bool,
-    /// Experimental OpenGL host rasterization; None inherits the global choice.
+    /// PocketPC-only vendor compatibility, independent of the host renderer.
     #[serde(default)]
-    pub gpu_renderer: Option<bool>,
+    pub gpu_compatibility_profile: gpu_profile::GpuCompatibilityProfile,
+    #[serde(default)]
+    pub import_executable_selected: bool,
     /// Which CPU backend the user prefers for this game.
     #[serde(default)]
     pub cpu_backend: CpuBackendPref,
@@ -731,6 +807,23 @@ impl GameSettings {
             .fps()
     }
 
+    pub fn effective_tilt_input(&self, config: &LauncherConfig) -> TiltInput {
+        self.pocketpc_tilt_input
+            .unwrap_or(config.pocketpc_tilt_input)
+    }
+
+    pub fn effective_tilt_axes(
+        &self,
+        config: &LauncherConfig,
+    ) -> Option<pocket_kernel::accelerometer::TiltAxes> {
+        use pocket_kernel::accelerometer::TiltAxes;
+        match self.effective_tilt_input(config) {
+            TiltInput::Accelerometer => None,
+            TiltInput::LeftRight => Some(TiltAxes::Horizontal),
+            TiltInput::FourDirections => Some(TiltAxes::Both),
+        }
+    }
+
     pub fn controls_mode(&self) -> stylus_grid::ControlsMode {
         self.pocketpc_controls
             .unwrap_or(if self.pocketpc_touch_steering {
@@ -797,6 +890,7 @@ impl Default for GameSettings {
             storage_card_dir: None,
             frame_rate_limit: None,
             pocketpc_touch_steering: false,
+            pocketpc_tilt_input: None,
             pocketpc_controls: None,
             pocketpc_swap_button_groups: false,
             pocketpc_stylus_grid: Default::default(),
@@ -809,7 +903,8 @@ impl Default for GameSettings {
             pocketpc_platform_type: String::new(),
             pocketpc_gapi_columns: false,
             pocketpc_egl_rgba8888_only: false,
-            gpu_renderer: None,
+            gpu_compatibility_profile: Default::default(),
+            import_executable_selected: false,
             cpu_backend: CpuBackendPref::default(),
             max_slices: default_max_slices(),
             instructions_per_slice: default_instructions_per_slice(),
@@ -1008,12 +1103,18 @@ pub enum ScreenPref {
     Landscape,
     /// 176x220 — the small Smartphone panel.
     SmallPortrait,
+    /// 240x400 WQVGA Pocket PC display.
+    Wqvga,
+    /// 400x240 landscape WQVGA Pocket PC display.
+    WqvgaLandscape,
     /// 480x640 VGA Pocket PC display.
     Vga,
     /// 640x480 landscape VGA Pocket PC display.
     VgaLandscape,
     /// 480x800 WVGA Windows Phone display.
     Wvga,
+    /// 800x480 WVGA landscape display.
+    WvgaLandscape,
     /// 480x320 — the Handheld PC / H/PC landscape panel.
     ///
     /// Windows CE's bundled applets (Solitaire among them) are H/PC
@@ -1074,9 +1175,12 @@ impl ScreenPref {
             ScreenPref::Qvga => "240x320 (QVGA portrait)",
             ScreenPref::Landscape => "320x240 (landscape)",
             ScreenPref::SmallPortrait => "176x220 (small)",
+            ScreenPref::Wqvga => "240x400 (WQVGA portrait)",
+            ScreenPref::WqvgaLandscape => "400x240 (WQVGA landscape)",
             ScreenPref::Vga => "480x640 (VGA portrait)",
             ScreenPref::VgaLandscape => "640x480 (VGA landscape)",
-            ScreenPref::Wvga => "480x800 (WVGA)",
+            ScreenPref::Wvga => "480x800 (WVGA portrait)",
+            ScreenPref::WvgaLandscape => "800x480 (WVGA landscape)",
             ScreenPref::Hpc => "480x320 (Handheld PC)",
         }
     }
@@ -1087,9 +1191,12 @@ impl ScreenPref {
             ScreenPref::Portrait | ScreenPref::Qvga => (240, 320),
             ScreenPref::Landscape => (320, 240),
             ScreenPref::SmallPortrait => (176, 220),
+            ScreenPref::Wqvga => (240, 400),
+            ScreenPref::WqvgaLandscape => (400, 240),
             ScreenPref::Vga => (480, 640),
             ScreenPref::VgaLandscape => (640, 480),
             ScreenPref::Wvga => (480, 800),
+            ScreenPref::WvgaLandscape => (800, 480),
             ScreenPref::Hpc => (480, 320),
         }
     }
@@ -1171,13 +1278,8 @@ pub struct LauncherConfig {
 
     #[serde(default = "default_pocketpc_processor")]
     pub pocketpc_processor: String,
-    /// Reproduce the Intel 2700G WinCE driver's constant polygon depth bias.
-    /// All PocketPC applications may opt in; Gizmondo always keeps standard ES.
     #[serde(default)]
-    pub pocketpc_intel2700g_depth_bias: bool,
-    /// Allow detected PocketPC clients to use NVIDIA AR10/AR11 programs.
-    #[serde(default = "default_pocketpc_nv_combiners")]
-    pub pocketpc_nv_combiners: bool,
+    pub pocketpc_tilt_input: TiltInput,
     #[serde(default = "default_recording_format")]
     pub recording_format: String,
     /// Video recording JPEG quality preset: low, medium or high.
@@ -1193,12 +1295,15 @@ pub struct LauncherConfig {
     pub gizmondo_platform_id: String,
     #[serde(default)]
     pub gizmondo_identity_revision: u8,
-    /// Host GPU rendering is enabled by default; games may override it.
+    /// Host GPU rendering for GLES 1.x is enabled by default.
     #[serde(default = "default_gpu_renderer")]
     pub gpu_renderer: bool,
-    /// Host-only GLES resolution: 1=native, 2=double all, 3=double QVGA only, 4=triple QVGA only, 5=quadruple QVGA only.
+    /// Host-only GLES resolution policy. Values 1–7 are stable across releases.
     #[serde(default = "default_gles_internal_resolution")]
     pub gles_internal_resolution: u8,
+    /// One-time first-import setup completion, independent for each platform.
+    #[serde(default)]
+    pub first_import_setup: import_setup::Completed,
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     /// Default CPU backend used when importing a new game.
@@ -1457,6 +1562,31 @@ fn default_fullscreen_mode() -> String {
 }
 
 impl LauncherConfig {
+    /// Decode the stable resolution policy into a multiplier and surface scope.
+    pub fn gles_resolution_selection(&self) -> (u8, bool) {
+        match self.gles_internal_resolution {
+            2 => (2, true),
+            3 => (2, false),
+            4 => (3, false),
+            5 => (4, false),
+            6 => (3, true),
+            7 => (4, true),
+            _ => (1, false),
+        }
+    }
+
+    pub fn set_gles_resolution_selection(&mut self, scale: u8, all: bool) {
+        self.gles_internal_resolution = match (scale, all) {
+            (2, true) => 2,
+            (2, false) => 3,
+            (3, false) => 4,
+            (4, false) => 5,
+            (3, true) => 6,
+            (4, true) => 7,
+            _ => 1,
+        };
+    }
+
     /// Effective PocketPC stylus keyboard inputs are unavailable to per-game grids.
     /// Explicit guest overrides free an old direction key for another purpose.
     pub fn stylus_keyboard_reserved(&self, key: &str) -> bool {
@@ -1487,10 +1617,6 @@ fn default_pocketpc_processor() -> String {
     "pxa270".into()
 }
 
-fn default_pocketpc_nv_combiners() -> bool {
-    true
-}
-
 fn default_desktop_vsync() -> bool {
     true
 }
@@ -1507,8 +1633,7 @@ impl Default for LauncherConfig {
             frame_rate_limit: FrameRateLimit::Fps60,
             desktop_vsync: true,
             pocketpc_processor: default_pocketpc_processor(),
-            pocketpc_intel2700g_depth_bias: false,
-            pocketpc_nv_combiners: true,
+            pocketpc_tilt_input: TiltInput::default(),
             recording_quality: default_recording_quality(),
             recording_format: default_recording_format(),
             device_preset_id: default_device_preset_id(),
@@ -1518,6 +1643,7 @@ impl Default for LauncherConfig {
             gizmondo_identity_revision: identity_revision(),
             gpu_renderer: true,
             gles_internal_resolution: 1,
+            first_import_setup: Default::default(),
             schema_version: 1,
             default_cpu_backend: CpuBackendPref::default(),
             verbosity: 1,
@@ -1597,6 +1723,65 @@ pub struct PreparedImport {
     entries: Vec<GameEntry>,
     updates: Vec<GameEntry>,
     cabinet_choices: Vec<InstallerCabinetChoice>,
+    executable_choices: Vec<ImportExecutableChoice>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportExecutableChoice {
+    pub id: String,
+    pub display_name: String,
+    pub executables: Vec<PathBuf>,
+}
+
+fn import_executable_choices(
+    root: &Path,
+    entries: &[GameEntry],
+    updates: &[GameEntry],
+) -> Vec<ImportExecutableChoice> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            if is_gizmondo_game(entry, root)
+                || updates
+                    .iter()
+                    .any(|old| old.id == entry.id && old.platform == Some(GamePlatform::Gizmondo))
+            {
+                return None;
+            }
+            let directory = root.join(entry.relative_dir());
+            let mut executables = launch_executables_in(&directory).ok()?;
+            if executables.len() < 2 {
+                return None;
+            }
+            if let Some(index) = executables
+                .iter()
+                .position(|path| *path == entry.executable)
+            {
+                executables.swap(0, index);
+            }
+            Some(ImportExecutableChoice {
+                id: entry.id.clone(),
+                display_name: entry.display_name.clone(),
+                executables,
+            })
+        })
+        .collect()
+}
+
+fn launch_executables_in(directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let extracted = directory.join("extracted");
+    if !pocket_cab::plain_path_below(directory, &extracted, true) {
+        return Ok(Vec::new());
+    }
+    Ok(import_tree_files(&extracted)?
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+                && is_guest_exe(path)
+        })
+        .filter_map(|path| path.strip_prefix(directory).ok().map(Path::to_path_buf))
+        .collect())
 }
 
 /// A CPU cabinet offered by an installer, with matching CPU-neutral resources.
@@ -1614,6 +1799,30 @@ pub struct InstallerCabinetChoice {
 }
 
 impl PreparedImport {
+    pub fn executable_choices(&self) -> &[ImportExecutableChoice] {
+        &self.executable_choices
+    }
+
+    pub fn choose_executable(&mut self, id: &str, index: usize) -> bool {
+        let Some(position) = self
+            .executable_choices
+            .iter()
+            .position(|choice| choice.id == id)
+        else {
+            return false;
+        };
+        let Some(executable) = self.executable_choices[position].executables.get(index) else {
+            return false;
+        };
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        entry.executable = executable.clone();
+        entry.settings.import_executable_selected = true;
+        self.executable_choices.remove(position);
+        true
+    }
+
     pub fn cabinet_choices(&self) -> &[InstallerCabinetChoice] {
         &self.cabinet_choices
     }
@@ -1635,6 +1844,8 @@ impl PreparedImport {
                 updates.push(previous);
             }
         }
+        self.executable_choices =
+            import_executable_choices(self.staging.path(), &entries, &updates);
         self.entries = entries;
         self.updates = updates;
         self.cabinet_choices.clear();
@@ -1666,6 +1877,9 @@ impl PreparedImport {
         }
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
             entry.platform = Some(platform);
+            if platform == GamePlatform::Gizmondo {
+                self.executable_choices.retain(|choice| choice.id != id);
+            }
             return true;
         }
         false
@@ -1711,8 +1925,8 @@ impl LauncherProfile {
 /// launcher has always used:
 ///
 /// 1. the `POCKETHLE_LIBRARY` environment variable,
-/// 2. `<documents>/PocketHLE` (e.g. `~/Documents/PocketHLE`),
-/// 3. `<data_dir>/PocketHLE/library` (XDG / `%APPDATA%`),
+/// 2. `<documents>/PocketHLE-Reborn`,
+/// 3. the PocketHLE-Reborn project data directory (XDG / `%APPDATA%`),
 /// 4. `./pockethle-library` as a last resort.
 ///
 /// Lives here rather than in a frontend so the CLI's `import` command
@@ -1723,13 +1937,55 @@ pub fn default_library_root() -> PathBuf {
     }
     if let Some(dirs) = directories::UserDirs::new() {
         if let Some(docs) = dirs.document_dir() {
-            return docs.join("PocketHLE");
+            return migrate_default_root(docs.join("PocketHLE"), docs.join("PocketHLE-Reborn"));
         }
     }
-    if let Some(dirs) = directories::ProjectDirs::from("ai", "PocketHLE", "PocketHLE") {
-        return dirs.data_dir().join("library");
+    if let (Some(old), Some(new)) = (
+        directories::ProjectDirs::from("ai", "PocketHLE", "PocketHLE"),
+        directories::ProjectDirs::from("ai", "PocketHLE", "PocketHLE-Reborn"),
+    ) {
+        return migrate_default_root(old.data_dir().to_owned(), new.data_dir().to_owned())
+            .join("library");
     }
     PathBuf::from("./pockethle-library")
+}
+
+fn migrate_default_root(old: PathBuf, new: PathBuf) -> PathBuf {
+    use std::io::ErrorKind;
+
+    match fs::symlink_metadata(&new) {
+        Ok(_) => return new,
+        Err(error) if error.kind() != ErrorKind::NotFound => return old,
+        Err(_) => {}
+    }
+    match fs::symlink_metadata(&old) {
+        Err(error) if error.kind() == ErrorKind::NotFound => new,
+        Ok(metadata) if metadata.is_dir() => match fs::rename(&old, &new) {
+            Ok(()) => new,
+            // Another process may have moved the same library first.
+            Err(_) if !old.exists() && new.is_dir() => new,
+            Err(_) => old,
+        },
+        _ => old,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn migrates_default_library_once_without_merging_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let old = temp.path().join("PocketHLE");
+    let new = temp.path().join("PocketHLE-Reborn");
+    assert_eq!(migrate_default_root(old.clone(), new.clone()), new);
+    fs::create_dir_all(old.join("games")).unwrap();
+    fs::write(old.join("games").join("save"), b"save").unwrap();
+    assert_eq!(migrate_default_root(old.clone(), new.clone()), new);
+    assert!(!old.exists());
+    assert_eq!(fs::read(new.join("games").join("save")).unwrap(), b"save");
+    fs::create_dir(&old).unwrap();
+    fs::write(old.join("library.json"), b"legacy").unwrap();
+    assert_eq!(migrate_default_root(old.clone(), new.clone()), new);
+    assert_eq!(fs::read(old.join("library.json")).unwrap(), b"legacy");
 }
 
 impl Library {
@@ -1772,6 +2028,7 @@ impl Library {
                 entries: Vec::new(),
                 updates: Vec::new(),
                 cabinet_choices: choices.clone(),
+                executable_choices: Vec::new(),
                 staging,
             });
         }
@@ -1805,6 +2062,7 @@ impl Library {
                 updates.push(previous);
             }
         }
+        let executable_choices = import_executable_choices(staging.path(), &entries, &updates);
         Ok(PreparedImport {
             staging,
             target_root: self.root.clone(),
@@ -1813,6 +2071,7 @@ impl Library {
             entries,
             updates,
             cabinet_choices: Vec::new(),
+            executable_choices,
         })
     }
 
@@ -1855,7 +2114,16 @@ impl Library {
                     fs::remove_dir_all(incoming_saves)?;
                 }
             }
+            let selected = entry.settings.import_executable_selected;
+            if previous.is_none() {
+                entry.settings.gpu_compatibility_profile = Default::default();
+            }
             self.preserve_import_preferences(&mut entry, previous.as_ref(), &directory)?;
+            entry.settings.import_executable_selected |= selected;
+            if selected {
+                entry.icon =
+                    extract_icon_png(&directory, &directory.join(&entry.executable)).or(entry.icon);
+            }
             write_json(&directory.join("game.json"), &entry)?;
             prepared.push((entry, directory, previous));
         }
@@ -2109,8 +2377,9 @@ impl Library {
         // import that skips this step ends up with a directory of
         // `00000RAY.004`-style names the game cannot open.
         let structured_header = header.as_ref().filter(|h| h.structured);
+        let mut header_names = Vec::new();
         if let Some(h) = structured_header {
-            pocket_cab::materialise_install_header_names(&extracted_dir, &files, h);
+            header_names = pocket_cab::materialise_install_header_names(&extracted_dir, &files, h);
         } else {
             materialise_legacy_assets(
                 &extracted_dir,
@@ -2240,6 +2509,20 @@ impl Library {
         if let Some(header) = header.as_ref().filter(|h| h.structured) {
             register_cab_install_dir(&mut registry, header);
         }
+        let screen = guess_screen(
+            &exe_abs,
+            &files,
+            header.as_ref().and_then(|h| h.app_name.as_deref()),
+        );
+        let mut installed_names = long_names;
+        installed_names.extend(header_names);
+        pocket_cab::remove_materialised_cab_sources(
+            &extracted_dir,
+            setup.as_ref(),
+            structured_header,
+            &installed_names,
+            &exe_abs,
+        )?;
         let entry = GameEntry {
             platform: None,
             id: id.clone(),
@@ -2263,11 +2546,7 @@ impl Library {
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
-                screen: guess_screen(
-                    &exe_abs,
-                    &files,
-                    header.as_ref().and_then(|h| h.app_name.as_deref()),
-                ),
+                screen,
                 ..GameSettings::default()
             },
             icon: extract_icon_png(&game_dir, &exe_abs),
@@ -2753,6 +3032,9 @@ impl Library {
                 }
             }
         }
+        if previous.is_none() {
+            apply_import_gpu_default(entry, staged);
+        }
         let gizmondo = entry.source_cab.starts_with("gzga-collection:")
             || is_gizmondo_title_id(&entry.id)
             || has_gizmondo_marker(&staged.join("extracted"));
@@ -3139,6 +3421,11 @@ impl Library {
     /// existing game with the same id.
     fn commit_entry(&mut self, id: &str, mut entry: GameEntry) -> Result<&GameEntry, LibraryError> {
         let game_dir = self.root.join("games").join(id);
+        if let Some(previous) = self.library.games.iter().find(|game| game.id == id) {
+            entry.settings.gpu_compatibility_profile = previous.settings.gpu_compatibility_profile;
+        } else {
+            apply_import_gpu_default(&mut entry, &game_dir);
+        }
         if !is_gizmondo_game(&entry, &self.root)
             && entry.executable.file_stem().is_some_and(|name| {
                 name.to_string_lossy()
@@ -3232,11 +3519,73 @@ impl Library {
         let game = self
             .get_mut(id)
             .ok_or_else(|| LibraryError::NotFound(id.to_string()))?;
+        let selected_executable = game.settings.import_executable_selected;
         game.settings = settings;
+        game.settings.import_executable_selected = selected_executable;
         let cloned = game.clone();
         let game_dir = self.root.join("games").join(id);
         write_json(&game_dir.join("game.json"), &cloned)?;
         self.save()
+    }
+
+    pub fn launch_executables(&self, id: &str) -> Result<Vec<PathBuf>, LibraryError> {
+        let game = self
+            .get(id)
+            .ok_or_else(|| LibraryError::NotFound(id.into()))?;
+        if is_gizmondo_game(game, &self.root) {
+            return Err(LibraryError::InvalidSettings(
+                "This option is for Pocket PC games.".into(),
+            ));
+        }
+        Ok(launch_executables_in(&self.root.join(game.relative_dir()))?)
+    }
+
+    pub fn switch_launch_executable(&mut self, id: &str, path: &Path) -> Result<(), LibraryError> {
+        use gpu_profile::GpuCompatibilityProfile::Generic;
+
+        let original = self
+            .get(id)
+            .ok_or_else(|| LibraryError::NotFound(id.into()))?;
+        if is_gizmondo_game(original, &self.root) {
+            return Err(LibraryError::InvalidSettings(
+                "This option is for Pocket PC games.".into(),
+            ));
+        }
+        let directory = self.root.join(original.relative_dir());
+        let absolute = directory.join(path);
+        if !absolute.starts_with(directory.join("extracted"))
+            || !pocket_cab::plain_path_below(&self.root, &absolute, false)
+            || !path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+            || !is_guest_exe(&absolute)
+        {
+            return Err(LibraryError::InvalidSettings(
+                "Invalid launch executable.".into(),
+            ));
+        }
+        let mut game = original.clone();
+        game.settings.gpu_compatibility_profile = Generic;
+        apply_import_gpu_default(&mut game, &directory);
+        let previous_default = game.settings.gpu_compatibility_profile;
+        game.executable = path.to_path_buf();
+        game.settings.import_executable_selected = true;
+        game.settings.gpu_compatibility_profile = original.settings.gpu_compatibility_profile;
+        if game.settings.gpu_compatibility_profile == previous_default {
+            game.settings.gpu_compatibility_profile = Generic;
+        }
+        apply_import_gpu_default(&mut game, &directory);
+
+        let mut next = self.library.clone();
+        *next.games.iter_mut().find(|entry| entry.id == id).unwrap() = game.clone();
+        let manifest = directory.join("game.json");
+        write_json(&manifest, &game)?;
+        if let Err(error) = write_json(&self.root.join("library.json"), &next) {
+            let _ = write_json(&manifest, original);
+            return Err(error);
+        }
+        self.library = next;
+        Ok(())
     }
 }
 
@@ -3600,18 +3949,38 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), LibraryError> 
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(value)?;
-    let temp = path.with_file_name(format!(
-        ".{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("manifest.json")
-    ));
-    fs::write(&temp, bytes)?;
-    if let Err(error) = fs::rename(&temp, path) {
-        let _ = fs::remove_file(&temp);
-        return Err(error.into());
-    }
+    use std::io::Write;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(directory)?;
+    temp.write_all(&bytes)?;
+    temp.persist(path).map_err(|error| error.error)?;
     Ok(())
+}
+
+#[test]
+fn concurrent_json_publication_uses_independent_temporary_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("catalogue.json");
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for index in 0..4 {
+            let (path, barrier) = (&path, &barrier);
+            scope.spawn(move || {
+                let value = vec![index; 4096];
+                barrier.wait();
+                for _ in 0..12 {
+                    write_json(path, &value).unwrap();
+                }
+            });
+        }
+    });
+    let value: Vec<u32> = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(value.len(), 4096);
+    assert!(value.iter().all(|&number| number == value[0]));
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
 }
 
 fn safe_archive_path(raw: &[u8]) -> Option<PathBuf> {
@@ -4047,11 +4416,12 @@ const IMAGE_FILE_DLL: u16 = 0x2000;
 struct PeSniff {
     machine: u16,
     characteristics: u16,
+    managed: bool,
 }
 
 impl PeSniff {
     fn is_supported_guest(self) -> bool {
-        is_supported_guest_machine(self.machine)
+        is_supported_guest_machine(self.machine) || self.managed
     }
 
     fn is_dll(self) -> bool {
@@ -4138,8 +4508,22 @@ fn sniff_pe(path: &Path) -> std::io::Result<Option<PeSniff>> {
     if &coff[0..4] != b"PE\0\0" {
         return Ok(None);
     }
+    let machine = u16::from_le_bytes([coff[4], coff[5]]);
+    let managed = if machine == pocket_pe::machine::I386 {
+        let mut optional = [0u8; 216];
+        u16::from_le_bytes([coff[20], coff[21]]) >= 216
+            && f.read_exact(&mut optional).is_ok()
+            && optional[..2] == [0x0b, 0x01]
+            && u32::from_le_bytes(optional[92..96].try_into().unwrap()) >= 15
+            && u32::from_le_bytes(optional[208..212].try_into().unwrap()) != 0
+            && f.metadata()?.len() <= 32 * 1024 * 1024
+            && pocket_netcf::entry_point(&fs::read(path)?).is_some()
+    } else {
+        false
+    };
     Ok(Some(PeSniff {
-        machine: u16::from_le_bytes([coff[4], coff[5]]),
+        machine,
+        managed,
         characteristics: u16::from_le_bytes([coff[22], coff[23]]),
     }))
 }
@@ -4271,8 +4655,60 @@ pub fn accelerated_renderer_build(shortcut_target: &Path) -> Option<PathBuf> {
     Some(chosen)
 }
 
-/// The GL ES driver `path` imports, lower-cased, if it is one PocketHLE
-/// implements.
+/// Identify static and explicit runtime links to the GLES 2 client library.
+pub fn uses_programmable_gles(image: &pocket_pe::LoadedImage) -> bool {
+    if image
+        .imports
+        .iter()
+        .any(|import| import.dll.eq_ignore_ascii_case("libglesv2.dll"))
+    {
+        return true;
+    }
+    let dll = b"libglesv2.dll\0";
+    let wide: Vec<_> = dll.iter().flat_map(|&byte| [byte, 0]).collect();
+    let names = [dll.as_slice(), wide.as_slice()];
+    let has_library = image.sections.iter().any(|section| {
+        names.iter().any(|name| {
+            section
+                .data
+                .windows(name.len())
+                .any(|value| value.eq_ignore_ascii_case(name))
+        })
+    });
+    has_library
+        && image.sections.iter().any(|section| {
+            section
+                .data
+                .windows(b"glCreateShader\0".len())
+                .any(|value| value == b"glCreateShader\0")
+        })
+}
+
+/// Infer a profile from the selected executable on a fresh import.
+fn apply_import_gpu_default(entry: &mut GameEntry, game_dir: &Path) {
+    use gpu_profile::GpuCompatibilityProfile;
+
+    if entry.settings.gpu_compatibility_profile != GpuCompatibilityProfile::Generic
+        || is_gizmondo_at(entry, &game_dir.join("extracted"))
+    {
+        return;
+    }
+    let Ok(image) = pocket_pe::load_file(&game_dir.join(&entry.executable)) else {
+        return;
+    };
+    let imports = |driver: &str| {
+        image
+            .imports
+            .iter()
+            .any(|import| import.dll.eq_ignore_ascii_case(driver))
+    };
+    if uses_programmable_gles(&image) {
+        entry.settings.gpu_compatibility_profile = GpuCompatibilityProfile::Adreno200;
+    } else if imports("libgles_cl.dll") {
+        entry.settings.gpu_compatibility_profile = GpuCompatibilityProfile::Intel2700g;
+    }
+}
+
 fn imported_gles_driver(path: &Path) -> Option<String> {
     let image = pocket_pe::load_file(path).ok()?;
     image
@@ -4374,6 +4810,28 @@ fn guess_screen(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tilt_input_inherits_or_overrides_the_emulator_default() {
+        let config: LauncherConfig =
+            serde_json::from_str(r#"{"pocketpc_tilt_input":"four_directions"}"#).unwrap();
+        let mut settings: GameSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            LauncherConfig::default().pocketpc_tilt_input,
+            TiltInput::Accelerometer
+        );
+        assert_eq!(
+            settings.effective_tilt_input(&config),
+            TiltInput::FourDirections
+        );
+        settings.pocketpc_tilt_input = Some(TiltInput::Accelerometer);
+        let roundtrip: GameSettings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.effective_tilt_input(&config),
+            TiltInput::Accelerometer
+        );
+    }
+
     #[test]
     fn custom_settings_badge_follows_saved_overrides_and_reset() {
         let config = super::LauncherConfig::default();
@@ -4487,11 +4945,21 @@ mod tests {
     }
 
     #[test]
-    fn qvga_resolution_policies_preserve_saved_values() {
-        for policy in [1, 2, 3, 4, 5] {
+    fn resolution_selection_preserves_saved_policies() {
+        for (policy, scale, all) in [
+            (1, 1, false),
+            (2, 2, true),
+            (3, 2, false),
+            (4, 3, false),
+            (5, 4, false),
+            (6, 3, true),
+            (7, 4, true),
+        ] {
             let mut value = serde_json::to_value(super::LauncherConfig::default()).unwrap();
             value["gles_internal_resolution"] = serde_json::json!(policy);
-            let config: super::LauncherConfig = serde_json::from_value(value).unwrap();
+            let mut config: super::LauncherConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(config.gles_resolution_selection(), (scale, all));
+            config.set_gles_resolution_selection(scale, all);
             assert_eq!(config.gles_internal_resolution, policy);
             assert_eq!(
                 serde_json::to_value(config).unwrap()["gles_internal_resolution"],
@@ -4517,7 +4985,6 @@ mod tests {
         let default = LauncherConfig::default();
         assert!(default.gpu_renderer);
         assert_eq!(default.gles_internal_resolution, 1);
-        assert!(!default.pocketpc_intel2700g_depth_bias);
         let mut old_config = serde_json::to_value(&default).unwrap();
         old_config
             .as_object_mut()
@@ -4559,14 +5026,6 @@ mod tests {
         );
         let settings: GameSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.dpad_deadzone, DpadDeadzone::Large);
-        assert_eq!(settings.gpu_renderer, None);
-        let gpu = GameSettings {
-            gpu_renderer: Some(true),
-            ..GameSettings::default()
-        };
-        let decoded: GameSettings =
-            serde_json::from_str(&serde_json::to_string(&gpu).unwrap()).unwrap();
-        assert_eq!(decoded.gpu_renderer, Some(true));
         for zone in DpadDeadzone::ALL {
             let settings = GameSettings {
                 dpad_deadzone: zone,
@@ -5199,7 +5658,10 @@ mod tests {
                         .unwrap()
                         .get("anisotropic_filtering")
                         .is_none());
-                    assert_eq!(reopened.get(&id).unwrap().settings.gpu_renderer, game);
+                    assert!(serde_json::to_value(&reopened.get(&id).unwrap().settings)
+                        .unwrap()
+                        .get("gpu_renderer")
+                        .is_none());
                 }
             }
         }
@@ -6659,6 +7121,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn switching_launch_executable_persists_the_choice_and_graphics_label() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let mut library = Library::open(root).unwrap();
+        let mut entry = entry_with_install_dir(Some("\\Program Files\\COD2"));
+        entry.id = "switch-executable".into();
+        entry.executable = "extracted/cod2.exe".into();
+        let directory = root.join(entry.relative_dir());
+        write_cod2_install(&directory.join("extracted"));
+        library.commit_entry(&entry.id, entry.clone()).unwrap();
+
+        let game = library.get(&entry.id).unwrap();
+        assert_eq!(
+            analysis::game_graphics_api(game, root),
+            Some("OpenGL ES CM")
+        );
+        let intel = Path::new("extracted/cod2_gles.exe");
+        assert!(library
+            .launch_executables(&entry.id)
+            .unwrap()
+            .iter()
+            .any(|path| path.as_path() == intel));
+        library.switch_launch_executable(&entry.id, intel).unwrap();
+
+        let reopened = Library::open(root).unwrap();
+        let game = reopened.get(&entry.id).unwrap();
+        assert_eq!(game.launch_path(root), directory.join(intel));
+        assert_eq!(
+            analysis::game_graphics_api(game, root),
+            Some("OpenGL ES 1.0 CL")
+        );
+        assert_eq!(
+            game.settings.gpu_compatibility_profile,
+            gpu_profile::GpuCompatibilityProfile::Intel2700g
+        );
+        let manifest: GameEntry =
+            serde_json::from_slice(&fs::read(directory.join("game.json")).unwrap()).unwrap();
+        assert_eq!(manifest.executable.as_path(), intel);
+
+        let software = Path::new("extracted/cod2.exe");
+        library
+            .switch_launch_executable(&entry.id, software)
+            .unwrap();
+        assert_eq!(
+            library.get(&entry.id).unwrap().launch_path(root),
+            directory.join(software)
+        );
+    }
+
     /// Everything else keeps the shortcut target: a build that already
     /// draws through a driver, a cabinet with a single executable, a
     /// sibling that wants a driver we do not implement, and an unrelated
@@ -6704,6 +7216,88 @@ mod tests {
         }
         // Nothing may be left behind for a rejected import.
         assert!(!root.join("games").join("pegcards").exists());
+    }
+
+    #[test]
+    fn pocketpc_import_launches_selected_executable_and_uses_its_profile() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("fixture.exe");
+        let archive = root.path().join("pocketpc.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        for (name, imports) in [
+            ("Autorun.exe", &[][..]),
+            ("hardware.exe", &["libGLES_CL.dll"][..]),
+        ] {
+            write_pe_importing(&exe, imports);
+            zip.start_file(name, zip::write::FileOptions::default())
+                .unwrap();
+            zip.write_all(&fs::read(&exe).unwrap()).unwrap();
+        }
+        zip.finish().unwrap();
+        let mut library = Library::open(root.path().join("library")).unwrap();
+
+        let mut gizmondo = library.prepare_import(&archive).unwrap();
+        let id = gizmondo.platform_choices()[0].0.clone();
+        assert!(gizmondo.choose_platform(&id, GamePlatform::Gizmondo));
+        assert!(gizmondo.executable_choices().is_empty());
+
+        let mut prepared = library.prepare_import(&archive).unwrap();
+        assert!(prepared.choose_platform(&id, GamePlatform::PocketPc));
+        let candidates = &prepared.executable_choices()[0].executables;
+        let selected = candidates
+            .iter()
+            .position(|path| path.ends_with("hardware.exe"))
+            .unwrap();
+        assert!(prepared.choose_executable(&id, selected));
+        let entries = library.apply_prepared_import(prepared, false).unwrap();
+        let entry = &entries[0];
+        assert!(entry.launch_path(library.root()).ends_with("hardware.exe"));
+        assert_eq!(
+            entry.settings.gpu_compatibility_profile,
+            gpu_profile::GpuCompatibilityProfile::Intel2700g
+        );
+        library
+            .update_settings(&id, GameSettings::default())
+            .unwrap();
+        assert!(
+            library
+                .get(&id)
+                .unwrap()
+                .settings
+                .import_executable_selected
+        );
+    }
+
+    #[test]
+    fn driver_import_sets_profile_and_reimport_preserves_manual_choice() {
+        use super::gpu_profile::GpuCompatibilityProfile;
+
+        for (dll, expected) in [
+            ("libGLES_CL.dll", GpuCompatibilityProfile::Intel2700g),
+            ("libGLESv2.dll", GpuCompatibilityProfile::Adreno200),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let exe = root.path().join("game.exe");
+            write_pe_importing(&exe, &["COREDLL.dll", dll]);
+            let mut library = Library::open(root.path().join("library")).unwrap();
+
+            let prepared = library.prepare_import(&exe).unwrap();
+            let entries = library.apply_prepared_import(prepared, false).unwrap();
+            assert_eq!(entries[0].settings.gpu_compatibility_profile, expected);
+
+            let settings = &mut library.get_mut(&entries[0].id).unwrap().settings;
+            settings.gpu_compatibility_profile = GpuCompatibilityProfile::Generic;
+            library.save().unwrap();
+
+            let prepared = library.prepare_import(&exe).unwrap();
+            let entries = library.apply_prepared_import(prepared, true).unwrap();
+            assert_eq!(
+                entries[0].settings.gpu_compatibility_profile,
+                GpuCompatibilityProfile::Generic
+            );
+        }
     }
 
     #[test]
@@ -6804,6 +7398,7 @@ mod tests {
         let resource = ResourceEntry {
             ty: ResourceKey::Name("CEUX".into()),
             name: ResourceKey::Name("HI_RES_AWARE".into()),
+            native_leaves: Vec::new(),
             data_rva: image.sections[0].virtual_address,
             size: 2,
             codepage: 0,
@@ -6816,13 +7411,29 @@ mod tests {
             ScreenPref::Landscape,
             ScreenPref::VgaLandscape,
             ScreenPref::Hpc,
+            ScreenPref::Wqvga,
+            ScreenPref::WqvgaLandscape,
             ScreenPref::Wvga,
+            ScreenPref::WvgaLandscape,
         ] {
             assert_eq!(pref.resolve_image(Some(&image)), pref.size());
         }
         image.sections[0].data[..2].copy_from_slice(&[0, 0]);
         assert_eq!(ScreenPref::Portrait.resolve_image(Some(&image)), (240, 320));
         assert_eq!(ScreenPref::Portrait.resolve_image(None), (240, 320));
+    }
+
+    #[test]
+    fn wqvga_screen_preferences_round_trip_with_native_dimensions() {
+        for (pref, name, size) in [
+            (ScreenPref::Wqvga, "wqvga", (240, 400)),
+            (ScreenPref::WqvgaLandscape, "wqvga_landscape", (400, 240)),
+        ] {
+            let json = serde_json::to_string(&pref).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<ScreenPref>(&json).unwrap(), pref);
+            assert_eq!(pref.size(), size);
+        }
     }
 
     #[test]
@@ -7362,50 +7973,6 @@ fn android_directional_control_size_is_global_and_round_trips() {
         .contains_key("android_pocketpc_controls_size"));
 }
 
-#[test]
-fn intel2700g_compatibility_is_opt_in_and_round_trips() {
-    let mut config = LauncherConfig::default();
-    let mut old = serde_json::to_value(&config).unwrap();
-    old.as_object_mut()
-        .unwrap()
-        .remove("pocketpc_intel2700g_depth_bias");
-    assert!(
-        !serde_json::from_value::<LauncherConfig>(old)
-            .unwrap()
-            .pocketpc_intel2700g_depth_bias
-    );
-    config.pocketpc_intel2700g_depth_bias = true;
-    let restored: LauncherConfig =
-        serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
-    assert!(restored.pocketpc_intel2700g_depth_bias);
-    assert_eq!(
-        restored.gles_internal_resolution,
-        config.gles_internal_resolution
-    );
-    assert_eq!(restored.gpu_renderer, config.gpu_renderer);
-}
-
-#[test]
-fn pocketpc_nv_combiners_preserve_default_and_round_trip_disabled() {
-    let mut config = LauncherConfig::default();
-    assert!(config.pocketpc_nv_combiners);
-    let mut old = serde_json::to_value(&config).unwrap();
-    old.as_object_mut().unwrap().remove("pocketpc_nv_combiners");
-    assert!(
-        serde_json::from_value::<LauncherConfig>(old)
-            .unwrap()
-            .pocketpc_nv_combiners
-    );
-    config.pocketpc_nv_combiners = false;
-    let restored: LauncherConfig =
-        serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
-    assert!(!restored.pocketpc_nv_combiners);
-    assert_eq!(
-        restored.pocketpc_intel2700g_depth_bias,
-        config.pocketpc_intel2700g_depth_bias
-    );
-}
-
 #[cfg(test)]
 #[test]
 fn egl_format_profile_defaults_off_and_round_trips_independently() {
@@ -7415,7 +7982,6 @@ fn egl_format_profile_defaults_off_and_round_trips_independently() {
         let settings = GameSettings {
             pocketpc_egl_rgba8888_only: enabled,
             pocketpc_gapi_columns: true,
-            gpu_renderer: Some(false),
             ..Default::default()
         };
         let restored: GameSettings =

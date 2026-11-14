@@ -8,6 +8,7 @@ members = [
     "crates/pocket-kernel",
     "crates/pocket-winceapi",
     "crates/pocket-gles",
+    "crates/pocket-netcf",
     "crates/pocket-core",
     "crates/pocket-library",
     "frontends/pocket-cli",
@@ -16,13 +17,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.7-wince.1"
+version = "0.4.8-wince.1"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/Katamaran21/PocketHLE-GDI"
 homepage = "https://github.com/Katamaran21/PocketHLE-GDI"
 authors = ["PocketHLE Contributors"]
-rust-version = "1.75"
+rust-version = "1.90"
 
 [workspace.dependencies]
 anyhow = "1"

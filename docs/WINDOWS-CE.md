@@ -303,7 +303,7 @@ handling its throw does not supply that driver or make the utility operational.
 tools\build-windows.cmd build --release -j 1 -p pocket-cli -p pocket-desktop --features pocket-cli/unicorn --locked
 ```
 
-See [Android build](ANDROID-BUILD.md) for the pinned Linux SDK/NDK workflow.
+See [Build and release](BUILD.md#android) for the pinned Linux SDK/NDK workflow.
 `tools/package-wince-profile.py --output profile.zip` produces public templates.
 Adding `--image PATH` produces a private backup with the original Explorer.
 `--cerf-apps PATH` includes the additional ARM applications and `--explorer-bin

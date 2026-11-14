@@ -59,20 +59,22 @@ impl HostInput {
                     "ESCAPE" | "F7" | "F8" | "F9" | "F10" | "F11" | "F12"
                 ) =>
             {
-                Some("This input is reserved by PocketHLE (Escape / F7–F12).")
+                Some("This input is reserved by PocketHLE-Reborn (Escape / F7–F12).")
             }
             Self::Controller(n)
                 if matches!(n.as_str(), "Select" | "Start")
                     || crate::stylus::controller_reserved(&n, false) =>
             {
-                Some("This input is reserved by PocketHLE.")
+                Some("This input is reserved by PocketHLE-Reborn.")
             }
             Self::Controller(n)
                 if fullscreen.is_some_and(|f| {
                     Self::Controller(f.into()).canonical() == Self::Controller(n.clone())
                 }) =>
             {
-                Some("This controller input is assigned to fullscreen in PocketHLE settings.")
+                Some(
+                    "This controller input is assigned to fullscreen in PocketHLE-Reborn settings.",
+                )
             }
             _ => None,
         }
@@ -100,12 +102,30 @@ impl Default for StylusGrid {
     }
 }
 impl StylusGrid {
-    pub const SIZES: [(u8, u8); 3] = [(4, 3), (5, 4), (6, 5)];
+    pub const SIZES: [(u8, u8); 4] = [(4, 3), (5, 4), (6, 5), (7, 6)];
+    fn supports(columns: u8, rows: u8) -> bool {
+        Self::SIZES.contains(&(columns.max(rows), columns.min(rows)))
+    }
+
+    pub fn orient(&mut self, portrait: bool) {
+        if !self.valid_size() || (self.columns < self.rows) == portrait {
+            return;
+        }
+        let columns = usize::from(self.columns);
+        let rows = usize::from(self.rows);
+        self.bindings
+            .retain(|binding| binding.cell < columns * rows);
+        for binding in &mut self.bindings {
+            binding.cell = (binding.cell % columns) * rows + binding.cell / columns;
+        }
+        std::mem::swap(&mut self.columns, &mut self.rows);
+    }
+
     pub fn valid_size(&self) -> bool {
-        Self::SIZES.contains(&(self.columns, self.rows))
+        Self::supports(self.columns, self.rows)
     }
     pub fn resize(&mut self, columns: u8, rows: u8) {
-        if Self::SIZES.contains(&(columns, rows)) && (columns, rows) != (self.columns, self.rows) {
+        if Self::supports(columns, rows) && (columns, rows) != (self.columns, self.rows) {
             self.columns = columns;
             self.rows = rows;
             self.bindings.clear();
@@ -133,11 +153,12 @@ impl StylusGrid {
         if !self.valid_size() || input.conflict(fullscreen).is_some() {
             return None;
         }
+        let input = input.clone().canonical();
+        let count = usize::from(self.columns) * usize::from(self.rows);
         self.bindings
             .iter()
-            .find(|b| b.input.clone().canonical() == input.clone().canonical())
-            .map(|b| b.cell)
-            .filter(|c| *c < usize::from(self.columns) * usize::from(self.rows))
+            .find(|binding| binding.cell < count && binding.input.clone().canonical() == input)
+            .map(|binding| binding.cell)
     }
     pub fn point(&self, cell: usize) -> (u16, u16) {
         let cols = usize::from(self.columns.max(1));
@@ -303,6 +324,21 @@ mod tests {
         );
     }
     #[test]
+    fn orientation_transposes_saved_bindings_without_clearing_them() {
+        let mut grid = StylusGrid::default();
+        grid.resize(7, 6);
+        let input = HostInput::Controller("South".into());
+        grid.bind(6, input.clone(), None).unwrap();
+        let landscape = grid.clone();
+        grid.orient(true);
+        assert_eq!((grid.columns, grid.rows), (6, 7));
+        assert_eq!(grid.cell_for(&input, None), Some(36));
+        assert_eq!(grid.point(36), (833, 9285));
+        grid.orient(false);
+        assert_eq!(grid, landscape);
+    }
+
+    #[test]
     fn centers_and_rotation_are_bounded_at_qvga_and_vga() {
         for (columns, rows) in StylusGrid::SIZES {
             let g = StylusGrid {
@@ -367,5 +403,20 @@ mod tests {
         assert!(!r.active());
         assert!(r.cancel().is_none());
         assert_eq!(r.input(&g, a, false, None), (true, None));
+    }
+}
+
+#[test]
+fn shared_android_grid_cases() {
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../tests/data/stylus-grid.json")).unwrap();
+    for case in cases {
+        let grid: StylusGrid = serde_json::from_value(case["grid"].clone()).unwrap();
+        let input: HostInput = serde_json::from_value(case["input"].clone()).unwrap();
+        let cell = grid.cell_for(&input, case["fullscreen"].as_str());
+        assert_eq!(serde_json::json!(cell), case["cell"], "{}", case["name"]);
+        if let Some(cell) = cell {
+            assert_eq!(serde_json::json!(grid.point(cell)), case["point"]);
+        }
     }
 }

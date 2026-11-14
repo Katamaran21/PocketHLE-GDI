@@ -57,23 +57,47 @@ class GameSettingsActivity : HostKeyActivity() {
                 !NativeBridge.isGizmondoGame(rootDir, gameId)
             findPreference<androidx.preference.PreferenceCategory>("device_identity_category")?.isVisible =
                 !NativeBridge.isGizmondoGame(rootDir, gameId)
+            findPreference<ListPreference>("gpu_compatibility_profile")?.apply {
+                isVisible = !NativeBridge.isGizmondoGame(rootDir, gameId)
+                entries = arrayOf("Generic OpenGL ES (1.1, Common)", "NVIDIA GoForce 5500 (OpenGL ES 1.1, Common)", "Intel 2700G (OpenGL ES 1.0, Common-Lite)", "Generic OpenGL ES (2.0, Common)")
+                entryValues = arrayOf("generic", "nvidia_goforce5500", "intel2700g", "adreno200")
+                value = current.gpuCompatibilityProfile
+                summaryProvider = androidx.preference.Preference.SummaryProvider<ListPreference> { "${it.entry}\nChoose the GPU targeted by this game. Generic OpenGL ES 2.0 uses the host GPU for OpenGL ES 2.0." }
+                setOnPreferenceChangeListener { _, newValue ->
+                    current = current.copy(gpuCompatibilityProfile = newValue.toString())
+                    writeGameSettings(); true
+                }
+            }
             if (!NativeBridge.isGizmondoGame(rootDir, gameId)) {
                 val controlsCategory = findPreference<androidx.preference.PreferenceCategory>("controls_category")!!
                 val identityCategory = findPreference<androidx.preference.PreferenceCategory>("device_identity_category")!!
                 val editor=androidx.preference.Preference(requireContext()).apply {
                     key="ppc_stylus_editor";isPersistent=false
                     setOnPreferenceClickListener {
-                        val config=LauncherConfig.fromJson(JSONObject(NativeBridge.readConfig(rootDir)))
-                        StylusControlsDialog(requireContext(),current,config){grid->
-                            current=current.copy(pocketpcStylusGridJson=grid.json().toString());writeGameSettings()
-                        }.show()
+                        if (current.controlsMode() == "grid") {
+                            val dialog = AddDataDialog(requireContext()) { false }
+                            dialog.setTitle("Configure Grid")
+                            dialog.setMessage("L1 + R1 cycles grid sizes. L2 + R2 toggles editing. L3 + R3 clears the selected assignment. You can also use the controls below the game screen.")
+                            dialog.setButton(android.content.DialogInterface.BUTTON_POSITIVE, "Start the game and configure the touch grid") { _, _ ->
+                                startActivity(android.content.Intent(requireContext(), GameActivity::class.java)
+                                    .putExtra(GameActivity.EXTRA_GAME_ID, gameId)
+                                    .putExtra(GameActivity.EXTRA_CONFIGURE_GRID, true))
+                                requireActivity().finish()
+                            }
+                            dialog.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "Cancel") { _, _ -> }
+                            dialog.show()
+                            dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).requestFocus()
+                        } else {
+                            val config = LauncherConfig.fromJson(JSONObject(NativeBridge.readConfig(rootDir)))
+                            StylusControlsDialog(requireContext(), current, config) { }.show()
+                        }
                         true
                     }
                 }
                 fun updateEditor() {
                     editor.isVisible=current.controlsMode()!="normal"
                     editor.title=if(current.controlsMode()=="zones") "Test controls…" else "Configure grid…"
-                    editor.summary=if(current.controlsMode()=="zones") "Test arrows / D-pad and progressive left-stick movement without starting a game." else "Choose 4 × 3, 5 × 4 or 6 × 5. Select a zone and press an input. Reserved PocketHLE shortcuts cannot be assigned."
+                    editor.summary=if(current.controlsMode()=="zones") "Test arrows / D-pad and progressive left-stick movement without starting a game." else "Start the game and configure the touch grid over the live game screen."
                 }
                 controlsCategory.addPreference(ListPreference(requireContext()).apply {
                     key="pocketpc_controls";title="Control mode";isPersistent=false
@@ -92,6 +116,20 @@ class GameSettingsActivity : HostKeyActivity() {
                     setOnPreferenceChangeListener { _, value ->
                         current=current.copy(pocketpcSwapButtonGroups=value as Boolean)
                         writeGameSettings();true
+                    }
+                })
+                controlsCategory.addPreference(ListPreference(requireContext()).apply {
+                    key = "pocketpc_tilt_input"
+                    title = "Tilt input (accelerometer)"
+                    isPersistent = false
+                    entries = arrayOf("Emulator Default") + TiltInput.values().map { it.label }
+                    entryValues = arrayOf("inherit") + TiltInput.values().map { it.id }
+                    value = current.pocketpcTiltInput?.id ?: "inherit"
+                    summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
+                    setOnPreferenceChangeListener { _, value ->
+                        current = current.copy(pocketpcTiltInput = TiltInput.fromId(value.toString()))
+                        writeGameSettings()
+                        true
                     }
                 })
                 controlsCategory.addPreference(editor);updateEditor()
@@ -215,20 +253,6 @@ class GameSettingsActivity : HostKeyActivity() {
                     true
                 }
             }
-            findPreference<ListPreference>("gpu_renderer_mode")?.apply {
-                // JSON is authoritative; do not maintain a second SharedPreferences value.
-                isPersistent = false
-                entries = arrayOf("Emulator default", "Software", "GPU")
-                entryValues = arrayOf("inherit", "software", "gpu")
-                value = when (current.gpuRenderer) { null -> "inherit"; false -> "software"; true -> "gpu" }
-                summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
-                setOnPreferenceChangeListener { _, newValue ->
-                    current = current.copy(gpuRenderer = when (newValue.toString()) { "gpu" -> true; "software" -> false; else -> null })
-                    writeGameSettings()
-                    true
-                }
-            }
-
         }
 
         private fun addWindowsCePreferences() {
@@ -320,15 +344,13 @@ class GameSettingsActivity : HostKeyActivity() {
             if (gameId.isEmpty()) return
             val result = runCatching { org.json.JSONObject(NativeBridge.writeGameSettings(rootDir, gameId, current.toJson().toString())) }.getOrNull()
             val saved = runCatching { org.json.JSONObject(NativeBridge.readGameSettings(rootDir, gameId)) }.getOrNull()
-            val gpuSaved = saved != null && saved.has("gpu_renderer") &&
-                (if (saved.isNull("gpu_renderer")) null else saved.optBoolean("gpu_renderer")) == current.gpuRenderer
             val frameLimitSaved = saved != null && saved.has("frame_rate_limit") && (if (saved.isNull("frame_rate_limit")) null else saved.optString("frame_rate_limit")) == current.frameRateLimit
             val heapSaved = saved != null &&
                 (if (saved.isNull("executable_heap")) null else saved.optBoolean("executable_heap")) == current.executableHeap
             val eglFormatSaved = saved != null && saved.has("pocketpc_egl_rgba8888_only") &&
                 saved.optBoolean("pocketpc_egl_rgba8888_only") == current.pocketpcEglRgba8888Only
             val ceSaved = saved != null && GameSettings.fromJson(saved).windowsCe?.copy(originalJson = "{}") == current.windowsCe?.copy(originalJson = "{}")
-            if (result?.optBoolean("ok", false) != true || !gpuSaved || !frameLimitSaved || !heapSaved || !eglFormatSaved || !ceSaved) {
+            if (result?.optBoolean("ok", false) != true || !frameLimitSaved || !heapSaved || !eglFormatSaved || !ceSaved) {
                 android.widget.Toast.makeText(context, "Could not save settings. Rebuild and install the updated native libraries and APK.", android.widget.Toast.LENGTH_LONG).show()
             }
         }

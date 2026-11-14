@@ -17,12 +17,57 @@ pub struct GameAnalysis {
     pub dependencies: Vec<(String, String)>,
 }
 
-/// Best-effort graphics label from PE imports and dynamic symbol references.
-/// This is an API hint, not proof of the active renderer. Unknown stays absent.
-/// Prefer framebuffer/3D APIs over GDI, which often only supplies menu text.
+/// Best-effort graphics label from the selected executable and its referenced
+/// local DLLs. This describes API evidence, not a live renderer.
 pub fn detect_graphics_api(path: &std::path::Path) -> Option<&'static str> {
+    detect_from_modules(path, read_graphics_module)
+}
+
+#[derive(Clone)]
+struct ModuleGraphics {
+    label: Option<&'static str>,
+    dependencies: std::collections::BTreeSet<String>,
+}
+
+const GLES_2: &str = "OpenGL ES 2.0 CM";
+const GLES_CM: &str = "OpenGL ES 1.1 CM";
+const GLES_LEGACY_CM: &str = "OpenGL ES CM";
+const GLES_CL: &str = "OpenGL ES 1.0 CL";
+const GLES_V1_CL: &str = "OpenGL ES 1.1 CL";
+const GLES_GENERIC: &str = "OpenGL ES";
+
+fn gles_driver_label(dll: &str) -> Option<&'static str> {
+    match dll {
+        "libglesv2.dll" => Some(GLES_2),
+        "libgles_cm.dll" => Some(GLES_LEGACY_CM),
+        "libglesv1_cm.dll" => Some(GLES_CM),
+        "libgles_cl.dll" => Some(GLES_CL),
+        "libglesv1_cl.dll" => Some(GLES_V1_CL),
+        "gles.dll" | "libgles.dll" => Some(GLES_GENERIC),
+        _ => None,
+    }
+}
+
+const GRAPHICS_PRIORITY: &[&str] = &[
+    GLES_2,
+    GLES_CM,
+    GLES_V1_CL,
+    GLES_CL,
+    GLES_LEGACY_CM,
+    GLES_GENERIC,
+    "Direct3D Mobile",
+    "DirectDraw",
+    "GAPI",
+    "GapiDraw",
+    "SDL",
+    "GDI",
+    "System.Drawing",
+];
+
+fn read_graphics_module(path: &std::path::Path) -> Option<ModuleGraphics> {
     let bytes = std::fs::read(path).ok()?;
     let image = pocket_pe::load_bytes(&bytes).ok()?;
+    let managed = pocket_netcf::graphics_api(&bytes);
     let mut imports = image.imports;
     // Use the same bundled COREDLL ordinal maps as the runtime, not game names.
     static ARM: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
@@ -60,24 +105,108 @@ pub fn detect_graphics_api(path: &std::path::Path) -> Option<&'static str> {
         }
     }
     let strings = binary_strings(&bytes);
-    graphics_api_from_evidence(&imports, &strings)
+    let mut dependencies: std::collections::BTreeSet<_> = imports
+        .iter()
+        .filter_map(|import| dll_basename(&import.dll))
+        .collect();
+    if imports.iter().any(|import| {
+        matches!(
+            &import.binding, pocket_pe::ImportBinding::Name(name)
+                if matches!(name.to_ascii_lowercase().as_str(),
+                    "loadlibraryw" | "loadlibrarya" | "loadlibraryexw" | "loadlibraryexa")
+        )
+    }) {
+        dependencies.extend(strings.iter().filter_map(|name| dll_basename(name)));
+    }
+    let label = graphics_api_from_evidence(&imports, &strings);
+    let label = GRAPHICS_PRIORITY.iter().copied().find(|candidate| {
+        Some(*candidate) == label
+            || dependencies
+                .iter()
+                .any(|dll| gles_driver_label(dll) == Some(*candidate))
+    });
+    let label = managed.or(label);
+    Some(ModuleGraphics {
+        label,
+        dependencies,
+    })
+}
+
+fn dll_basename(name: &str) -> Option<String> {
+    let name = name.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
+    let stem = name.strip_suffix(".dll")?;
+    if stem.is_empty()
+        || stem.len() > 128
+        || !stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b' ' | b'$'))
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn detect_from_modules(
+    path: &std::path::Path,
+    mut inspect: impl FnMut(&std::path::Path) -> Option<ModuleGraphics>,
+) -> Option<&'static str> {
+    let main = inspect(path)?;
+    if main
+        .label
+        .is_some_and(|label| label != "GDI" && label != GLES_GENERIC)
+        || main.dependencies.is_empty()
+    {
+        return main.label;
+    }
+    let Some(files) = path.parent().and_then(|dir| std::fs::read_dir(dir).ok()) else {
+        return main.label;
+    };
+    // Cabinets may add $-separated suffixes to installed DLL filenames.
+    // Prefer the exact filename and skip ambiguous aliases.
+    let files: Vec<_> = files
+        .flatten()
+        .filter_map(|entry| {
+            let name = dll_basename(entry.file_name().to_str()?)?;
+            entry
+                .file_type()
+                .ok()?
+                .is_file()
+                .then(|| (name, entry.path()))
+        })
+        .collect();
+    let mut labels = std::collections::HashSet::new();
+    labels.extend(main.label);
+    for dependency in main.dependencies {
+        let mut exact = files.iter().filter(|(name, _)| *name == dependency);
+        let candidate = if let Some(candidate) = exact.next() {
+            exact.next().is_none().then_some(candidate)
+        } else {
+            let stem = dependency.trim_end_matches(".dll");
+            let mut aliases = files.iter().filter(|(name, _)| {
+                name.split_once('$')
+                    .is_some_and(|(prefix, _)| prefix == stem)
+            });
+            let first = aliases.next();
+            first.filter(|_| aliases.next().is_none())
+        };
+        if let Some((_, candidate)) = candidate {
+            labels.extend(inspect(candidate).and_then(|module| module.label));
+        }
+    }
+    GRAPHICS_PRIORITY
+        .iter()
+        .copied()
+        .find(|label| labels.contains(label))
 }
 
 /// Process-local cache for catalogue refreshes. File metadata, not game names,
 /// invalidates both known and unknown API results after executable replacement.
 #[derive(Default)]
-struct GraphicsApiCache {
-    entries: std::collections::HashMap<
-        std::path::PathBuf,
-        (u64, std::time::SystemTime, Option<&'static str>),
-    >,
+struct GraphicsApiCache<T> {
+    entries: std::collections::HashMap<std::path::PathBuf, (u64, std::time::SystemTime, T)>,
 }
-impl GraphicsApiCache {
-    fn get(
-        &mut self,
-        path: &std::path::Path,
-        detect: impl FnOnce(&std::path::Path) -> Option<&'static str>,
-    ) -> Option<&'static str> {
+impl<T: Clone> GraphicsApiCache<T> {
+    fn get(&mut self, path: &std::path::Path, detect: impl FnOnce(&std::path::Path) -> T) -> T {
         let stamp = std::fs::metadata(path)
             .ok()
             .and_then(|m| m.modified().ok().map(|t| (m.len(), t)));
@@ -87,23 +216,31 @@ impl GraphicsApiCache {
         };
         if let Some((old_len, old_time, label)) = self.entries.get(path) {
             if *old_len == len && *old_time == modified {
-                return *label;
+                return label.clone();
             }
         }
         let label = detect(path);
         self.entries
-            .insert(path.to_path_buf(), (len, modified, label));
+            .insert(path.to_path_buf(), (len, modified, label.clone()));
         label
     }
 }
 pub fn detect_graphics_api_cached(path: &std::path::Path) -> Option<&'static str> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<GraphicsApiCache>> =
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<GraphicsApiCache<Option<ModuleGraphics>>>> =
         std::sync::OnceLock::new();
-    CACHE
+    let mut cache = CACHE
         .get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(path, detect_graphics_api)
+        .unwrap_or_else(|e| e.into_inner());
+    detect_from_modules(path, |module| cache.get(module, read_graphics_module))
+}
+
+pub fn game_graphics_api(game: &GameEntry, root: &std::path::Path) -> Option<&'static str> {
+    // The original Gizmondo NVIDIA driver reports ES-CM 1.0 via GL_VERSION.
+    match detect_graphics_api_cached(&game.launch_path(root))? {
+        GLES_LEGACY_CM if crate::is_gizmondo_game(game, root) => Some("OpenGL ES 1.0 CM"),
+        label => Some(label),
+    }
 }
 
 fn graphics_api_from_evidence(
@@ -139,7 +276,7 @@ fn graphics_api_from_evidence(
 }
 
 fn graphics_api_from_imports(imports: &[pocket_pe::ImportSymbol]) -> Option<&'static str> {
-    let mut gles = false;
+    let mut gles = None;
     let mut d3dm = false;
     let mut ddraw = false;
     let mut gapi = false;
@@ -148,23 +285,22 @@ fn graphics_api_from_imports(imports: &[pocket_pe::ImportSymbol]) -> Option<&'st
     let mut gapidraw = false;
     for import in imports {
         let dll = import.dll.to_ascii_lowercase();
-        gles |= matches!(
-            dll.as_str(),
-            "libgles_cm.dll"
-                | "libgles_cl.dll"
-                | "libglesv1_cm.dll"
-                | "libglesv2.dll"
-                | "gles.dll"
-                | "libgles.dll"
-        );
+        if let Some(label) = gles_driver_label(&dll) {
+            gles = GRAPHICS_PRIORITY
+                .iter()
+                .copied()
+                .find(|candidate| *candidate == label || Some(*candidate) == gles);
+        }
         d3dm |= dll == "d3dm.dll";
         ddraw |= dll == "ddraw.dll";
         if let pocket_pe::ImportBinding::Name(name) = &import.binding {
             let name = name.to_ascii_lowercase();
-            gles |= matches!(
+            if matches!(
                 name.as_str(),
                 "eglswapbuffers" | "glclear" | "gldrawarrays" | "gldrawelements"
-            );
+            ) {
+                gles.get_or_insert(GLES_GENERIC);
+            }
             gapidraw |= name.contains("@cgapidisplay@@")
                 && (name.starts_with("?opendisplay@") || name.starts_with("?flip@"));
             sdl |= matches!(
@@ -189,8 +325,8 @@ fn graphics_api_from_imports(imports: &[pocket_pe::ImportSymbol]) -> Option<&'st
             );
         }
     }
-    if gles {
-        Some("OpenGL ES")
+    if gles.is_some() {
+        gles
     } else if d3dm {
         Some("Direct3D Mobile")
     } else if ddraw {
@@ -500,10 +636,9 @@ pub fn analyze_game(game: &GameEntry, root: &std::path::Path) -> GameAnalysis {
             .map(|i| i.dll.to_ascii_lowercase())
             .collect();
         if dlls.iter().any(|d| d.contains("gles")) {
-            a.graphics
-                .push(("Renderer".into(), "OpenGL ES / EGL".into()));
-            a.evidence
-                .push("Import: libGLES_CM.dll (OpenGL ES / EGL)".into());
+            for dll in dlls.iter().filter(|dll| gles_driver_label(dll).is_some()) {
+                a.evidence.push(format!("OpenGL ES import: {dll}"));
+            }
         }
         if dlls.iter().any(|d| d.contains("fmod")) || text.contains("fmodce.dll") {
             a.game_data
@@ -527,10 +662,6 @@ pub fn analyze_game(game: &GameEntry, root: &std::path::Path) -> GameAnalysis {
             .push(("Native display".into(), "320 × 240 • Landscape".into()));
     }
     if text.contains("eglcreatewindowsurface") || text.contains("eglinitialize") {
-        if !a.graphics.iter().any(|(k, _)| k == "Renderer") {
-            a.graphics
-                .push(("Renderer".into(), "OpenGL ES / EGL".into()));
-        }
         for api in [
             "eglInitialize",
             "eglCreateWindowSurface",
@@ -542,6 +673,12 @@ pub fn analyze_game(game: &GameEntry, root: &std::path::Path) -> GameAnalysis {
                 a.evidence.push(format!("Graphics symbol: {api}"));
             }
         }
+    }
+    if let Some(api) = game_graphics_api(game, root).or_else(|| {
+        (text.contains("eglcreatewindowsurface") || text.contains("eglinitialize"))
+            .then_some("OpenGL ES / EGL")
+    }) {
+        a.graphics.push(("Renderer".into(), api.into()));
     }
     // Device names and transport APIs are evidence; scene-camera names are not.
     // Imports referenced by ordinal have no readable name, so absence is not proof.
@@ -649,6 +786,34 @@ pub fn analyze_game(game: &GameEntry, root: &std::path::Path) -> GameAnalysis {
     if giz {
         a.hardware
             .insert(0, ("Controls".into(), "Gizmondo front panel".into()));
+    } else {
+        a.hardware.clear();
+        let sensor = [
+            "htcsensorsdk",
+            "htcsensoropen",
+            "htcsensorgetdataoutput",
+            "sen0:",
+            "acc1:",
+        ];
+        let mut detected = pocket_netcf::references_accelerometer(&bytes);
+        if detected {
+            a.evidence
+                .push("Accelerometer: managed sensor or tilt-backed compass API".into());
+        }
+        for marker in sensor {
+            if text.contains(marker) {
+                detected = true;
+                a.evidence.push(format!("Accelerometer: {marker}"));
+            }
+        }
+        a.hardware.push((
+            "Accelerometer".into(),
+            if detected {
+                "✓ Detected".into()
+            } else {
+                "No static evidence (dynamic or ordinal calls may be present)".into()
+            },
+        ));
     }
 
     if let Some(save) = first_matching_string(&strings, |s| s.contains("\\flash disk\\mygames")) {
@@ -768,11 +933,12 @@ mod hardware_detection_tests {
     fn device_strings_detect_features_without_confusing_scene_cameras() {
         use super::*;
         let root = tempfile::tempdir().unwrap();
-        let game: GameEntry = serde_json::from_value(serde_json::json!({
+        let mut game: GameEntry = serde_json::from_value(serde_json::json!({
             "id":"fixture", "display_name":"Fixture", "source_cab":"fixture.zip",
             "executable":"extracted/Autorun.exe", "imported_at":0,
         }))
         .unwrap();
+        game.platform = Some(crate::GamePlatform::Gizmondo);
         let path = game.executable_path(root.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -794,6 +960,18 @@ mod hardware_detection_tests {
         std::fs::write(&path, b"FREECAMERA\0CHASECAMERA\0").unwrap();
         let a = analyze_game(&game, root.path());
         assert!(!a.hardware.contains(&("Camera".into(), "✓ Detected".into())));
+
+        game.platform = Some(crate::GamePlatform::PocketPc);
+        let mut sensor = b"HTCSensorSDK.dll\0HTCSensorGetDataOutput\0".to_vec();
+        sensor.extend("SEN0:\0ACC1:\0".encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(&path, sensor).unwrap();
+        let a = analyze_game(&game, root.path());
+        assert_eq!(
+            a.hardware,
+            vec![("Accelerometer".into(), "✓ Detected".into())]
+        );
+        assert!(a.evidence.iter().any(|line| line == "Accelerometer: sen0:"));
+        assert!(a.evidence.iter().any(|line| line == "Accelerometer: acc1:"));
     }
 }
 
@@ -895,7 +1073,7 @@ mod graphics_api_tests {
         };
         assert_eq!(
             graphics_api_from_imports(&[gdi, gapi, gles]),
-            Some("OpenGL ES")
+            Some("OpenGL ES CM")
         );
     }
     #[test]
@@ -959,6 +1137,39 @@ mod graphics_api_tests {
 #[cfg(test)]
 mod catalogue_cache_tests {
     use super::*;
+    #[test]
+    fn catalogue_follows_only_the_referenced_local_dll() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("game.exe");
+        let aliased = temp.path().join("graphics$a$b.dll");
+        let unrelated = temp.path().join("other.dll");
+        let exact = temp.path().join("graphics.dll");
+        for path in [&aliased, &unrelated] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let inspect = |path: &std::path::Path| {
+            let label = if path == main {
+                None
+            } else if path == aliased {
+                Some("DirectDraw")
+            } else if path == exact {
+                Some("GAPI")
+            } else {
+                panic!("unreferenced DLL was scanned")
+            };
+            Some(ModuleGraphics {
+                label,
+                dependencies: (path == main)
+                    .then(|| "graphics.dll".into())
+                    .into_iter()
+                    .collect(),
+            })
+        };
+        assert_eq!(detect_from_modules(&main, inspect), Some("DirectDraw"));
+        std::fs::write(&exact, b"fixture").unwrap();
+        assert_eq!(detect_from_modules(&main, inspect), Some("GAPI"));
+    }
+
     #[test]
     fn executable_metadata_invalidates_cached_known_and_unknown_results() {
         let temp = tempfile::tempdir().unwrap();

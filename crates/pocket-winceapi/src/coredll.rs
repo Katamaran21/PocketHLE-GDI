@@ -358,6 +358,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "CharUpperW", char_upper_w);
     d.register_handler(dll, "_wcsupr", char_upper_w);
     d.register_handler(dll, "CharLowerW", char_lower_w);
+    d.register_handler(dll, "CharLowerBuffW", char_lower_buff_w);
     d.register_handler(dll, "CharUpperA", char_upper_a);
     d.register_handler(dll, "CharLowerA", char_lower_a);
     d.register_handler(dll, "swprintf", swprintf);
@@ -387,6 +388,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_snprintf", snprintf);
     d.register_handler(dll, "sscanf", sscanf);
     d.register_handler(dll, "fscanf", fscanf);
+    d.register_handler(dll, "fwscanf", fwscanf);
     d.register_handler(dll, "swscanf", swscanf);
     d.register_handler(dll, "_snwprintf", snwprintf);
     d.register_handler(dll, "vswprintf", vswprintf);
@@ -399,6 +401,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // nothing into the buffer and both fields came out blank.
     d.register_handler(dll, "StringCbPrintfW", string_cb_printf_w);
     d.register_handler(dll, "StringCchPrintfW", string_cch_printf_w);
+    d.register_handler(dll, "StringCchCopyW", string_cch_copy_w);
     d.register_handler(dll, "StringCbCopyW", string_cb_copy_w);
     d.register_handler(dll, "StringCbLengthW", string_cb_length_w);
     d.register_handler(dll, "StringCbCatW", string_cb_cat_w);
@@ -428,6 +431,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetSystemMemoryDivision", set_system_memory_division);
     d.register_handler(dll, "GetStoreInformation", get_store_information);
     d.register_handler(dll, "GetDiskFreeSpaceExW", get_disk_free_space_ex_w);
+    d.register_handler(dll, "CeGetVolumeInfo", ce_get_volume_info);
     d.register_handler(dll, "#323", get_store_information);
     d.register_handler(dll, "DeviceIoControl", device_io_control);
     d.register_handler(dll, "SetFilePointer", set_file_pointer);
@@ -484,6 +488,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "feof", crt_feof);
     d.register_handler(dll, "ferror", crt_ferror);
     d.register_handler(dll, "fflush", crt_fflush);
+    d.register_handler(dll, "setvbuf", crt_setvbuf);
     d.register_handler(dll, "_fcloseall", crt_fcloseall);
     // CeGCC's C runtime startup (`crt3.c`) calls `_fpreset` before it
     // reaches `main`; MSVC-built images never do.
@@ -558,14 +563,15 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "HeapSize", heap_size);
     d.register_handler(dll, "GetProcessHeap", get_process_heap);
     d.register_handler(dll, "VirtualAlloc", virtual_alloc);
+    d.register_handler(dll, "VirtualProtect", virtual_protect);
     d.register_handler(dll, "VirtualFree", virtual_free);
     d.register_handler(dll, "qsort", qsort);
     d.register_handler(dll, "malloc", malloc);
     d.register_handler(dll, "calloc", calloc);
     d.register_handler(dll, "free", free);
     d.register_handler(dll, "realloc", realloc);
-    d.register_handler(dll, "_new", malloc);
-    d.register_handler(dll, "_delete", free);
+    d.register_handler(dll, "_new", operator_new);
+    d.register_handler(dll, "_delete", operator_delete);
     // MSVC-mangled C++ scalar new/delete:
     //   ??2@YAPAXI@Z  = void* operator new(unsigned int)
     //   ??3@YAXPAX@Z  = void  operator delete(void*)
@@ -575,11 +581,11 @@ pub fn register(d: &mut WinCeDispatcher) {
     // MFC for CE3 exports the same global allocation ABI by ordinal315.
     d.register_handler("mfcce300.dll", "??2@YAPAXI@Z", operator_new);
     d.register_handler("mfcce300.dll", "ord:315", operator_new);
-    d.register_handler("mfcce300.dll", "??3@YAXPAX@Z", free);
-    d.register_handler("mfcce300.dll", "ord:317", free);
-    d.register_handler(dll, "??3@YAXPAX@Z", free);
+    d.register_handler("mfcce300.dll", "??3@YAXPAX@Z", operator_delete);
+    d.register_handler("mfcce300.dll", "ord:317", operator_delete);
+    d.register_handler(dll, "??3@YAXPAX@Z", operator_delete);
     d.register_handler(dll, "??_U@YAPAXI@Z", operator_new);
-    d.register_handler(dll, "??_V@YAXPAX@Z", free);
+    d.register_handler(dll, "??_V@YAXPAX@Z", operator_delete);
 
     // ---- Resources ----
     d.register_handler(dll, "FindResourceW", find_resource_w);
@@ -691,8 +697,16 @@ pub fn register(d: &mut WinCeDispatcher) {
         "RequestPowerNotifications",
         request_power_notifications,
     );
+    d.register_handler(
+        dll,
+        "RequestDeviceNotifications",
+        request_device_notifications,
+    );
+    d.register_handler(dll, "StopDeviceNotifications", stop_device_notifications);
     d.register_handler(dll, "StopPowerNotifications", stop_power_notifications);
     d.register_handler(dll, "GetSystemPowerState", get_system_power_state);
+    d.register_handler(dll, "SetSystemPowerState", set_system_power_state);
+    d.register_handler(dll, "PowerPolicyNotify", power_policy_notify);
     d.register_handler(
         dll,
         "MsgWaitForMultipleObjectsEx",
@@ -729,6 +743,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "waveOutGetDevCaps", wave_out_get_dev_caps);
     d.register_handler(dll, "waveOutGetDevCapsW", wave_out_get_dev_caps);
     d.register_handler(dll, "waveOutGetPosition", wave_out_get_position);
+    d.register_handler(dll, "waveOutGetPlaybackRate", wave_out_get_playback_rate);
+    d.register_handler(dll, "waveOutSetPlaybackRate", wave_out_set_playback_rate);
     d.register_handler(dll, "waveOutGetID", wave_out_get_id);
     d.register_constant(dll, "waveOutMessage", 0, zero_returning);
     d.register_handler(dll, "setjmp", setjmp);
@@ -736,6 +752,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     send_timeout::register(d, dll);
     d.register_handler(dll, "GetUpdateRect", get_update_rect);
     d.register_handler(dll, "InvalidateRect", invalidate_rect);
+    d.register_handler(dll, "RedrawWindow", redraw_window);
     d.register_handler(dll, "InvalidateRgn", invalidate_rgn);
     d.register_constant(dll, "ValidateRect", 1, one_returning);
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
@@ -787,9 +804,13 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "KillTimer", kill_timer);
     d.register_handler(dll, "RegisterHotKey", register_hot_key);
     d.register_handler(dll, "UnregisterHotKey", unregister_hot_key);
+    d.register_constant(dll, "UnregisterFunc1", 0, zero_returning);
 
     // ---- GDI (real, framebuffer-backed) ----
+    d.register_handler(dll, "GetDoubleClickTime", get_double_click_time);
+    d.register_handler(dll, "MulDiv", mul_div);
     d.register_handler(dll, "GetDC", get_dc);
+    d.register_handler(dll, "GetDCEx", get_dc_ex);
     // Same DC: this HLE has one screen surface and no non-client area to
     // distinguish. An EGL/GL renderer asks for the window DC to build
     // its surface, and a NULL here reads as "no display" and aborts
@@ -975,6 +996,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     // applications save the old HIMC and restore it after their game UI.
     d.register_handler(dll, "ImmAssociateContext", imm_associate_context);
     d.register_handler(dll, "ImmGetContext", imm_get_context);
+    // The built-in input context has no IME-specific escape provider.
+    d.register_constant(dll, "ImmEscapeW", 0, zero_returning);
     d.register_handler(dll, "ImmGetOpenStatus", imm_get_open_status);
     d.register_handler(dll, "ImmSetOpenStatus", imm_set_open_status);
     d.register_handler(dll, "ImmReleaseContext", imm_release_context);
@@ -1001,13 +1024,13 @@ pub fn register(d: &mut WinCeDispatcher) {
     );
     d.register_handler(dll, "DeleteCriticalSection", delete_critical_section);
     d.register_handler(dll, "EnterCriticalSection", enter_critical_section);
+    d.register_handler(dll, "TryEnterCriticalSection", try_enter_critical_section);
     d.register_handler(dll, "LeaveCriticalSection", leave_critical_section);
     d.register_handler(dll, "GetCurrentThreadId", get_current_thread_id);
     d.register_handler(dll, "GetExitCodeThread", get_exit_code_thread);
     d.register_handler(dll, "ExitThread", exit_thread);
     d.register_handler(dll, "GetCurrentProcessId", get_current_process_id);
     d.register_handler(dll, "GetProcessVersion", get_process_version);
-    d.register_handler(dll, "MulDiv", mul_div);
     d.register_handler(dll, "IsBadReadPtr", is_bad_read_ptr);
     d.register_handler(dll, "IsBadWritePtr", is_bad_write_ptr);
     d.register_handler(dll, "GetCurrentProcess", get_current_process);
@@ -1340,6 +1363,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     crate::crt_integer::register(d);
     d.register_handler(dll, "abs", m_abs_i32);
     d.register_handler(dll, "fabs", m_fabs);
+    d.register_handler(dll, "_copysign", m_copysign);
+    d.register_handler(dll, "_finite", m_finite);
     d.register_handler(dll, "atan2", m_atan2);
     d.register_handler(dll, "pow", m_pow);
     d.register_handler(dll, "fmod", m_fmod);
@@ -1469,6 +1494,8 @@ pub fn register(d: &mut WinCeDispatcher) {
         crt_query_new_handler,
     );
     d.register_handler(dll, "_set_new_handler", crt_set_new_handler);
+    d.register_handler(dll, "_set_new_mode", crt_set_new_mode);
+    d.register_handler(dll, "?_set_new_mode@@YAHH@Z", crt_set_new_mode);
     d.register_handler(dll, "_query_new_handler", crt_query_new_handler);
 
     // ---- Session clipboard ----
@@ -2903,17 +2930,31 @@ fn delete_critical_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ker
     ctx.kernel.critical_sections.remove(&key);
     Ok(DispatchOutcome::ReturnedR0(0))
 }
-fn enter_critical_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let key = ctx.arg_u32(0)?;
-    let current = ctx.kernel.current_thread;
-    let lock = ctx
-        .kernel
+fn acquire_critical_section(kernel: &mut KernelState, key: u32) -> bool {
+    let current = kernel.current_thread;
+    let lock = kernel
         .critical_sections
         .entry(key)
         .or_insert((usize::MAX, 0));
-    if lock.1 == 0 || lock.0 == current {
-        lock.0 = current;
-        lock.1 = lock.1.saturating_add(1);
+    if lock.1 != 0 && lock.0 != current {
+        return false;
+    }
+    lock.0 = current;
+    lock.1 = lock.1.saturating_add(1);
+    true
+}
+
+fn try_enter_critical_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let key = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(u32::from(
+        acquire_critical_section(ctx.kernel, key),
+    )))
+}
+
+fn enter_critical_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let key = ctx.arg_u32(0)?;
+    let current = ctx.kernel.current_thread;
+    if acquire_critical_section(ctx.kernel, key) {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     if let Some(index) = current.checked_sub(1) {
@@ -2978,9 +3019,8 @@ fn leave_critical_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
 ///
 /// A guest calling `Sleep` has voluntarily given up the CPU, which is
 /// exactly when a driver thread would have run, so serve the queue here
-/// too. `WaitFor*Object*` deliberately does not do this: those handlers
-/// re-run their call on re-entry, and stacking the callback detour on
-/// top of that has no game asking for it.
+/// too. Blocking single-object waits also deliver callbacks so a worker
+/// can receive its final buffer notification while the caller joins it.
 pub(crate) fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // Must come first: when `waveOutProc` returns, the thunk re-fires
     // this handler with R0..R3 holding the callback's result rather than
@@ -4285,6 +4325,37 @@ fn get_store_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+fn ce_get_volume_info(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const SIZE: u32 = 144;
+    let level = ctx.arg_u32(1)?;
+    let output = ctx.arg_u32(2)?;
+    if level != 0 || !vfs_probe_output(ctx, output, SIZE) || ctx.cpu.read_u32_le(output)? != SIZE {
+        set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let (name, attributes) =
+        match vfs_api_path(ctx, 0).and_then(|path| ctx.kernel.vfs.volume_info(&path)) {
+            Ok(info) => info,
+            Err(error) => {
+                set_thread_error(ctx, error);
+                return Ok(DispatchOutcome::ReturnedR0(0));
+            }
+        };
+    let mut info = [0; SIZE as usize];
+    info[..4].copy_from_slice(&SIZE.to_le_bytes());
+    info[4..8].copy_from_slice(&attributes.to_le_bytes());
+    info[12..16].copy_from_slice(&512u32.to_le_bytes());
+    for (unit, bytes) in name
+        .encode_utf16()
+        .take(31)
+        .zip(info[16..80].chunks_exact_mut(2))
+    {
+        bytes.copy_from_slice(&unit.to_le_bytes());
+    }
+    ctx.cpu.write_mem(output, &info)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn get_disk_free_space_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let ptr = ctx.arg_u32(0)?;
     let outputs = [ctx.arg_u32(1)?, ctx.arg_u32(2)?, ctx.arg_u32(3)?];
@@ -4395,6 +4466,9 @@ fn device_io_control(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     let out_len = ctx.arg_u32(5)?;
     let returned_p = ctx.arg_u32(6)?;
 
+    if ctx.kernel.vfs.is_htc_sensor(handle) {
+        return crate::htcsensor::stream_control(ctx);
+    }
     if ctx.kernel.vfs.bluetooth_driver_open(handle).is_some() {
         return crate::bluetooth::driver_control(ctx);
     }
@@ -4841,6 +4915,7 @@ pub(crate) fn gles_module_handle(name: &str) -> Option<u32> {
         "libgles_cm" => Some(pocket_kernel::GLES_CM_MODULE_HANDLE),
         "libgles_cl" => Some(pocket_kernel::GLES_CL_MODULE_HANDLE),
         "libegl" => Some(pocket_kernel::EGL_MODULE_HANDLE),
+        "libglesv2" => Some(pocket_kernel::GLES2_MODULE_HANDLE),
         _ => None,
     }
 }
@@ -4873,6 +4948,10 @@ fn get_module_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
 }
 
 fn load_library_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // A DllMain return reenters this thunk with callback registers.
+    if let Some(result) = finish_module_attach(ctx)? {
+        return Ok(result);
+    }
     let file = ctx.arg_u32(1)?;
     let flags = ctx.arg_u32(2)?;
     if file != 0 {
@@ -4921,6 +5000,10 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     if let Some(result) = finish_module_attach(ctx)? {
         return Ok(result);
     }
+    load_library(ctx)
+}
+
+fn load_library(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let path_p = ctx.arg_u32(0)?;
     let path = match read_wstr(ctx, path_p, 260) {
         Ok(path) if path_p != 0 && !path.is_empty() => path,
@@ -4957,7 +5040,7 @@ fn load_library_named_inner(
     if let Some(result) = finish_module_attach(ctx)? {
         return Ok(result);
     }
-    let name = request.to_ascii_lowercase();
+    let mut name = request.to_ascii_lowercase();
     if module_file_name(&name) == "note_prj.dll" || name == "note_prj" {
         let handle = pocket_kernel::NOTE_PRJ_MODULE_HANDLE;
         if ctx.kernel.dynamic_exports.contains_key(&handle) {
@@ -4987,6 +5070,11 @@ fn load_library_named_inner(
         log::debug!("LoadLibraryW({name:?}) -> 0x{FAKE_MODULE_HANDLE:08x}");
         return Ok(DispatchOutcome::ReturnedR0(FAKE_MODULE_HANDLE));
     }
+    if name == "toolhelp.dll" || name == "toolhelp" {
+        return Ok(DispatchOutcome::ReturnedR0(
+            pocket_kernel::TOOLHELP_MODULE_HANDLE,
+        ));
+    }
     if name.ends_with("aygshell.dll") || name == "aygshell" {
         let handle = if ctx
             .kernel
@@ -5015,6 +5103,14 @@ fn load_library_named_inner(
         }
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
+    if module_file_name(&name) == "ddraw.dll" {
+        let handle = pocket_kernel::DDRAW_MODULE_HANDLE;
+        if ctx.kernel.dynamic_exports.contains_key(&handle) {
+            return Ok(DispatchOutcome::ReturnedR0(handle));
+        }
+        set_thread_error(ctx, 126);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
     if name.ends_with("commctrl.dll") || name == "commctrl" {
         let handle = if ctx.kernel.dynamic_exports.contains_key(&0x1000_0002) {
             0x1000_0002
@@ -5026,6 +5122,19 @@ fn load_library_named_inner(
             set_thread_error(ctx, 126);
         }
         return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    if matches!(
+        name.rsplit(['\\', '/']).next(),
+        Some("htcsensorsdk" | "htcsensorsdk.dll")
+    ) {
+        if ctx.kernel.find_module_file("htcsensorsdk.dll").is_none() {
+            return Ok(DispatchOutcome::ReturnedR0(
+                pocket_kernel::HTCSENSOR_MODULE_HANDLE,
+            ));
+        }
+        if !name.ends_with(".dll") {
+            name.push_str(".dll");
+        }
     }
     if name.ends_with("hss.dll") || name == "hss" {
         let handle = if ctx.kernel.dynamic_exports.contains_key(&HSS_MODULE_HANDLE) {
@@ -5136,7 +5245,9 @@ pub(crate) fn native_import_available(kernel: &KernelState, thunk: &pocket_kerne
         .ce
         .system_modules
         .contains(&thunk.dll.to_ascii_lowercase())
-        && (!runtime_hle_dll(&thunk.dll) || thunk.dll.eq_ignore_ascii_case("zlib.dll"))
+        && (!runtime_hle_dll(&thunk.dll)
+            || thunk.dll.eq_ignore_ascii_case("zlib.dll")
+            || thunk.dll.eq_ignore_ascii_case("htcsensorsdk.dll"))
         && kernel.find_module_file(&thunk.dll).is_some()
 }
 
@@ -5144,8 +5255,11 @@ pub(crate) fn native_import_available(kernel: &KernelState, thunk: &pocket_kerne
 // Prefer the user's actual runtime from its first call, avoiding split HLE /
 // native CString, allocator and module state. A supplied zlib likewise owns its
 // stream state; never pass an HLE stream handle into a native inflater.
+// A supplied HTC SDK likewise owns its sensor handles and return-code ABI.
 pub(crate) fn native_import_preferred(kernel: &KernelState, thunk: &pocket_kernel::Thunk) -> bool {
-    (thunk.dll.eq_ignore_ascii_case("mfcce300.dll") || thunk.dll.eq_ignore_ascii_case("zlib.dll"))
+    (thunk.dll.eq_ignore_ascii_case("mfcce300.dll")
+        || thunk.dll.eq_ignore_ascii_case("zlib.dll")
+        || thunk.dll.eq_ignore_ascii_case("htcsensorsdk.dll"))
         && native_import_available(kernel, thunk)
 }
 
@@ -5240,6 +5354,7 @@ pub(crate) fn runtime_hle_dll(dll: &str) -> bool {
             | "ole32.dll"
             | "sdlaunch.dll"
             | "hss.dll"
+            | "htcsensorsdk.dll"
             | "oleaut32.dll"
             | "iphlpapi.dll"
             | "crypt32.dll"
@@ -5247,8 +5362,150 @@ pub(crate) fn runtime_hle_dll(dll: &str) -> bool {
             | "winsock.dll"
             | "ws2.dll"
             | "wininet.dll"
+            | "mmtimer.dll"
+            | "winmm.dll"
             | "zlib.dll"
     ) || gles_module_handle(&name).is_some()
+}
+
+/// WinCE EXEs can import DLL data directly through the IAT. Resolve these
+/// slots before entry, since the guest may dereference them without a call.
+pub(crate) fn attach_static_imports(
+    cpu: &mut dyn pocket_cpu::Cpu,
+    kernel: &mut KernelState,
+    resume: bool,
+) -> Result<Option<u32>, KernelError> {
+    use pocket_kernel::STATIC_DLL_ATTACH_RETURN_VA;
+    let thunk = pocket_kernel::Thunk {
+        thunk_va: STATIC_DLL_ATTACH_RETURN_VA,
+        iat_va: 0,
+        dll: "coredll.dll".into(),
+        binding: pocket_pe::ImportBinding::Name("LoadLibraryW".into()),
+        friendly_name: None,
+    };
+    let mut ctx = CallCtx {
+        cpu,
+        thunk: &thunk,
+        kernel,
+    };
+    let outcome = if resume {
+        finish_module_attach(&mut ctx)?.ok_or_else(|| {
+            KernelError::Loader("Static DLL attach returned without its saved context".into())
+        })?
+    } else {
+        // Main executables can have MUI satellites just like DLLs.
+        // Map them before the entry point so early resource lookups can see them.
+        if let Some(path) = ctx.kernel.find_module_file(&ctx.kernel.module_path) {
+            load_mui_satellites(&mut ctx, &path, 0);
+        }
+        let mut modules = std::collections::BTreeMap::new();
+        for import in &ctx.kernel.image_imports {
+            if !runtime_hle_dll(&import.dll) {
+                modules
+                    .entry(import.dll.to_ascii_lowercase())
+                    .or_insert_with(Vec::new)
+                    .push(import.clone());
+            }
+        }
+        let mut bindings = Vec::new();
+        for (dll, imports) in modules {
+            let Some(path) = ctx.kernel.find_module_file(&dll) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(image) = pocket_pe::load_bytes(&bytes) else {
+                continue;
+            };
+            let key = |binding: &pocket_pe::ImportBinding| match binding {
+                pocket_pe::ImportBinding::Name(name) => name.clone(),
+                pocket_pe::ImportBinding::Ordinal(ordinal) => format!("#{ordinal}"),
+            };
+            if !imports.iter().any(|import| {
+                image.exports.get(&key(&import.binding)).is_some_and(|rva| {
+                    image.sections.iter().any(|section| {
+                        !section.is_executable()
+                            && *rva >= section.virtual_address
+                            && *rva - section.virtual_address
+                                < section.virtual_size.max(section.data.len() as u32)
+                    })
+                })
+            }) {
+                continue;
+            }
+            let base = if let Some(module) = ctx.kernel.module_by_name(&dll) {
+                module.base
+            } else {
+                let base = load_resource_module(&mut ctx, &dll)?.ok_or_else(|| {
+                    KernelError::Loader(format!("Cannot load static DLL data imports from {dll}"))
+                })?;
+                // The mapper retains an explicit LoadLibrary reference by default.
+                // The main executable's imports instead pin this module until exit.
+                if let Some(module) = ctx.kernel.modules.iter_mut().find(|m| m.base == base) {
+                    module.refcount = 0;
+                }
+                base
+            };
+            if !ctx.kernel.static_module_roots.contains(&base) {
+                ctx.kernel.static_module_roots.push(base);
+            }
+            for import in imports {
+                if let Some(address) = ctx.kernel.dynamic_exports[&base].get(&key(&import.binding))
+                {
+                    bindings.push((import.iat_va, *address));
+                }
+            }
+        }
+        if bindings.is_empty() {
+            return Ok(None);
+        }
+        for (slot, address) in bindings {
+            ctx.cpu.write_mem(slot, &address.to_le_bytes())?;
+        }
+        let cleanup: Vec<_> = ctx
+            .kernel
+            .modules
+            .iter()
+            .filter(|m| !m.attached)
+            .map(|m| m.base)
+            .collect();
+        if cleanup.is_empty() {
+            return Ok(None);
+        }
+        let sequence = cleanup.iter().rev().copied().collect();
+        let frame = GuestCallFrame {
+            args: [
+                ctx.arg_u32(0)?,
+                ctx.arg_u32(1)?,
+                ctx.arg_u32(2)?,
+                ctx.arg_u32(3)?,
+            ],
+            lr: ctx.cpu.read_reg(ArmReg::Lr)?,
+            sp: ctx.cpu.read_reg(ArmReg::Sp)?,
+        };
+        ctx.cpu.add_code_hook(STATIC_DLL_ATTACH_RETURN_VA)?;
+        let pending = pocket_kernel::ModuleAttachFrame {
+            detaching: false,
+            base: 0,
+            thunk: STATIC_DLL_ATTACH_RETURN_VA,
+            thread: ctx.kernel.current_thread,
+            frame,
+            sequence,
+            cleanup,
+            completed: vec![],
+            result: 1,
+            error: None,
+        };
+        advance_module_callback(&mut ctx, pending)?
+    };
+    match outcome {
+        DispatchOutcome::JumpTo(entry) => Ok(Some(entry)),
+        DispatchOutcome::ReturnedR0(1) => Ok(None),
+        _ => Err(KernelError::Loader(
+            "Static DLL process attach failed".into(),
+        )),
+    }
 }
 
 fn begin_module_attach(ctx: &mut CallCtx<'_>, base: u32) -> Result<DispatchOutcome, KernelError> {
@@ -5508,7 +5765,8 @@ fn load_mui_satellites(ctx: &mut CallCtx<'_>, host_path: &std::path::Path, owner
         .filter_map(|e| e.file_name().to_str().map(str::to_owned))
         .filter(|n| {
             n.len() == file_name.len() + 9
-                && n.starts_with(file_name)
+                && n.get(..file_name.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(file_name))
                 && n[file_name.len()..].starts_with('.')
                 && n[file_name.len() + 5..].eq_ignore_ascii_case(".mui")
                 && n[file_name.len() + 1..file_name.len() + 5]
@@ -5660,6 +5918,8 @@ fn hle_module_handle(dll: &str) -> Option<u32> {
         "gx.dll" => 0x1000_0001,
         "commctrl.dll" => 0x1000_0002,
         "ddraw.dll" => 0x1000_0003,
+        "toolhelp.dll" => pocket_kernel::TOOLHELP_MODULE_HANDLE,
+        "htcsensorsdk.dll" => pocket_kernel::HTCSENSOR_MODULE_HANDLE,
         "hss.dll" => pocket_kernel::HSS_MODULE_HANDLE,
         "ole32.dll" => pocket_kernel::OLE32_MODULE_HANDLE,
         "iphlpapi.dll" => pocket_kernel::IPHLPAPI_MODULE_HANDLE,
@@ -5878,7 +6138,8 @@ fn map_resource_module_inner(
         .iter()
         .map(|import| {
             runtime_hle_dll(&import.dll)
-                && !(import.dll.eq_ignore_ascii_case("zlib.dll")
+                && !((import.dll.eq_ignore_ascii_case("zlib.dll")
+                    || import.dll.eq_ignore_ascii_case("htcsensorsdk.dll"))
                     && (ctx.kernel.module_by_name(&import.dll).is_some()
                         || native_dependency_file(ctx.kernel, host_path, &import.dll).is_some()))
         })
@@ -6188,6 +6449,7 @@ fn map_resource_module_inner(
         module_slot,
         handle: base,
         name,
+        guest_path: ctx.kernel.vfs.guest_path_for_file(request, host_path),
         base,
         image_size: image.size_of_image,
         image_entry,
@@ -6291,14 +6553,21 @@ pub(crate) fn lookup_resource(
     None
 }
 
-/// Resolve a resource *address* previously handed to the guest by
-/// `FindResourceW` back to the entry it came from, whichever image that
-/// was.
-fn resource_at_address(kernel: &KernelState, addr: u32) -> Option<(ResourceEntry, u32)> {
+/// Resolve the payload or native directory-entry address in a loaded image.
+fn resource_at_address(kernel: &KernelState, addr: u32) -> Option<(u32, u32)> {
     for (entries, base) in kernel.resource_scopes() {
         let rva = addr.wrapping_sub(base);
-        if let Some(e) = entries.iter().find(|e| e.data_rva == rva) {
-            return Some((e.clone(), base));
+        for entry in entries {
+            if entry.data_rva == rva {
+                return Some((addr, entry.size));
+            }
+            if let Some(leaf) = entry
+                .native_leaves
+                .iter()
+                .find(|leaf| leaf.directory_entry_rva == rva || leaf.data_rva == rva)
+            {
+                return Some((base.wrapping_add(leaf.data_rva), leaf.size));
+            }
         }
     }
     None
@@ -6327,12 +6596,15 @@ fn write_wide_str(
 }
 
 fn get_module_file_name_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // GetModuleFileNameW(HINSTANCE hModule, LPWSTR lpFilename, DWORD nSize) -> DWORD
-    let _h = ctx.arg_u32(0)?;
+    let module = ctx.arg_u32(0)?;
     let dst = ctx.arg_u32(1)?;
     let cap = ctx.arg_u32(2)?;
-    let path = ctx.kernel.module_path.clone();
-    let written = write_wide_str(ctx.cpu, dst, cap, &path)?;
+    let path = ctx
+        .kernel
+        .module_by_handle(module)
+        .filter(|module| !module.guest_path.is_empty())
+        .map_or(&ctx.kernel.module_path, |module| &module.guest_path);
+    let written = write_wide_str(ctx.cpu, dst, cap, path)?;
     Ok(DispatchOutcome::ReturnedR0(written))
 }
 
@@ -8569,6 +8841,12 @@ fn crt_vfprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn emit_stream_text(ctx: &mut CallCtx<'_>, stream: u32, text: &str) -> Result<(), KernelError> {
     if std_file_label(stream).is_some() || console::stream_is_open(ctx.kernel, stream) {
         console::write_text(ctx, stream, text, false);
+        if std_file_label(stream) == Some("stderr") && !text.trim().is_empty() {
+            let text = text.trim_end_matches(['\r', '\n']);
+            log::info!(target: "pockethle_guest_stderr", "{text}");
+        }
+    } else if ctx.kernel.vfs.is_open(stream) {
+        write_stdio_raw(ctx, stream, &crate::crt_ansi::encode(text));
     } else {
         log::debug!("guest fprintf to unknown stream 0x{stream:08x}: {text}");
     }
@@ -9019,13 +9297,25 @@ fn run_sscanf(
 /// records. Translate CRLF only for a text-mode FILE and map logical offsets
 /// back to physical bytes before seeking to the final position.
 fn fscanf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    scan_stream(ctx, false)
+}
+
+fn fwscanf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    scan_stream(ctx, true)
+}
+
+fn scan_stream(ctx: &mut CallCtx<'_>, wide: bool) -> Result<DispatchOutcome, KernelError> {
     use pocket_kernel::vfs::SeekKind;
     let handle = ctx.arg_u32(0)?;
     let format = ctx.arg_u32(1)?;
     if format == 0 || !ctx.kernel.vfs.is_open(handle) {
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
     }
-    let fmt = String::from_utf8_lossy(&read_crt_cstr(ctx, format)?).into_owned();
+    let fmt = if wide {
+        String::from_utf16_lossy(&read_wstr(ctx, format, 0x4000)?)
+    } else {
+        String::from_utf8_lossy(&read_crt_cstr(ctx, format)?).into_owned()
+    };
     let Some(start) = ctx.kernel.vfs.seek(handle, 0, SeekKind::Current) else {
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
     };
@@ -9045,23 +9335,31 @@ fn fscanf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let mut input = Vec::new();
     let pushed = ctx.kernel.crt_pushback.remove(&handle);
     let mut offsets = vec![0usize];
+    let mut append = |byte: u8, position: usize| {
+        if wide && !byte.is_ascii() {
+            let text = crate::crt_ansi::decode(&[byte]);
+            input.extend_from_slice(text.as_bytes());
+            offsets.resize(input.len() + 1, position);
+        } else {
+            input.push(byte);
+            offsets.push(position);
+        }
+    };
     if let Some(byte) = pushed {
-        input.push(byte);
-        offsets.push(0);
+        append(byte, 0);
     }
     let mut i = 0;
     while i < raw.len() {
         if text_mode && raw[i] == b'\r' && raw.get(i + 1) == Some(&b'\n') {
-            input.push(b'\n');
             i += 2;
+            append(b'\n', i);
         } else {
-            input.push(raw[i]);
             i += 1;
+            append(raw[i - 1], i);
         }
-        offsets.push(i);
     }
     let mut arg = 2u8;
-    let result = run_scan_bytes(ctx, &input, &fmt, false, |ctx| {
+    let result = run_scan_bytes(ctx, &input, &fmt, wide, |ctx| {
         let pointer = ctx.arg_u32(arg)?;
         arg = arg.saturating_add(1);
         Ok(pointer)
@@ -9334,6 +9632,28 @@ fn string_cb_length_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         STRSAFE_E_INSUFFICIENT_BUFFER
     }))
 }
+fn string_cch_copy_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const E_INVALIDARG: u32 = 0x8007_0057;
+    let dst = ctx.arg_u32(0)?;
+    let capacity = ctx.arg_u32(1)?;
+    let src = ctx.arg_u32(2)?;
+    if dst == 0 || src == 0 || capacity == 0 || capacity > 0x7fff_ffff {
+        return Ok(DispatchOutcome::ReturnedR0(E_INVALIDARG));
+    }
+    let mut units = read_wstr(ctx, src, capacity)?;
+    let truncated = units.len() == capacity as usize;
+    if truncated {
+        units.pop();
+    }
+    units.push(0);
+    ctx.cpu.write_mem(dst, &wide_to_bytes(&units))?;
+    Ok(DispatchOutcome::ReturnedR0(if truncated {
+        STRSAFE_E_INSUFFICIENT_BUFFER
+    } else {
+        S_OK
+    }))
+}
+
 /// `HRESULT StringCchPrintfW(LPWSTR dst, size_t cchDest, LPCWSTR fmt, ...)`
 /// — capacity counted in *characters*.
 fn string_cch_printf_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -9710,6 +10030,28 @@ fn char_upper_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(p))
 }
 
+fn char_lower_buff_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let ptr = ctx.arg_u32(0)?;
+    let count = ctx.arg_u32(1)?;
+    let Some(size) = count.checked_mul(2).filter(|&size| size != 0) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if !vfs_probe_output(ctx, ptr, size) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut bytes = ctx.cpu.read_mem(ptr, size)?;
+    for unit in bytes.chunks_exact_mut(2) {
+        let original = u16::from_le_bytes([unit[0], unit[1]]);
+        if let Some(character) = char::from_u32(original as u32) {
+            let lower = character.to_lowercase().next().unwrap_or(character);
+            let value = u16::try_from(lower as u32).unwrap_or(original);
+            unit.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    ctx.cpu.write_mem(ptr, &bytes)?;
+    Ok(DispatchOutcome::ReturnedR0(count))
+}
+
 fn char_lower_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let p = ctx.arg_u32(0)?;
     if p == 0 {
@@ -9774,6 +10116,20 @@ fn create_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         .is_ok_and(|n| n.trim_matches(['\\', '/']).eq_ignore_ascii_case("COM8:"))
     {
         return crate::serial::open(ctx);
+    }
+    if let Ok(name) = &name {
+        use pocket_kernel::vfs::AccelerometerStream;
+        let name = name.trim_matches(['\\', '/']);
+        let stream = if name.eq_ignore_ascii_case("SEN0:") {
+            Some(AccelerometerStream::Sen0)
+        } else if name.eq_ignore_ascii_case("ACC1:") {
+            Some(AccelerometerStream::Acc1)
+        } else {
+            None
+        };
+        if let Some(stream) = stream {
+            return Ok(crate::htcsensor::open_stream(ctx, disposition, stream));
+        }
     }
     let result = name.and_then(|name| {
         ctx.kernel.vfs.open_file(
@@ -10465,6 +10821,20 @@ fn crt_fpreset(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
+fn crt_setvbuf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let stream = ctx.arg_u32(0)?;
+    let mode = ctx.arg_u32(2)?;
+    // stdio writes already go straight to the VFS. Accept unbuffered
+    // mode for both the CE and desktop CRT constant spellings.
+    let valid = matches!(mode, 2 | 4)
+        && (std_file_label(stream).is_some() || ctx.kernel.vfs.is_open(stream));
+    Ok(DispatchOutcome::ReturnedR0(if valid {
+        0
+    } else {
+        u32::MAX
+    }))
+}
+
 fn crt_fflush(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let stream = ctx.arg_u32(0)?;
     if stream == 0 {
@@ -10513,7 +10883,7 @@ fn read_stdio_raw(ctx: &mut CallCtx<'_>, stream: u32, bytes: &mut [u8]) -> Optio
             console::read_bytes(ctx, handle, bytes)
         }
     } else {
-        ctx.kernel.vfs.read(handle, bytes)
+        ctx.kernel.vfs.read_stdio(handle, bytes)
     };
     if result.is_none() {
         ctx.kernel.crt_stream_errors.insert(stream);
@@ -10685,9 +11055,8 @@ fn crt_fseek(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn crt_ftell(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    use pocket_kernel::vfs::SeekKind;
     let h = ctx.arg_u32(0)?;
-    let pos = ctx.kernel.vfs.seek(h, 0, SeekKind::Current).unwrap_or(0);
+    let pos = ctx.kernel.vfs.position(h).unwrap_or(0);
     let pos = pos.saturating_sub(u64::from(ctx.kernel.crt_pushback.contains_key(&h)));
     Ok(DispatchOutcome::ReturnedR0(pos as u32))
 }
@@ -10706,10 +11075,9 @@ fn crt_ftell(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// to be on the stack, so the game's archive loader walked off the end
 /// of its own tables and faulted before the first frame.
 fn crt_fgetpos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    use pocket_kernel::vfs::SeekKind;
     let h = ctx.arg_u32(0)?;
     let out = ctx.arg_u32(1)?;
-    let Some(pos) = ctx.kernel.vfs.seek(h, 0, SeekKind::Current) else {
+    let Some(pos) = ctx.kernel.vfs.position(h) else {
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
     };
     let pos = pos.saturating_sub(u64::from(ctx.kernel.crt_pushback.contains_key(&h)));
@@ -10742,7 +11110,6 @@ fn crt_fsetpos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn crt_feof(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    use pocket_kernel::vfs::SeekKind;
     let stream = ctx.arg_u32(0)?;
     let h = console::stream_handle(ctx, stream).unwrap_or(INVALID_HANDLE_VALUE);
     if let Some(console) = ctx.kernel.vfs.console_open(h) {
@@ -10755,8 +11122,11 @@ fn crt_feof(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
                 && !ctx.kernel.crt_pushback.contains_key(&h),
         )));
     }
+    if ctx.kernel.vfs.has_stdio_read_ahead(h) || ctx.kernel.crt_pushback.contains_key(&h) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
     let size = ctx.kernel.vfs.size(h).unwrap_or(0);
-    let pos = ctx.kernel.vfs.seek(h, 0, SeekKind::Current).unwrap_or(0);
+    let pos = ctx.kernel.vfs.position(h).unwrap_or(0);
     Ok(DispatchOutcome::ReturnedR0(
         if pos >= size && !ctx.kernel.crt_pushback.contains_key(&h) {
             1
@@ -11244,6 +11614,18 @@ fn memory_division_virtual_commit_ranges() {
     );
 }
 
+fn virtual_page_permissions(protect: u32) -> Option<Prot> {
+    Some(match protect {
+        1 => Prot::NONE,
+        2 => Prot::READ,
+        4 => Prot::READ | Prot::WRITE,
+        0x10 => Prot::EXEC,
+        0x20 => Prot::EXEC | Prot::READ,
+        0x40 => Prot::EXEC | Prot::READ | Prot::WRITE,
+        _ => return None,
+    })
+}
+
 fn virtual_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect)
     let addr = ctx.arg_u32(0)?;
@@ -11251,17 +11633,9 @@ fn virtual_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 
     let kind = ctx.arg_u32(2)?;
     let protect = ctx.arg_u32(3)?;
-    let prot = match protect {
-        1 => Prot::NONE,
-        2 => Prot::READ,
-        4 => Prot::READ | Prot::WRITE,
-        0x10 => Prot::EXEC,
-        0x20 => Prot::EXEC | Prot::READ,
-        0x40 => Prot::EXEC | Prot::READ | Prot::WRITE,
-        _ => {
-            set_thread_error(ctx, ERROR_INVALID_PARAMETER);
-            return Ok(DispatchOutcome::ReturnedR0(0));
-        }
+    let Some(prot) = virtual_page_permissions(protect) else {
+        set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+        return Ok(DispatchOutcome::ReturnedR0(0));
     };
     if kind & !0x3000 != 0 || kind & 0x3000 == 0 {
         set_thread_error(ctx, ERROR_INVALID_PARAMETER);
@@ -11344,6 +11718,85 @@ fn virtual_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(base))
 }
 
+fn virtual_protect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const PAGE_NOCACHE: u32 = 0x200;
+    const ERROR_INVALID_ADDRESS: u32 = 487;
+    let address = ctx.arg_u32(0)?;
+    let size = ctx.arg_u32(1)?;
+    let protect = ctx.arg_u32(2)?;
+    let old_protect_out = ctx.arg_u32(3)?;
+    // PAGE_NOCACHE is a guest cache policy hint. Retain it for VirtualQuery
+    // and subsequent VirtualProtect calls; the CPU backend needs only R/W/X.
+    let Some(prot) = virtual_page_permissions(protect & !PAGE_NOCACHE)
+        .filter(|&p| p != Prot::NONE || protect & PAGE_NOCACHE == 0)
+    else {
+        set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if size == 0
+        || old_protect_out == 0
+        || ctx
+            .cpu
+            .check_guest_access(old_protect_out, 4, Prot::WRITE)
+            .is_err()
+    {
+        set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    let start = address & !4095;
+    let Some(end) = address
+        .checked_add(size)
+        .and_then(|end| end.checked_add(4095))
+        .map(|end| end & !4095)
+    else {
+        set_thread_error(ctx, ERROR_INVALID_ADDRESS);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+
+    // Check the full range before changing any page. The heap tracks
+    // commitment separately from CPU mappings, which include reserved pages.
+    let mut old_ranges = Vec::new();
+    let mut allocation = None;
+    let mut page = start;
+    while page < end {
+        let Some([_, base, _, bytes, 0x1000, old, _]) = ctx.kernel.heap.query_virtual(page) else {
+            set_thread_error(ctx, ERROR_INVALID_ADDRESS);
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        };
+        if allocation.is_some_and(|previous| previous != base) {
+            set_thread_error(ctx, ERROR_INVALID_ADDRESS);
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        allocation = Some(base);
+        let len = bytes.min(end - page);
+        old_ranges.push((page, len, old));
+        page += len;
+    }
+
+    if ctx.cpu.protect_region(start, end - start, prot).is_err() {
+        set_thread_error(ctx, ERROR_NOT_SUPPORTED);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    // Check the output's original writability above, even when it resides
+    // inside the protected range. A host write can still fail on page-in.
+    if let Err(error) = ctx
+        .cpu
+        .write_mem(old_protect_out, &old_ranges[0].2.to_le_bytes())
+    {
+        for (base, len, old) in old_ranges {
+            let old = virtual_page_permissions(old & !PAGE_NOCACHE)
+                .expect("committed virtual pages have supported protection");
+            ctx.cpu.protect_region(base, len, old)?;
+        }
+        return Err(error.into());
+    }
+    ctx.kernel
+        .heap
+        .set_virtual_page_protect(start, end - start, protect);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn virtual_free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let address = ctx.arg_u32(0)?;
     if ctx.kernel.mapped_views.containing(address).is_some() {
@@ -11393,7 +11846,13 @@ fn malloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn operator_new(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let size = ctx.arg_u32(0)?;
-    do_alloc(ctx, size)
+    allocate_zeroed(ctx, size, pocket_kernel::Heap::alloc_cpp)
+}
+
+fn operator_delete(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let pointer = ctx.arg_u32(0)?;
+    do_free(ctx, pointer);
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn calloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -11404,9 +11863,9 @@ fn calloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let p = ctx.arg_u32(0)?;
-    if p != 0 {
-        do_free(ctx, p);
-    }
+    // A stale CRT free can otherwise reclaim an unrelated C++ object when
+    // the common heap reuses a block (Shift's audio plug-in does this).
+    ctx.kernel.heap.free_crt(p);
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
@@ -11421,7 +11880,15 @@ fn realloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// `LocalSize` / `_msize` / `do_free` / `do_realloc` can recover it
 /// later without trusting guest memory.
 pub(crate) fn do_alloc(ctx: &mut CallCtx<'_>, size: u32) -> Result<DispatchOutcome, KernelError> {
-    let user_ptr = match ctx.kernel.heap.alloc(size) {
+    allocate_zeroed(ctx, size, pocket_kernel::Heap::alloc)
+}
+
+fn allocate_zeroed(
+    ctx: &mut CallCtx<'_>,
+    size: u32,
+    allocate: fn(&mut pocket_kernel::Heap, u32) -> Option<u32>,
+) -> Result<DispatchOutcome, KernelError> {
+    let user_ptr = match allocate(&mut ctx.kernel.heap, size) {
         Some(p) => p,
         None => {
             log::warn!("heap exhausted; alloc({size}) failed");
@@ -11843,6 +12310,7 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
                     ctx.cpu.write_reg(ArmReg::R3, frame.args[3])?;
                     ctx.cpu.write_reg(ArmReg::Lr, frame.lr)?;
                     finish_window_callback(ctx.kernel);
+                    activate_visible_created_window(ctx.kernel, hwnd);
                     queue_window_paint(ctx.kernel, hwnd);
                     if window_is_visible(ctx.kernel, hwnd) {
                         system_sound::window_event(
@@ -11900,7 +12368,8 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
                         o => o,
                     });
                 }
-                // Visible children need their first paint even when the app
+                activate_visible_created_window(ctx.kernel, hwnd);
+                // Visible windows need their first paint even when the app
                 // never calls ShowWindow again after WS_VISIBLE creation.
                 queue_window_paint(ctx.kernel, hwnd);
                 if window_is_visible(ctx.kernel, hwnd) {
@@ -12113,6 +12582,20 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             .windows
             .raise(hwnd, ex_style & 8 != 0, &ctx.kernel.window_styles);
     }
+    if hwnd != FAKE_HWND
+        && style & 0x5000_0000 == 0x1000_0000
+        && ctx
+            .kernel
+            .gdi
+            .class_values
+            .get(&(class_name.to_ascii_lowercase(), -10))
+            .is_some_and(|&brush| brush != 0)
+    {
+        let dc = window_dc(ctx, hwnd);
+        if dc != GDI_SCREEN_DC {
+            erase_child_background(ctx, hwnd, dc)?;
+        }
+    }
     let create_struct = ctx.kernel.heap.alloc(0x40).unwrap_or(0);
     if create_struct != 0 {
         // CREATESTRUCTW: lpCreateParams, hInstance, hMenu, hwndParent, cy,
@@ -12221,6 +12704,7 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             ctx.kernel.pending_create = Some((hwnd, create_struct));
         }
     }
+    activate_visible_created_window(ctx.kernel, hwnd);
     if window_is_visible(ctx.kernel, hwnd) {
         system_sound::window_event(
             ctx.kernel,
@@ -12229,6 +12713,24 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         );
     }
     Ok(DispatchOutcome::ReturnedR0(hwnd))
+}
+
+fn activate_visible_created_window(kernel: &mut KernelState, hwnd: u32) {
+    const WS_CHILD: u32 = 0x4000_0000;
+    const WS_VISIBLE: u32 = 0x1000_0000;
+    const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+    if kernel
+        .window_styles
+        .get(&hwnd)
+        .is_some_and(|&(style, ex_style)| {
+            style & (WS_CHILD | WS_VISIBLE) == WS_VISIBLE && ex_style & WS_EX_NOACTIVATE == 0
+        })
+    {
+        kernel.active_window = hwnd;
+        raise_window_panels(kernel, hwnd);
+        kernel.gdi.pending_window_erases.insert(hwnd);
+        kernel.invalidate_presentation();
+    }
 }
 
 /// `BOOL ShowWindow(HWND hWnd, int nCmdShow)`.
@@ -12597,11 +13099,17 @@ fn create_msg_queue(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     let name = ctx.arg_u32(0)?;
     let options = ctx.arg_u32(1)?;
     let (max_messages, max_message_size, read_access) = read_msg_queue_options(ctx, options)?;
+    let queue_name = if name == 0 {
+        None
+    } else {
+        Some(String::from_utf16_lossy(&read_wstr(ctx, name, 260)?))
+    };
     let handle = ctx.kernel.next_msg_queue_handle;
     ctx.kernel.next_msg_queue_handle = ctx.kernel.next_msg_queue_handle.wrapping_add(1);
     ctx.kernel.msg_queues.insert(
         handle,
         pocket_kernel::MsgQueue {
+            name: queue_name,
             max_messages: max_messages.max(1),
             max_message_size: max_message_size.max(1),
             read_access,
@@ -12726,6 +13234,42 @@ fn write_msg_queue(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+fn request_device_notifications(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let class = ctx.arg_u32(0)?;
+    let queue = ctx.arg_u32(1)?;
+    if !ctx.kernel.msg_queues.contains_key(&queue) {
+        set_thread_error(ctx, ERROR_INVALID_HANDLE);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if class != 0 && ctx.cpu.check_guest_access(class, 16, Prot::READ).is_err() {
+        set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let handle = ctx.kernel.next_device_notification;
+    if handle >= 0xda90_0000 || ctx.kernel.device_notification_queues.len() >= 1024 {
+        set_thread_error(ctx, 8);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    // The emulator exposes mounted filesystems through the VFS. Its device
+    // manager has no advertised PnP interfaces to enumerate or hotplug.
+    ctx.kernel.next_device_notification += 1;
+    ctx.kernel.device_notification_queues.insert(handle, queue);
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+fn stop_device_notifications(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let stopped = ctx
+        .kernel
+        .device_notification_queues
+        .remove(&handle)
+        .is_some();
+    if !stopped {
+        set_thread_error(ctx, ERROR_INVALID_HANDLE);
+    }
+    Ok(DispatchOutcome::ReturnedR0(u32::from(stopped)))
+}
+
 /// Register a process-owned CE power-manager subscription. Spore Origins
 /// requires registration to succeed even when no power change has occurred.
 fn request_power_notifications(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -12761,24 +13305,77 @@ fn stop_power_notifications(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ke
     Ok(DispatchOutcome::ReturnedR0(u32::from(stopped)))
 }
 
-/// `DWORD GetSystemPowerState(LPVOID pSystemPowerState, DWORD dwLen,
-///                             LPDWORD pdwFlags, DWORD dwFlags)`.
-///
-/// Diamond Twister polls this before every iteration of its window loop.
-/// The desktop HLE has no suspend/resume power manager, so report the
-/// active state and clear the optional flag output instead of returning
-/// zero without touching the caller's buffers.
+const POWER_STATE_ON: u32 = 0x0001_0000;
+const POWER_STATE_BACKLIGHTON: u32 = 0x0200_0000;
+
+/// Project host display power onto the guest backlight flag. With no
+/// physical display reading the emulated LCD retains its normal on state.
 fn get_system_power_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const STATE_NAME: [u8; 6] = [b'o', 0, b'n', 0, 0, 0];
     let state = ctx.arg_u32(0)?;
     let state_len = ctx.arg_u32(1)?;
     let flags_out = ctx.arg_u32(2)?;
-    if state != 0 && state_len >= 4 {
-        ctx.cpu.write_mem(state, &0u32.to_le_bytes())?;
+    if state != 0 {
+        if state_len < 3 {
+            return Ok(DispatchOutcome::ReturnedR0(122)); // ERROR_INSUFFICIENT_BUFFER
+        }
+        ctx.cpu.write_mem(state, &STATE_NAME)?;
     }
     if flags_out != 0 {
-        ctx.cpu.write_mem(flags_out, &0u32.to_le_bytes())?;
+        let mut flags = POWER_STATE_ON;
+        if pocket_kernel::power::host_display_is_on().unwrap_or(true) {
+            flags |= POWER_STATE_BACKLIGHTON;
+        }
+        ctx.cpu.write_mem(flags_out, &flags.to_le_bytes())?;
     }
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// WinCE keeps the emulated system in the active state. An explicit request
+/// to stay on succeeds. Other transitions require an emulated power manager.
+fn set_system_power_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const POWER_FORCE: u32 = 0x0000_1000;
+    let name = ctx.arg_u32(0)?;
+    let flags = ctx.arg_u32(1)?;
+    let options = ctx.arg_u32(2)?;
+    if options & !POWER_FORCE != 0 {
+        return Ok(DispatchOutcome::ReturnedR0(ERROR_INVALID_PARAMETER));
+    }
+    let on = if name == 0 {
+        if flags == 0 {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_INVALID_PARAMETER));
+        }
+        flags == POWER_STATE_ON
+    } else {
+        let Some(name) = power_requirement_name(ctx, name) else {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_INVALID_PARAMETER));
+        };
+        name.eq_ignore_ascii_case("on")
+    };
+    Ok(DispatchOutcome::ReturnedR0(if on {
+        0
+    } else {
+        ERROR_NOT_SUPPORTED
+    }))
+}
+
+/// BOOL PowerPolicyNotify(DWORD dwMessage, DWORD dwData).
+fn power_policy_notify(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const PPN_UNATTENDEDMODE: u32 = 3;
+    if ctx.arg_u32(0)? != PPN_UNATTENDEDMODE {
+        set_thread_error(ctx, ERROR_NOT_SUPPORTED);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    let enable = ctx.arg_u32(1)? != 0;
+    let accepted = ctx
+        .kernel
+        .power_notifications
+        .request_unattended_mode(enable);
+    if !accepted {
+        set_thread_error(ctx, 8); // ERROR_NOT_ENOUGH_MEMORY
+    }
+    Ok(DispatchOutcome::ReturnedR0(u32::from(accepted)))
 }
 
 fn get_msg_queue_info(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -12804,6 +13401,9 @@ fn close_msg_queue(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     Ok(DispatchOutcome::ReturnedR0(
         if ctx.kernel.msg_queues.remove(&handle).is_some() {
             ctx.kernel.power_notifications.close_queue(handle);
+            ctx.kernel
+                .device_notification_queues
+                .retain(|_, queue| *queue != handle);
             1
         } else {
             0
@@ -12827,6 +13427,7 @@ fn open_msg_queue(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     ctx.kernel.next_msg_queue_handle = ctx.kernel.next_msg_queue_handle.wrapping_add(1);
     let (_, _, read_access) = read_msg_queue_options(ctx, options)?;
     let queue = pocket_kernel::MsgQueue {
+        name: None,
         max_messages: source.0,
         max_message_size: source.1,
         read_access,
@@ -14111,20 +14712,7 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         .kernel
         .take_message_return(owner, ctx.cpu.read_reg(ArmReg::Sp)?)
     {
-        use pocket_cpu::regs::ArmReg;
-        for (index, value) in frame.args.iter().enumerate() {
-            ctx.cpu.write_reg(
-                match index {
-                    0 => ArmReg::R0,
-                    1 => ArmReg::R1,
-                    2 => ArmReg::R2,
-                    _ => ArmReg::R3,
-                },
-                *value,
-            )?;
-        }
-        ctx.cpu.write_reg(ArmReg::Sp, frame.sp)?;
-        ctx.cpu.write_reg(ArmReg::Lr, frame.lr)?;
+        frame.restore(ctx.cpu)?;
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     // DispatchMessageW(const MSG *lpMsg) — pass the message into the
@@ -14199,16 +14787,7 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         hwnd, message, wparam, lparam, wnd_proc
     );
     use pocket_cpu::regs::ArmReg;
-    let frame = pocket_kernel::GuestCallFrame {
-        args: [
-            ctx.cpu.read_reg(ArmReg::R0)?,
-            ctx.cpu.read_reg(ArmReg::R1)?,
-            ctx.cpu.read_reg(ArmReg::R2)?,
-            ctx.cpu.read_reg(ArmReg::R3)?,
-        ],
-        lr: ctx.cpu.read_reg(ArmReg::Lr)?,
-        sp: ctx.cpu.read_reg(ArmReg::Sp)?,
-    };
+    let frame = pocket_kernel::DispatchMessageFrame::capture(ctx.cpu)?;
     ctx.kernel
         .message_frames
         .entry(owner)
@@ -16272,9 +16851,41 @@ fn take_posted_message(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
     take_posted_message_at(ctx.kernel, i)
 }
 
+fn input_window_thread(kernel: &KernelState) -> usize {
+    kernel
+        .window_threads
+        .get(&input_window(kernel))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn next_host_input_message(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
+    if ctx.kernel.ce.windows.enabled {
+        // Explorer's taskbar and folder controls run on distinct UI workers.
+        // Route each event through hit testing and wake its actual recipient.
+        return next_input_message(ctx);
+    }
+    if input_window_thread(ctx.kernel) != ctx.kernel.current_thread {
+        return None;
+    }
+    while let Some(ev) = take_pending_input(ctx) {
+        update_key_state(ctx, ev);
+        if let Some(handled) = controls_take_input(ctx, ev) {
+            match handled {
+                Some(addressed) => return Some(addressed),
+                None => continue,
+            }
+        }
+        if let Some(addressed) = addressed_input(ctx.kernel, ev) {
+            return Some(addressed);
+        }
+    }
+    None
+}
+
 fn next_queued_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
-    if let Some(message) = next_input_message(ctx) {
-        return Some(message);
+    if let Some(input) = next_host_input_message(ctx) {
+        return Some(input);
     }
     // Driver notifications (`MM_WOM_DONE`) outrank the synthetic
     // paint/timer pump: a game streaming music refills its buffer from
@@ -16433,7 +17044,7 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
             write_retrieved_message(ctx, lp_msg, 0, msg, wp, lp)?;
             return Ok(DispatchOutcome::ReturnedR0(u32::from(msg != WM_QUIT)));
         }
-        if let Some((hwnd, msg, wp, lp)) = next_input_message(ctx) {
+        if let Some((hwnd, msg, wp, lp)) = next_host_input_message(ctx) {
             write_retrieved_message(ctx, lp_msg, hwnd, msg, wp, lp)?;
             return Ok(DispatchOutcome::ReturnedR0(u32::from(msg != WM_QUIT)));
         }
@@ -16579,11 +17190,11 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
             write_retrieved_message(ctx, lp_msg, 0, msg, wp, lp)?;
             return Ok(DispatchOutcome::ReturnedR0(1));
         }
-        if let Some(message) = next_input_message(ctx) {
+        if let Some(message @ (hwnd, msg, wp, lp)) = next_host_input_message(ctx) {
             if remove_mode & 1 == 0 {
                 ctx.kernel.posted_messages.push_front(message);
             }
-            write_retrieved_message(ctx, lp_msg, message.0, message.1, message.2, message.3)?;
+            write_retrieved_message(ctx, lp_msg, hwnd, msg, wp, lp)?;
             return Ok(DispatchOutcome::ReturnedR0(1));
         }
         if let Some((hwnd, msg, wp, lp)) = timer_message_if_due(ctx, remove_mode & 1 != 0) {
@@ -16911,8 +17522,10 @@ fn block_on_wait(
     if let Some(outcome) = resume_worker_reenter(ctx)? {
         return Ok(outcome);
     }
-    // Keep the main call open. The normal run-loop hook still services host
-    // stop/input while the event is unsignalled or its deadline is pending.
+    // No guest thread can run until a signal or a timeout. Retry the same
+    // call after yielding outside the shared execution gate so other
+    // processes can run and signal it.
+    ctx.kernel.wait_retry_delay = Some(std::time::Duration::from_millis(1));
     Ok(DispatchOutcome::JumpTo(ctx.thunk.thunk_va))
 }
 
@@ -17239,6 +17852,18 @@ fn window_dc(ctx: &mut CallCtx<'_>, hwnd: u32) -> u32 {
     ctx.kernel.gdi.pending_window_erases.insert(hwnd);
     dc
 }
+fn get_double_click_time(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(500))
+}
+
+fn get_dc_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if ctx.arg_u32(1)? == 0 && ctx.arg_u32(2)? == 0 {
+        return get_dc(ctx);
+    }
+    set_thread_error(ctx, ERROR_NOT_SUPPORTED);
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
 fn get_dc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
     Ok(DispatchOutcome::ReturnedR0(window_dc(ctx, hwnd)))
@@ -18262,6 +18887,17 @@ fn get_current_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
 
 fn delete_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let h = ctx.arg_u32(0)?;
+    // A DirectDraw DC borrows its bitmap and surface pixels until ReleaseDC.
+    if ctx
+        .kernel
+        .framebuffer
+        .directdraw
+        .surface_dcs
+        .values()
+        .any(|&(_, bitmap)| bitmap == h)
+    {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
     let dib_bits = ctx.kernel.gdi.bitmap(h).and_then(|b| b.dib_bits_va);
     let deleted = ctx.kernel.gdi.delete(h);
     if deleted && ctx.kernel.gdi.bitmap(h).is_none() {
@@ -19407,7 +20043,7 @@ pub(crate) fn sync_bitmap_to_guest(ctx: &mut CallCtx<'_>, bm_h: u32) -> Result<(
 /// `bm.dib_row_stride * bm.height` and for actually writing the
 /// result back to guest memory.
 // Chopper Fight overlays labels on DIB pixels written directly by the guest.
-fn sync_dib_from_guest(ctx: &mut CallCtx<'_>, hdc: u32) -> Result<(), KernelError> {
+pub(crate) fn sync_dib_from_guest(ctx: &mut CallCtx<'_>, hdc: u32) -> Result<(), KernelError> {
     let bitmap_handle = match ctx.kernel.gdi.dc(hdc).and_then(|dc| dc.selected_bitmap) {
         Some(handle) => handle,
         None => return Ok(()),
@@ -19588,11 +20224,11 @@ fn find_resource_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 }
 
 fn load_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // LoadResource just returns the same handle on Windows when the
-    // resource is in-image. We've already encoded the data VA in the
-    // FindResource result.
-    let h = ctx.arg_u32(1)?;
-    Ok(DispatchOutcome::ReturnedR0(h))
+    // FindResourceW returns a payload VA. Native resource walkers also
+    // pass the address of the PE directory's IMAGE_RESOURCE_DATA_ENTRY.
+    let handle = ctx.arg_u32(1)?;
+    let address = resource_at_address(ctx.kernel, handle).map_or(handle, |(payload, _)| payload);
+    Ok(DispatchOutcome::ReturnedR0(address))
 }
 
 fn lock_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -19604,8 +20240,8 @@ fn sizeof_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     // SizeofResource(hModule, hResInfo) — hResInfo is the VA we
     // returned from FindResourceW. We look up by data_rva.
     let h = ctx.arg_u32(1)?;
-    if let Some((entry, _base)) = resource_at_address(ctx.kernel, h) {
-        return Ok(DispatchOutcome::ReturnedR0(entry.size));
+    if let Some((_, size)) = resource_at_address(ctx.kernel, h) {
+        return Ok(DispatchOutcome::ReturnedR0(size));
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -20813,59 +21449,7 @@ pub(crate) fn read_guest_wstr_lossy(
     Ok(String::from_utf16_lossy(&read_wstr(ctx, p, max)?))
 }
 
-/// Decode a PCM `.wav` into interleaved `i16` samples.
-///
-/// Split out of [`play_sound_impl`] so `hss.dll` can reuse it: both
-/// paths accept exactly the formats [`parse_pcm_wave`] admits, and a
-/// second decoder would be a second set of rounding bugs.
-pub(crate) fn decode_pcm_wave(
-    bytes: &[u8],
-) -> Option<(pocket_kernel::audio::GuestFormat, Vec<i16>)> {
-    let Some((fmt, data)) = parse_pcm_wave(bytes) else {
-        return crate::wave_adpcm::decode(bytes);
-    };
-    let samples: Vec<i16> = match fmt.bits_per_sample {
-        8 => data.iter().map(|&b| (b as i16 - 128) * 256).collect(),
-        16 => data
-            .chunks_exact(2)
-            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect(),
-        _ => return None,
-    };
-    Some((fmt, samples))
-}
-
-fn parse_pcm_wave(bytes: &[u8]) -> Option<(pocket_kernel::audio::GuestFormat, &[u8])> {
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut p = 12usize;
-    let mut fmt = None;
-    let mut data = None;
-    while p + 8 <= bytes.len() {
-        let id = &bytes[p..p + 4];
-        let size = u32::from_le_bytes(bytes[p + 4..p + 8].try_into().ok()?) as usize;
-        let end = p.checked_add(8)?.checked_add(size)?.min(bytes.len());
-        if id == b"fmt " && size >= 16 && p + 24 <= bytes.len() {
-            let tag = u16::from_le_bytes(bytes[p + 8..p + 10].try_into().ok()?);
-            let channels = u16::from_le_bytes(bytes[p + 10..p + 12].try_into().ok()?);
-            let rate = u32::from_le_bytes(bytes[p + 12..p + 16].try_into().ok()?);
-            let bits = u16::from_le_bytes(bytes[p + 22..p + 24].try_into().ok()?);
-            if tag != 1 || channels == 0 || rate == 0 || !matches!(bits, 8 | 16) {
-                return None;
-            }
-            fmt = Some(pocket_kernel::audio::GuestFormat {
-                sample_rate: rate,
-                channels,
-                bits_per_sample: bits,
-            });
-        } else if id == b"data" {
-            data = Some(&bytes[p + 8..end]);
-        }
-        p = p + 8 + size + (size & 1);
-    }
-    Some((fmt?, data?))
-}
+pub(crate) use pocket_kernel::audio::decode_pcm_wave;
 
 const OSVERSIONINFOW_BYTES: u32 = 4 + 4 * 4 + 128 * 2;
 
@@ -20979,6 +21563,95 @@ fn queue_visible_window_paints(kernel: &mut KernelState, hwnd: u32) {
         kernel.gdi.pending_window_erases.insert(child);
         queue_window_paint(kernel, child);
     }
+}
+
+fn redraw_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const INVALIDATE: u32 = 0x001;
+    const INTERNAL_PAINT: u32 = 0x002;
+    const ERASE: u32 = 0x004;
+    const VALIDATE: u32 = 0x008;
+    const NO_INTERNAL_PAINT: u32 = 0x010;
+    const NO_ERASE: u32 = 0x020;
+    const NO_CHILDREN: u32 = 0x040;
+    const ALL_CHILDREN: u32 = 0x080;
+
+    let hwnd = ctx.arg_u32(0)?;
+    let rect = ctx.arg_u32(1)?;
+    let region = ctx.arg_u32(2)?;
+    let flags = ctx.arg_u32(3)?;
+    if hwnd != 0 && !is_live_hwnd(hwnd) {
+        set_thread_error(ctx, 1400); // ERROR_INVALID_WINDOW_HANDLE
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let empty = if region != 0 {
+        let Some(rects) = ctx.kernel.gdi.regions.get(&region) else {
+            set_thread_error(ctx, ERROR_INVALID_HANDLE);
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        };
+        rects.is_empty()
+    } else if rect != 0 {
+        let bytes = match ctx.cpu.read_mem(rect, 16) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+                return Ok(DispatchOutcome::ReturnedR0(0));
+            }
+        };
+        let coordinate =
+            |index: usize| i32::from_le_bytes(bytes[index..index + 4].try_into().unwrap());
+        coordinate(0) >= coordinate(8) || coordinate(4) >= coordinate(12)
+    } else {
+        false
+    };
+    let mut windows: Vec<_> = if hwnd == 0 {
+        ctx.kernel
+            .window_procs
+            .keys()
+            .copied()
+            .filter(|window| {
+                flags & NO_CHILDREN == 0 || !ctx.kernel.window_parents.contains_key(window)
+            })
+            .collect()
+    } else {
+        vec![hwnd]
+    };
+    if hwnd != 0 && flags & (ALL_CHILDREN | NO_CHILDREN) == ALL_CHILDREN {
+        let mut index = 0;
+        while index < windows.len() {
+            let parent = windows[index];
+            for (&child, &owner) in &ctx.kernel.window_parents {
+                if owner == parent && !windows.contains(&child) {
+                    windows.push(child);
+                }
+            }
+            index += 1;
+        }
+    }
+    windows.sort_unstable();
+    for window in windows {
+        if flags & (VALIDATE | NO_INTERNAL_PAINT) != 0 && !empty {
+            cancel_generated_paint(ctx.kernel, window);
+        }
+        if flags & NO_ERASE != 0 {
+            ctx.kernel.gdi.pending_window_erases.remove(&window);
+            if window == FAKE_HWND {
+                ctx.kernel.window_background_erase_pending = false;
+            }
+        }
+        if (flags & INVALIDATE != 0 && !empty)
+            || flags & (INTERNAL_PAINT | NO_INTERNAL_PAINT) == INTERNAL_PAINT
+        {
+            // Use the existing full-client update queue, like UpdateWindow.
+            queue_window_paint(ctx.kernel, window);
+            if flags & (INVALIDATE | ERASE | NO_ERASE) == INVALIDATE | ERASE && !empty {
+                ctx.kernel.gdi.pending_window_erases.insert(window);
+                if window == FAKE_HWND {
+                    ctx.kernel.window_background_erase_pending = true;
+                }
+            }
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn invalidate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -21968,6 +22641,12 @@ fn wait_for_single_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
     service_mas_audio(ctx.kernel);
     ctx.kernel.sync_power_notifications();
     crate::shell::service(ctx);
+    let thunk_va = ctx.thunk.thunk_va;
+    // A wave callback returns through this same thunk. Restore its interrupted
+    // call before inspecting the handle or touching the wait deadline.
+    if ctx.kernel.wave_out.function_frame.is_some() {
+        wave_out_enter_callback(ctx, thunk_va)?;
+    }
     let handle = ctx.arg_u32(0)?;
     let timeout = ctx.arg_u32(1)?;
 
@@ -21976,19 +22655,12 @@ fn wait_for_single_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
         return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
     }
 
-    // The real wave driver keeps running while a guest thread is blocked in
-    // WaitForSingleObject.  In this HLE, buffer retirement normally happens
-    // only when the guest crosses one of our API boundaries; without servicing
-    // waveOut here, a CALLBACK_NULL mixer can submit its first buffer, wait,
-    // and never observe WHDR_DONE even though the host has already consumed it.
-    //
-    // CALLBACK_FUNCTION is the one exception: delivering a waveOutProc requires
-    // a guest-call detour and this handler may be re-entered while a wait is
-    // being reevaluated.  Sleep/the message pump already own that detour path.
-    // The other notification modes only mutate guest-visible state or enqueue/
-    // signal an object, which is exactly what an asynchronous driver would do
-    // while the thread waits.
-    if ctx.kernel.wave_out.callback_kind != WaveCallbackKind::Function {
+    // Driver completion can signal an event or queue a guest function.
+    // Retire function-mode buffers even when the main thread has stopped
+    // pumping messages. Keep the existing full service for other modes.
+    if ctx.kernel.wave_out.callback_kind == WaveCallbackKind::Function {
+        retire_completed_wave_buffers(ctx)?;
+    } else {
         service_wave_out(ctx)?;
     }
 
@@ -22007,6 +22679,27 @@ fn wait_for_single_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
     if waitable_is_signalled(ctx.kernel, handle) {
         let result = acquire_wait_signal(ctx.kernel, handle);
         return finish_wait(ctx, result);
+    }
+    if timeout != 0 && !ctx.kernel.wave_out.function_done.is_empty() {
+        if timeout != u32::MAX {
+            let key = (
+                ctx.kernel.current_thread,
+                thunk_va,
+                ctx.cpu.read_reg(ArmReg::Sp)?,
+            );
+            let now = monotonic_ms();
+            let deadline = *ctx
+                .kernel
+                .wait_deadlines
+                .entry(key)
+                .or_insert_with(|| now.saturating_add(u64::from(timeout)));
+            if now >= deadline {
+                return finish_wait(ctx, 0x102); // WAIT_TIMEOUT
+            }
+        }
+        if let Some(outcome) = wave_out_enter_callback(ctx, thunk_va)? {
+            return Ok(outcome);
+        }
     }
     block_on_wait(ctx, &[handle], false, timeout)
 }
@@ -22871,6 +23564,9 @@ fn blit_text_at(
     let color = colorref_to_rgb565(dc_meta.text_color);
     let bk_color = colorref_to_rgb565(dc_meta.bk_color);
     let selected_font = selected_text_font(ctx.kernel, hdc);
+    let turn = selected_font
+        .as_ref()
+        .and_then(|font| pocket_kernel::text::TextQuarterTurn::new(x, y, font.field(8)));
     let layout = pocket_kernel::text::layout_dx(selected_font.as_ref(), &chars, dx);
     let (x, mut y) = aligned_text_origin(&dc_meta, x, y, layout.width, layout.height);
     // TA_BASELINE uses ascent, TA_BOTTOM uses the complete cell.
@@ -22903,15 +23599,28 @@ fn blit_text_at(
                 );
             }
         } else if !dc_meta.bk_transparent {
-            let left = x.max(clip[0]);
-            let top = y.max(clip[1]);
-            let right = x.saturating_add(layout.width).min(clip[2]);
-            let bottom = y.saturating_add(layout.height).min(clip[3]);
+            let cell = [
+                x,
+                y,
+                x.saturating_add(layout.width),
+                y.saturating_add(layout.height),
+            ];
+            let [left, top, right, bottom] = turn
+                .filter(|_| layout.width > 0 && layout.height > 0)
+                .map_or(cell, |turn| turn.bounds(cell));
+            let left = left.max(clip[0]);
+            let top = top.max(clip[1]);
+            let right = right.min(clip[2]);
+            let bottom = bottom.min(clip[3]);
             if right > left && bottom > top {
                 surf.fill_rect(left, top, right - left, bottom - top, bk_color);
             }
         }
-        layout.draw(&mut surf, x, y, color, clip);
+        if let Some(turn) = turn {
+            layout.draw_quarter_turn(&mut surf, x, y, color, clip, turn);
+        } else {
+            layout.draw(&mut surf, x, y, color, clip);
+        }
         surf.mark_dirty();
     }
     sync_dst_dib_to_guest(ctx, hdc)?;
@@ -23600,6 +24309,10 @@ fn tls_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn tls_free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let slot = ctx.arg_u32(0)?;
+    free_tls_slot(ctx, slot)
+}
+
+fn free_tls_slot(ctx: &mut CallCtx<'_>, slot: u32) -> Result<DispatchOutcome, KernelError> {
     if slot >= TLS_SLOT_COUNT || ctx.kernel.tls_slots_used & (1u64 << slot) == 0 {
         set_thread_error(ctx, ERROR_INVALID_PARAMETER);
         return Ok(DispatchOutcome::ReturnedR0(0));
@@ -24150,6 +24863,16 @@ fn m_abs_i32(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn m_fabs(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     libm_unary_d(c, f64::abs)
+}
+
+fn m_finite(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(u32::from(
+        read_f64(ctx, 0)?.is_finite(),
+    )))
+}
+
+fn m_copysign(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_binary_d(c, f64::copysign)
 }
 
 fn m_atan2(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -26167,8 +26890,20 @@ fn acquire_wait_signal(kernel: &mut KernelState, handle: u32) -> u32 {
     0
 }
 
-fn tls_call(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0))
+fn tls_call(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // CE SDKs expose TlsAlloc and TlsFree as TlsCall macros. Share the
+    // slot bitmap and per-thread KData values with the named imports.
+    match ctx.arg_u32(0)? {
+        0 => tls_alloc(ctx),
+        1 => {
+            let slot = ctx.arg_u32(1)?;
+            free_tls_slot(ctx, slot)
+        }
+        _ => {
+            set_thread_error(ctx, ERROR_INVALID_PARAMETER);
+            Ok(DispatchOutcome::ReturnedR0(0))
+        }
+    }
 }
 
 fn ce_set_thread_quantum(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -26350,9 +27085,35 @@ fn wave_out_get_dev_caps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
             buf[76..78].copy_from_slice(&2u16.to_le_bytes());
         }
         if buf.len() >= 84 {
-            buf[80..84].copy_from_slice(&12u32.to_le_bytes()); // WAVECAPS_VOLUME | WAVECAPS_LRVOLUME
+            // WAVECAPS_PLAYBACKRATE | WAVECAPS_VOLUME | WAVECAPS_LRVOLUME
+            buf[80..84].copy_from_slice(&14u32.to_le_bytes());
         }
         ctx.cpu.write_mem(caps, &buf)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
+}
+
+fn wave_out_get_playback_rate(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let output = ctx.arg_u32(1)?;
+    let Some(rate) = ctx.kernel.audio.wave_playback_rate(handle) else {
+        return Ok(DispatchOutcome::ReturnedR0(5)); // MMSYSERR_INVALHANDLE
+    };
+    if output == 0 || ctx.cpu.check_guest_access(output, 4, Prot::WRITE).is_err() {
+        return Ok(DispatchOutcome::ReturnedR0(11)); // MMSYSERR_INVALPARAM
+    }
+    ctx.cpu.write_mem(output, &rate.to_le_bytes())?;
+    Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
+}
+
+fn wave_out_set_playback_rate(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let rate = ctx.arg_u32(1)?;
+    if (rate as i32) <= 0 {
+        return Ok(DispatchOutcome::ReturnedR0(11)); // MMSYSERR_INVALPARAM
+    }
+    if !ctx.kernel.audio.set_wave_playback_rate(handle, rate) {
+        return Ok(DispatchOutcome::ReturnedR0(5)); // MMSYSERR_INVALHANDLE
     }
     Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
 }
@@ -28449,6 +29210,53 @@ fn find_close_change_notification(ctx: &mut CallCtx<'_>) -> Result<DispatchOutco
 #[cfg(test)]
 mod tests {
     #[test]
+    fn resource_descriptor_and_payload_addresses_resolve_to_the_same_data() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        kernel.image_base = 0x10000;
+        kernel.resources.push(ResourceEntry {
+            ty: ResourceKey::Id(10),
+            name: ResourceKey::Id(7),
+            data_rva: 0x2000,
+            native_leaves: vec![
+                pocket_pe::resources::ResourceLeaf {
+                    directory_entry_rva: 0x1000,
+                    data_rva: 0x2000,
+                    size: 16,
+                },
+                pocket_pe::resources::ResourceLeaf {
+                    directory_entry_rva: 0x1010,
+                    data_rva: 0x2100,
+                    size: 24,
+                },
+            ],
+            size: 16,
+            codepage: 0,
+        });
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut kernel,
+            thunk: &thunk,
+        };
+        for (handle, address, size) in [
+            (0x11000, 0x12000, 16),
+            (0x12000, 0x12000, 16),
+            (0x11010, 0x12100, 24),
+        ] {
+            ctx.cpu.write_reg(ArmReg::R1, handle).unwrap();
+            assert_eq!(
+                load_resource(&mut ctx).unwrap(),
+                DispatchOutcome::ReturnedR0(address)
+            );
+            assert_eq!(
+                sizeof_resource(&mut ctx).unwrap(),
+                DispatchOutcome::ReturnedR0(size)
+            );
+        }
+    }
+
+    #[test]
     fn retained_frame_cap_is_obeyed_by_message_pumps_and_sleep() {
         use std::time::{Duration, Instant};
         for boundary in 0..3 {
@@ -28614,6 +29422,7 @@ mod tests {
         let entry = |name: &str, rva: u32| ResourceEntry {
             ty: ResourceKey::Name("TXT".into()),
             name: ResourceKey::Name(name.into()),
+            native_leaves: Vec::new(),
             data_rva: rva,
             size: 16,
             codepage: 0,
@@ -29441,6 +30250,7 @@ mod tests {
         kernel.resources.push(ResourceEntry {
             ty: ResourceKey::Id(2),
             name: ResourceKey::Id(211),
+            native_leaves: Vec::new(),
             data_rva: 0x100,
             size: 48,
             codepage: 0,
@@ -29738,7 +30548,7 @@ mod tests {
             ),
             DispatchOutcome::ReturnedR0(0)
         );
-        assert_eq!(cpu.read_mem(0x2150, 4).unwrap(), 12u32.to_le_bytes());
+        assert_eq!(cpu.read_mem(0x2150, 4).unwrap(), 14u32.to_le_bytes());
         // WAVE_FORMAT_2S16 must be advertised for applications that check
         // stereo 22.05 kHz support before starting their renderer.
         assert_eq!(cpu.read_mem(0x2148, 4).unwrap(), 0x0fffu32.to_le_bytes());
@@ -30017,6 +30827,33 @@ mod tests {
         assert_eq!(ctx.cpu.read_reg(ArmReg::R0).unwrap(), 0x1100);
         assert_eq!(ctx.cpu.read_reg(ArmReg::Lr).unwrap(), 0x10400);
         assert!(ctx.kernel.message_frames.is_empty());
+    }
+
+    #[test]
+    fn dispatch_message_restores_nonvolatile_registers_after_a_window_callback() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let thunk = thunk_at(0x70000100);
+        kernel.wnd_proc = 0x10200;
+        write_synthetic_msg(&mut cpu, 0x1100, WM_LBUTTONDOWN, 1, 0x00200010).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1100).unwrap();
+        cpu.write_reg(ArmReg::Lr, 0x10400).unwrap();
+        cpu.write_reg(ArmReg::R4, 0x12345678).unwrap();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut kernel,
+            thunk: &thunk,
+        };
+        assert_eq!(
+            dispatch_message_w(&mut ctx).unwrap(),
+            DispatchOutcome::JumpTo(0x10200)
+        );
+        ctx.cpu.write_reg(ArmReg::R4, 0x00200010).unwrap();
+        assert_eq!(
+            dispatch_message_w(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R4).unwrap(), 0x12345678);
     }
 
     #[test]
@@ -30771,6 +31608,59 @@ mod tests {
         assert_eq!(
             api!("GetWindowTextLengthW", &[edit]),
             DispatchOutcome::ReturnedR0(10)
+        );
+    }
+
+    #[test]
+    fn stdio_byte_reads_and_eof_queries_keep_read_ahead_and_logical_position() {
+        use crate::bluetooth::tests::{call, setup};
+        use pocket_kernel::vfs::Access;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stream.dat"), b"abcdef").unwrap();
+        let (mut cpu, mut k, mut d) = setup();
+        k.vfs.mount("\\Data\\", dir.path());
+        let h = k
+            .vfs
+            .open("\\Data\\stream.dat", Access::Read, false)
+            .unwrap();
+        macro_rules! api {
+            ($name:literal,$args:expr) => {
+                call(&mut cpu, &mut k, &mut d, "coredll.dll", $name, $args)
+            };
+        }
+        assert_eq!(
+            api!("fgetc", &[h]),
+            DispatchOutcome::ReturnedR0(b'a' as u32)
+        );
+        assert!(k.vfs.has_stdio_read_ahead(h));
+        for _ in 0..100 {
+            assert_eq!(api!("feof", &[h]), DispatchOutcome::ReturnedR0(0));
+            assert!(k.vfs.has_stdio_read_ahead(h));
+        }
+        assert_eq!(api!("ftell", &[h]), DispatchOutcome::ReturnedR0(1));
+        assert_eq!(api!("fseek", &[h, 0, 2]), DispatchOutcome::ReturnedR0(0));
+        assert_eq!(api!("feof", &[h]), DispatchOutcome::ReturnedR0(1));
+        assert_eq!(
+            api!("ungetc", &[b'Z' as u32, h]),
+            DispatchOutcome::ReturnedR0(b'Z' as u32)
+        );
+        assert_eq!(api!("feof", &[h]), DispatchOutcome::ReturnedR0(0));
+        assert_eq!(
+            api!("fgetc", &[h]),
+            DispatchOutcome::ReturnedR0(b'Z' as u32)
+        );
+        assert_eq!(api!("feof", &[h]), DispatchOutcome::ReturnedR0(1));
+        api!("rewind", &[h]);
+        assert_eq!(
+            api!("fgetc", &[h]),
+            DispatchOutcome::ReturnedR0(b'a' as u32)
+        );
+        api!("fflush", &[h]);
+        assert!(!k.vfs.has_stdio_read_ahead(h));
+        assert_eq!(api!("ftell", &[h]), DispatchOutcome::ReturnedR0(1));
+        assert_eq!(
+            api!("fgetc", &[h]),
+            DispatchOutcome::ReturnedR0(b'b' as u32)
         );
     }
 
@@ -31710,6 +32600,7 @@ mod tests {
             handle: base,
             name: format!("{base:x}.dll"),
             base,
+            guest_path: String::new(),
             image_size: 4096,
             image_entry: entry,
             resources: vec![],
@@ -32244,6 +33135,7 @@ mod tests {
                 handle: base,
                 base,
                 name: "test.dll".into(),
+                guest_path: String::new(),
                 image_size: 0x2000,
                 image_entry: base + 0x1000,
                 resources: vec![],
@@ -32885,6 +33777,45 @@ mod tests {
     }
 
     #[test]
+    fn native_data_import_is_bound_and_pins_the_dll_before_main() {
+        let root = tempfile::tempdir().unwrap();
+        let mut dll = loader_fixture_dll(None);
+        // Export Value from .data instead of .text.
+        dll[0xc2c..0xc30].copy_from_slice(&0x3000u32.to_le_bytes());
+        std::fs::write(root.path().join("loader-test.dll"), dll).unwrap();
+        let mut cpu = StubCpu::new();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(
+            pocket_kernel::KERNEL_TRAP_BASE,
+            0x1000,
+            Prot::READ | Prot::EXEC,
+        )
+        .unwrap();
+        let mut kernel = fresh_kernel();
+        kernel.module_search_dirs.push(root.path().to_path_buf());
+        kernel.image_imports.push(pocket_pe::ImportSymbol {
+            dll: "loader-test.dll".into(),
+            binding: pocket_pe::ImportBinding::Name("Value".into()),
+            iat_va: 0x1100,
+        });
+        cpu.write_reg(ArmReg::R0, 0x1234).unwrap();
+        let entry = attach_static_imports(&mut cpu, &mut kernel, false).unwrap();
+        let base = kernel.modules[0].base;
+        assert_eq!(entry, Some(base + 0x1000));
+        assert_eq!(cpu.read_u32_le(0x1100).unwrap(), base + 0x3000);
+        cpu.write_reg(ArmReg::R0, 1).unwrap();
+        assert_eq!(
+            attach_static_imports(&mut cpu, &mut kernel, true).unwrap(),
+            None
+        );
+        assert_eq!(cpu.read_reg(ArmReg::R0).unwrap(), 0x1234);
+        assert!(kernel.modules[0].attached);
+        assert_eq!(kernel.modules[0].refcount, 0);
+        assert!(kernel.unreachable_runtime_modules().is_empty());
+    }
+
+    #[test]
     fn native_import_binds_function_and_data_iat_as_one_runtime() {
         for missing_export in [false, true] {
             let mut cpu = StubCpu::new();
@@ -32965,6 +33896,7 @@ mod tests {
                 handle: base,
                 base,
                 name: "audio.dll".into(),
+                guest_path: String::new(),
                 image_size: 0x2000,
                 image_entry: base + 0x1000,
                 resources: vec![],
@@ -33438,6 +34370,7 @@ mod tests {
         kernel.msg_queues.insert(
             1,
             pocket_kernel::MsgQueue {
+                name: None,
                 max_messages: 4,
                 max_message_size: 36,
                 read_access: true,
@@ -33861,6 +34794,7 @@ mod tests {
             gles_local_ordinals: std::collections::HashMap::new(),
             runtime_thunks: std::collections::HashMap::new(),
             module_attach_frames: Vec::new(),
+            static_module_roots: Vec::new(),
             dll_notification_frame: None,
             next_module_handle: 0x1000_0001,
             modules: Vec::new(),
@@ -33871,6 +34805,7 @@ mod tests {
             guest_fb_pitch: 0,
             direct_fb_frames: 0,
             gx_readback_scratch: Vec::new(),
+            gx_previous_readback: Vec::new(),
             gx_layout_scratch: Vec::new(),
             gapi_column_major: false,
             mem_op_scratch: Vec::new(),
@@ -33937,6 +34872,7 @@ mod tests {
             pending_input: std::collections::VecDeque::new(),
             stylus_stick: Default::default(),
             touch_steering: Default::default(),
+            virtual_tilt_axes: None,
             gapi_keys_queried: false,
             pocketpc_processor: None,
             gapi_action_key: pocket_kernel::gapi::VK_A,
@@ -33952,11 +34888,13 @@ mod tests {
             notification_icons: Default::default(),
             winsock_last_errors: Default::default(),
             crt_new_handler: 0,
+            crt_new_mode: 0,
             cpp_new_handler: 0,
             worker_schedule_cursor: 0,
             worker_round_seen: Vec::new(),
             worker_preempt_after_ms: 0,
             wait_deadlines: std::collections::HashMap::new(),
+            wait_retry_delay: None,
             guest_fpscr: std::collections::HashMap::new(),
             timer_period_requests: std::collections::BTreeMap::new(),
             critical_sections: std::collections::HashMap::new(),
@@ -33987,7 +34925,10 @@ mod tests {
             posted_messages: Default::default(),
             msg_queues: std::collections::HashMap::new(),
             next_msg_queue_handle: 0xDEAD_E500,
+            registry_notifications: Default::default(),
             power_notifications: Default::default(),
+            device_notification_queues: Default::default(),
+            next_device_notification: 0xda80_0000,
             battery_alerts: Default::default(),
             menus: std::collections::HashMap::new(),
             menu_items: std::collections::HashMap::new(),
@@ -34291,6 +35232,95 @@ mod tests {
             DispatchOutcome::ReturnedR0(0)
         );
         assert_eq!(ctx.cpu.read_u32_le(0x2004).unwrap(), WM_QUIT);
+    }
+
+    #[test]
+    fn worker_window_receives_stylus_input_in_its_own_message_pump() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let thunk = dummy_thunk();
+        kernel.active_window = FAKE_HWND;
+        kernel.window_threads.insert(FAKE_HWND, 1);
+        kernel
+            .pending_input
+            .push_back(InputEvent::PointerDown { x: 42, y: 31 });
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut kernel,
+            thunk: &thunk,
+        };
+        assert_eq!(next_host_input_message(&mut ctx), None);
+        ctx.kernel.current_thread = 1;
+        for mode in [0u32, 1] {
+            ctx.cpu.write_reg(ArmReg::R0, 0x2000).unwrap();
+            ctx.cpu.write_mem(0x9000, &mode.to_le_bytes()).unwrap();
+            assert_eq!(
+                peek_message_w(&mut ctx).unwrap(),
+                DispatchOutcome::ReturnedR0(1)
+            );
+            assert_eq!(ctx.cpu.read_u32_le(0x2000).unwrap(), FAKE_HWND);
+            assert_eq!(ctx.cpu.read_u32_le(0x2004).unwrap(), WM_LBUTTONDOWN);
+        }
+        assert!(ctx.kernel.pending_input.is_empty());
+        assert!(ctx.kernel.posted_messages.is_empty());
+    }
+
+    #[test]
+    fn ce_copysign_ordinal_returns_both_soft_float_words() {
+        let (mut cpu, mut kernel, mut dispatcher) = crate::bluetooth::tests::setup();
+        for (args, expected) in [
+            ([0, 0x3ff8_0000, 0, 0x8000_0000], 0xbff8_0000),
+            ([0, 0, 0, 0x8000_0000], 0x8000_0000),
+        ] {
+            assert_eq!(
+                crate::bluetooth::tests::call(
+                    &mut cpu,
+                    &mut kernel,
+                    &mut dispatcher,
+                    "coredll.dll",
+                    "#1003",
+                    &args,
+                ),
+                DispatchOutcome::ReturnedR0R1(0, expected)
+            );
+        }
+    }
+
+    #[test]
+    fn blocking_wait_yields_outside_the_gate_when_no_worker_can_run() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let thunk = thunk_at(0x70000100);
+        let handle = 0xdead8080;
+        kernel.events.insert(
+            handle,
+            pocket_kernel::EventObject {
+                manual_reset: false,
+                signalled: false,
+            },
+        );
+        cpu.write_reg(ArmReg::R0, handle).unwrap();
+        cpu.write_reg(ArmReg::R1, u32::MAX).unwrap();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            kernel: &mut kernel,
+            thunk: &thunk,
+        };
+        assert_eq!(
+            wait_for_single_object(&mut ctx).unwrap(),
+            DispatchOutcome::JumpTo(thunk.thunk_va)
+        );
+        assert_eq!(
+            ctx.kernel.wait_retry_delay.take(),
+            Some(std::time::Duration::from_millis(1))
+        );
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R0).unwrap(), handle);
+        ctx.kernel.events.get_mut(&handle).unwrap().signalled = true;
+        assert_eq!(
+            wait_for_single_object(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert!(ctx.kernel.wait_retry_delay.is_none());
     }
 
     #[test]
@@ -35486,6 +36516,37 @@ mod tests {
         c.cpu.write_reg(ArmReg::R0, p).unwrap();
         let _ = free(&mut c).unwrap();
         assert_eq!(c.kernel.heap.free_bytes(), initial_free);
+    }
+
+    #[test]
+    fn stale_c_free_cannot_reclaim_a_reused_cpp_allocation() {
+        use crate::bluetooth::tests::{call, setup};
+        let (mut cpu, mut kernel, mut dispatcher) = setup();
+        cpu.map_region(0x5000_0000, 0x10000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let mut api = |name, arg| {
+            call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                name,
+                &[arg],
+            )
+        };
+        let DispatchOutcome::ReturnedR0(pointer) = api("malloc", 512) else {
+            panic!("expected allocation");
+        };
+        assert_ne!(pointer, 0);
+        assert_eq!(api("free", pointer), DispatchOutcome::ReturnedR0(0));
+        assert_eq!(
+            api("??2@YAPAXI@Z", 20),
+            DispatchOutcome::ReturnedR0(pointer)
+        );
+        assert_eq!(api("free", pointer), DispatchOutcome::ReturnedR0(0));
+        assert_eq!(api("_msize", pointer), DispatchOutcome::ReturnedR0(20));
+        assert_eq!(api("??3@YAXPAX@Z", pointer), DispatchOutcome::ReturnedR0(0));
+        assert_eq!(api("malloc", 512), DispatchOutcome::ReturnedR0(pointer));
     }
 
     #[test]
@@ -38935,6 +39996,75 @@ mod tests {
     }
 
     #[test]
+    fn virtual_protect_updates_committed_pages_and_preserves_cache_hint() {
+        use crate::bluetooth::tests::{call, setup};
+        let (mut cpu, mut kernel, mut dispatcher) = setup();
+        macro_rules! api {
+            ($name:literal, $args:expr) => {
+                call(
+                    &mut cpu,
+                    &mut kernel,
+                    &mut dispatcher,
+                    "coredll.dll",
+                    $name,
+                    $args,
+                )
+            };
+        }
+        let base = 0x58f3_0000;
+        let out = 0x1100;
+        assert_eq!(
+            api!("VirtualAlloc", &[base, 0x2000, 0x3000, 0x20]),
+            DispatchOutcome::ReturnedR0(base)
+        );
+        assert_eq!(
+            api!("VirtualProtect", &[base, 0x600, 0x204, out]),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(cpu.read_u32_le(out).unwrap(), 0x20);
+        assert!(cpu.check_guest_access(base, 4096, Prot::WRITE).is_ok());
+        cpu.write_mem(base, b"code").unwrap();
+        assert!(cpu.check_guest_access(base, 1, Prot::EXEC).is_err());
+        assert!(cpu.check_guest_access(base + 4096, 1, Prot::EXEC).is_ok());
+        assert_eq!(
+            api!("VirtualQuery", &[base, out, 28]),
+            DispatchOutcome::ReturnedR0(28)
+        );
+        assert_eq!(cpu.read_u32_le(out + 12).unwrap(), 4096);
+        assert_eq!(cpu.read_u32_le(out + 20).unwrap(), 0x204);
+
+        // Unaligned ranges include both pages. Return the first page's
+        // previous protection, and leave reserved pages untouched on error.
+        assert_eq!(
+            api!("VirtualProtect", &[base + 4095, 2, 0x20, out]),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(cpu.read_u32_le(out).unwrap(), 0x204);
+        assert!(cpu
+            .check_guest_access(base, 8192, Prot::READ | Prot::EXEC)
+            .is_ok());
+        assert_eq!(cpu.read_mem(base, 4).unwrap(), b"code");
+        assert!(cpu.check_guest_access(base + 4096, 1, Prot::WRITE).is_err());
+        for args in [
+            [base, 0x2001, 4, out],
+            [base, 1, 4, base],
+            [base, 0, 4, out],
+            [base, 1, 0x104, out],
+            [0xffff_ffff, 2, 4, out],
+        ] {
+            assert_eq!(
+                api!("VirtualProtect", &args),
+                DispatchOutcome::ReturnedR0(0)
+            );
+            assert!(cpu
+                .check_guest_access(base, 8192, Prot::READ | Prot::EXEC)
+                .is_ok());
+            assert!(cpu.check_guest_access(base, 1, Prot::WRITE).is_err());
+            assert_eq!(cpu.read_u32_le(out).unwrap(), 0x204);
+        }
+    }
+
+    #[test]
     fn memory_division_api_allocation_status_and_virtual_release() {
         let mut cpu = scanf_cpu();
         cpu.map_region(0x50000000, 0x40000, Prot::READ | Prot::WRITE)
@@ -39299,6 +40429,61 @@ mod tests {
         assert_eq!(
             msg_wait_for_multiple_objects_legacy(&mut ctx).unwrap(),
             DispatchOutcome::ReturnedR0(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn fwscanf_decodes_ansi_and_keeps_the_byte_position() {
+        use pocket_kernel::vfs::SeekKind;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("records.txt"), b"\xe9lan\r\nnext").unwrap();
+        let (mut cpu, mut kernel, mut dispatcher) = crate::bluetooth::tests::setup();
+        kernel.vfs.mount("\\", dir.path());
+        let handle = kernel
+            .vfs
+            .open("\\records.txt", Access::Read, false)
+            .unwrap();
+        kernel.vfs.mark_text_mode(handle);
+        cpu.write_mem(0x1100, &wide_to_bytes(&[37, 115, 10, 0]))
+            .unwrap();
+        assert_eq!(
+            crate::bluetooth::tests::call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "fwscanf",
+                &[handle, 0x1100, 0x1200]
+            ),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(
+            cpu.read_mem(0x1200, 10).unwrap(),
+            wide_to_bytes(&[0xe9, 108, 97, 110, 0])
+        );
+        assert_eq!(kernel.vfs.seek(handle, 0, SeekKind::Current), Some(6));
+    }
+
+    #[test]
+    fn string_cch_copy_w_truncates_by_utf16_unit_and_terminates() {
+        let (mut cpu, mut kernel, mut dispatcher) = crate::bluetooth::tests::setup();
+        cpu.write_mem(0x1100, &wide_to_bytes(&[0xd83d, 0xde00, 0]))
+            .unwrap();
+        cpu.write_mem(0x1200, &[0x7f; 8]).unwrap();
+        assert_eq!(
+            crate::bluetooth::tests::call(
+                &mut cpu,
+                &mut kernel,
+                &mut dispatcher,
+                "coredll.dll",
+                "StringCchCopyW",
+                &[0x1200, 2, 0x1100]
+            ),
+            DispatchOutcome::ReturnedR0(STRSAFE_E_INSUFFICIENT_BUFFER)
+        );
+        assert_eq!(
+            cpu.read_mem(0x1200, 8).unwrap(),
+            [0x3d, 0xd8, 0, 0, 0x7f, 0x7f, 0x7f, 0x7f]
         );
     }
 
@@ -40433,14 +41618,28 @@ mod tests {
             thunk: &thunk,
         };
         initialize_critical_section(&mut ctx).unwrap();
-        enter_critical_section(&mut ctx).unwrap();
-        enter_critical_section(&mut ctx).unwrap();
+        assert_eq!(
+            try_enter_critical_section(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(
+            try_enter_critical_section(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
         ctx.kernel.worker_preempt_after_ms = 0;
         assert_eq!(
             wake_due_worker(&mut ctx).unwrap(),
             Some(DispatchOutcome::JumpTo(0x10200))
         );
         assert_eq!(ctx.kernel.critical_sections[&key], (0, 2));
+        ctx.cpu.write_reg(ArmReg::R0, key).unwrap();
+        assert_eq!(
+            try_enter_critical_section(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert_eq!(ctx.kernel.current_thread, 1);
+        assert_eq!(ctx.kernel.critical_sections[&key], (0, 2));
+        assert!(ctx.kernel.threads[0].parked_wait_handles.is_empty());
         // The independent worker may own a different critical section.
         ctx.cpu.write_reg(ArmReg::R0, other).unwrap();
         assert_eq!(
@@ -42651,6 +43850,62 @@ mod tests {
     }
 
     #[test]
+    fn blocking_wait_delivers_wave_completion_and_restores_the_wait() {
+        let (mut cpu, mut kernel, _) = crate::bluetooth::tests::setup();
+        let t = dummy_thunk();
+        let event = 0xdeade010;
+        let proc = 0x3000;
+        kernel.events.insert(
+            event,
+            pocket_kernel::EventObject {
+                manual_reset: false,
+                signalled: false,
+            },
+        );
+        kernel.wave_out.callback_kind = WaveCallbackKind::Function;
+        kernel.wave_out.devices.insert(
+            FAKE_HWAVEOUT,
+            pocket_kernel::WaveOutDevice {
+                callback_kind: WaveCallbackKind::Function,
+                callback_target: proc,
+                instance: 0,
+                owner_thread: 0,
+                format: pocket_kernel::audio::GuestFormat::default(),
+                paused: false,
+            },
+        );
+        kernel
+            .wave_out
+            .pending
+            .push_back(pocket_kernel::PendingWaveBuffer {
+                handle: FAKE_HWAVEOUT,
+                hdr: 0x1000,
+                end_cursor: 0,
+            });
+        cpu.write_reg(ArmReg::R0, event).unwrap();
+        cpu.write_reg(ArmReg::R1, u32::MAX).unwrap();
+        cpu.write_reg(ArmReg::Lr, 0x1200).unwrap();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(
+            wait_for_single_object(&mut ctx).unwrap(),
+            DispatchOutcome::JumpTo(proc)
+        );
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R1).unwrap(), MM_WOM_DONE);
+        ctx.kernel.events.get_mut(&event).unwrap().signalled = true;
+        assert_eq!(
+            wait_for_single_object(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert_eq!(ctx.cpu.read_reg(ArmReg::Sp).unwrap(), 0x4000);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::Lr).unwrap(), 0x1200);
+        assert!(!ctx.kernel.events.get(&event).unwrap().signalled);
+    }
+
+    #[test]
     fn sleep_delivers_wave_out_callback_and_survives_a_nested_sleep() {
         wave_callback_sleep_roundtrip(0);
     }
@@ -43058,6 +44313,29 @@ mod tests {
     }
 
     #[test]
+    fn tls_call_and_named_imports_share_slots() {
+        let mut cpu = tls_test_cpu();
+        let mut kernel = fresh_kernel();
+        let first = tls_test_call(&mut cpu, &mut kernel, tls_call, &[0, 0]);
+        let second = tls_test_call(&mut cpu, &mut kernel, tls_call, &[0, 0]);
+        assert_ne!(first, second);
+        tls_test_call(&mut cpu, &mut kernel, tls_set_value, &[first, 0x1234]);
+        assert_eq!(
+            tls_test_call(&mut cpu, &mut kernel, tls_get_value, &[second]),
+            0
+        );
+        assert_eq!(
+            tls_test_call(&mut cpu, &mut kernel, tls_call, &[1, first]),
+            1
+        );
+        assert_eq!(tls_test_call(&mut cpu, &mut kernel, tls_alloc, &[]), first);
+        assert_eq!(
+            tls_test_call(&mut cpu, &mut kernel, tls_get_value, &[first]),
+            0
+        );
+    }
+
+    #[test]
     fn copy_and_registry_flush_failures_are_real_guest_return_values() {
         use pocket_kernel::Dispatcher;
         let mut cpu = StubCpu::new();
@@ -43399,6 +44677,15 @@ fn set_file_attributes_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
     let flags = ctx.arg_u32(1)?;
     let result = vfs_api_path(ctx, 0).and_then(|p| ctx.kernel.vfs.set_attributes(&p, flags));
     vfs_api_bool(ctx, result)
+}
+
+fn crt_set_new_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let next = ctx.arg_u32(0)?;
+    if next > 1 {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    let previous = std::mem::replace(&mut ctx.kernel.crt_new_mode, next);
+    Ok(DispatchOutcome::ReturnedR0(previous))
 }
 
 fn crt_set_new_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -45206,6 +46493,77 @@ mod power_requirement_api_tests {
     use crate::bluetooth::tests::{call, setup};
     use pocket_cpu::Cpu;
     use pocket_kernel::DispatchOutcome;
+    #[test]
+    fn system_power_query_reports_active_backlight_and_checks_buffer_capacity() {
+        let (mut cpu, mut kernel, mut dispatcher) = setup();
+        for (capacity, expected) in [(2, 122), (3, 0)] {
+            assert_eq!(
+                call(
+                    &mut cpu,
+                    &mut kernel,
+                    &mut dispatcher,
+                    "coredll.dll",
+                    "GetSystemPowerState",
+                    &[0x2000, capacity, 0x2010],
+                ),
+                DispatchOutcome::ReturnedR0(expected)
+            );
+        }
+        assert_eq!(cpu.read_mem(0x2000, 6).unwrap(), [b'o', 0, b'n', 0, 0, 0]);
+        let display_flag = u8::from(pocket_kernel::power::host_display_is_on().unwrap_or(true)) * 2;
+        assert_eq!(cpu.read_mem(0x2010, 4).unwrap(), [0, 0, 1, display_flag]);
+    }
+
+    #[test]
+    fn system_power_requests_use_the_ce_state_name_or_flags() {
+        let (mut cpu, mut kernel, mut dispatcher) = setup();
+        cpu.write_mem(0x2000, &[b'O', 0, b'n', 0, 0, 0]).unwrap();
+        for (args, expected) in [
+            ([0, 0x0001_0000, 0], 0),
+            ([0x2000, 0x0020_0000, 0x1000], 0),
+            ([0, 0x0020_0000, 0], 50),
+            ([0, 0, 0], 87),
+            ([0x8000, 0x0001_0000, 0], 87),
+        ] {
+            assert_eq!(
+                call(
+                    &mut cpu,
+                    &mut kernel,
+                    &mut dispatcher,
+                    "coredll.dll",
+                    "SetSystemPowerState",
+                    &args
+                ),
+                DispatchOutcome::ReturnedR0(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn power_policy_accepts_unattended_mode_and_rejects_unknown_notifications() {
+        let (mut cpu, mut kernel, mut dispatcher) = setup();
+        for (args, expected) in [
+            ([3, 1], 1),
+            ([3, 1], 1),
+            ([3, 0], 1),
+            ([3, 0], 1),
+            ([u32::MAX, 0], 0),
+        ] {
+            assert_eq!(
+                call(
+                    &mut cpu,
+                    &mut kernel,
+                    &mut dispatcher,
+                    "coredll.dll",
+                    "PowerPolicyNotify",
+                    &args,
+                ),
+                DispatchOutcome::ReturnedR0(expected)
+            );
+        }
+        assert_eq!(kernel.thread_last_errors[&kernel.current_thread], 50);
+    }
+
     #[test]
     fn requirements_use_the_ce_abi_and_release_returns_a_status() {
         let (mut cpu, mut kernel, mut dispatcher) = setup();

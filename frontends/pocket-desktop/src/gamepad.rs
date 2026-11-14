@@ -4,6 +4,7 @@ use sdl3::{
     event::Event as SdlEvent,
     gamepad::{Axis, Button, Gamepad},
     joystick::{HatState, Joystick},
+    sensor::{Sensor, SensorData, SensorType},
 };
 use std::{
     collections::{BTreeMap, HashSet},
@@ -67,12 +68,14 @@ fn axis_down(value: f32, held: bool) -> bool {
 struct Transitions {
     deadzone: pocket_library::DpadDeadzone,
     held: HashSet<(usize, String)>,
+    steering: BTreeMap<(usize, bool), i16>,
 }
 impl Default for Transitions {
     fn default() -> Self {
         Self {
             deadzone: pocket_library::DpadDeadzone::Medium,
             held: HashSet::new(),
+            steering: BTreeMap::new(),
         }
     }
 }
@@ -114,6 +117,7 @@ impl Transitions {
             .collect()
     }
     fn disconnect(&mut self, id: usize) -> Vec<Event> {
+        self.steering.retain(|(device, _), _| *device != id);
         let names: Vec<_> = self
             .held
             .iter()
@@ -125,6 +129,24 @@ impl Transitions {
             .filter_map(|name| self.change(id, name, false))
             .collect()
     }
+    fn steering_axis(&mut self, device: usize, axis: Axis, value: i16) -> Option<Event> {
+        let horizontal = match axis {
+            Axis::LeftX => true,
+            Axis::LeftY => false,
+            _ => return None,
+        };
+        let previous = self.steering.entry((device, horizontal)).or_default();
+        if *previous == value {
+            return None;
+        }
+        *previous = value;
+        Some(Event::SteeringAxis {
+            device,
+            horizontal,
+            value: (f32::from(value) / 32767.0).clamp(-1.0, 1.0),
+        })
+    }
+
     fn controller_axis(&mut self, id: usize, axis: Axis, value: i16) -> Vec<Event> {
         let value = value as f32 / 32767.0;
         match axis {
@@ -208,7 +230,9 @@ fn poll_controller(controller: &Gamepad, state: &mut Transitions) -> Vec<Event> 
         changes.extend(state.change(id, button_name(button), controller.button(button)));
     }
     for axis in POLLED_AXES {
-        changes.extend(state.controller_axis(id, axis, controller.axis(axis)));
+        let value = controller.axis(axis);
+        changes.extend(state.controller_axis(id, axis, value));
+        changes.extend(state.steering_axis(id, axis, value));
     }
     changes
 }
@@ -260,6 +284,31 @@ impl Device {
         matches!(self, Self::Raw(_))
     }
 }
+fn open_host_accelerometer(subsystem: &sdl3::SensorSubsystem) -> Option<Sensor> {
+    subsystem
+        .num_sensors()
+        .ok()?
+        .into_iter()
+        .filter_map(|id| subsystem.open(id).ok())
+        .find(|sensor| sensor.sensor_type() == SensorType::Accelerometer)
+}
+
+fn sample_controller_accelerometer(device: &Device) -> Option<[f32; 3]> {
+    let Device::Controller(controller) = device else {
+        return None;
+    };
+    let sensor = SensorType::Accelerometer;
+    if !controller.connected() || !unsafe { controller.has_sensor(sensor) } {
+        return None;
+    }
+    if !controller.sensor_enabled(sensor) {
+        controller.sensor_set_enabled(sensor, true).ok()?;
+    }
+    let mut axes = [0.0; 3];
+    controller.sensor_get_data(sensor, &mut axes).ok()?;
+    Some(axes)
+}
+
 fn scan(
     controllers: &sdl3::GamepadSubsystem,
     joysticks: &sdl3::JoystickSubsystem,
@@ -345,6 +394,7 @@ fn worker(
     profile: &AtomicU8,
     selected: &AtomicUsize,
     enabled: &AtomicBool,
+    accelerometer_enabled: &AtomicBool,
     commands: &Receiver<crate::rumble::Command>,
     steam_deck: bool,
 ) -> Result<(), String> {
@@ -379,6 +429,19 @@ fn worker(
     let mut rumble_on = false;
     let mut last_rumble = Instant::now() - Duration::from_secs(1);
     let mut next_scan = Instant::now() + Duration::from_secs(1);
+    let sensors = sdl.sensor().ok();
+    let mut physical_sensor = accelerometer_enabled.load(Ordering::Relaxed);
+    let mut host_accelerometer = sensors.as_ref().filter(|_| physical_sensor).and_then(open_host_accelerometer);
+    let mut next_acceleration = Instant::now();
+    let mut acceleration_controller = None;
+    let publish_acceleration = pocket_core::kernel::accelerometer::publish;
+    struct ClearAcceleration;
+    impl Drop for ClearAcceleration {
+        fn drop(&mut self) {
+            pocket_core::kernel::accelerometer::publish(false, None);
+        }
+    }
+    let _clear_acceleration = ClearAcceleration;
     while alive.load(Ordering::Relaxed) {
         state.deadzone = match profile.load(Ordering::Relaxed) {
             0 => pocket_library::DpadDeadzone::Small,
@@ -518,13 +581,7 @@ fn worker(
                     which, axis, value, ..
                 } => {
                     changes = state.controller_axis(which.raw() as usize, axis, value);
-                    if matches!(axis, Axis::LeftX | Axis::LeftY) {
-                        changes.push(Event::SteeringAxis {
-                            device: which.raw() as usize,
-                            horizontal: axis == Axis::LeftX,
-                            value: (value as f32 / 32767.0).clamp(-1.0, 1.0),
-                        });
-                    }
+                    changes.extend(state.steering_axis(which.raw() as usize, axis, value));
                     if matches!(axis, Axis::RightX | Axis::RightY) {
                         changes.push(Event::AimAxis {
                             device: which.raw() as usize,
@@ -616,7 +673,50 @@ fn worker(
                 publish(tx, ctx, change, enabled.load(Ordering::Relaxed))?;
             }
         }
+        if Instant::now() >= next_acceleration {
+            let requested = accelerometer_enabled.load(Ordering::Relaxed);
+            if requested != physical_sensor {
+                physical_sensor = requested;
+                host_accelerometer = sensors
+                    .as_ref()
+                    .filter(|_| physical_sensor)
+                    .and_then(open_host_accelerometer);
+            }
+            let active = physical_sensor && enabled.load(Ordering::Relaxed);
+            let current = active.then_some(selected as u32);
+            if current != acceleration_controller {
+                if let Some(Device::Controller(controller)) =
+                    acceleration_controller.and_then(|id| devices.get(&id))
+                {
+                    if controller.sensor_enabled(SensorType::Accelerometer) {
+                        let _ = controller.sensor_set_enabled(SensorType::Accelerometer, false);
+                    }
+                }
+                acceleration_controller = current;
+            }
+            let sample = if active {
+                let sample = host_accelerometer.as_ref().and_then(|sensor| match sensor.get_data() {
+                    Ok(SensorData::Accel(axes)) => Some(axes),
+                    _ => None,
+                });
+                if sample.is_none() {
+                    host_accelerometer = None;
+                }
+                sample.or_else(|| {
+                    current
+                        .and_then(|id| devices.get(&id))
+                        .and_then(sample_controller_accelerometer)
+                })
+            } else {
+                None
+            };
+            publish_acceleration(sample.is_some(), sample);
+            next_acceleration = Instant::now() + Duration::from_millis(16);
+        }
         if Instant::now() >= next_scan {
+            if accelerometer_enabled.load(Ordering::Relaxed) && host_accelerometer.is_none() {
+                host_accelerometer = sensors.as_ref().and_then(open_host_accelerometer);
+            }
             let gone: Vec<_> = devices
                 .iter()
                 .filter(|(_, d)| !d.attached())
@@ -656,6 +756,7 @@ pub struct Monitor {
     profile: Arc<AtomicU8>,
     selected: Arc<AtomicUsize>,
     enabled: Arc<AtomicBool>,
+    accelerometer_enabled: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     _commands: SyncSender<crate::rumble::Command>,
 }
@@ -670,6 +771,10 @@ impl Monitor {
             Ordering::Relaxed,
         );
     }
+    pub fn set_accelerometer_enabled(&self, enabled: bool) {
+        self.accelerometer_enabled.store(enabled, Ordering::Relaxed);
+    }
+
     pub fn set_output(&self, device: Option<usize>, enabled: bool) {
         self.selected
             .store(device.unwrap_or(usize::MAX), Ordering::Relaxed);
@@ -694,6 +799,8 @@ pub fn start(ctx: egui::Context, steam_deck: bool) -> Monitor {
     let worker_selected = selected.clone();
     let enabled = Arc::new(AtomicBool::new(false));
     let worker_enabled = enabled.clone();
+    let accelerometer_enabled = Arc::new(AtomicBool::new(true));
+    let worker_accelerometer_enabled = accelerometer_enabled.clone();
     let (command_tx, command_rx) = mpsc::sync_channel(32);
     pocket_core::kernel::vibration::install_host(Arc::new(crate::rumble::Bridge::new(
         command_tx.clone(),
@@ -708,6 +815,7 @@ pub fn start(ctx: egui::Context, steam_deck: bool) -> Monitor {
                 &worker_profile,
                 &worker_selected,
                 &worker_enabled,
+                &worker_accelerometer_enabled,
                 &command_rx,
                 steam_deck,
             ) {
@@ -721,6 +829,7 @@ pub fn start(ctx: egui::Context, steam_deck: bool) -> Monitor {
         profile,
         selected,
         enabled,
+        accelerometer_enabled,
         thread: Some(thread),
         _commands: command_tx,
     }

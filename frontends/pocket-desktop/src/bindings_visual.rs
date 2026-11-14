@@ -654,7 +654,7 @@ impl Editor {
                 keyboard_shortcut(input).is_some() || (*long && input == "Escape")
             };
             if fixed {
-                q.message = "This input is reserved by PocketHLE. Choose another input.".into();
+                q.message = "This input is reserved by PocketHLE-Reborn. Choose another input.".into();
                 q.choice = None;
                 q.pressed = None;
                 accept = false;
@@ -877,7 +877,7 @@ impl Editor {
     }
     pub fn reserved_input_attempt(&mut self) -> bool {
         if let Some(quick) = self.quick.as_mut().filter(|q| !q.wait_launch_release) {
-            quick.message = "This input is reserved by PocketHLE. Choose another input.".into();
+            quick.message = "This input is reserved by PocketHLE-Reborn. Choose another input.".into();
             return true;
         }
         false
@@ -1094,12 +1094,12 @@ impl Editor {
             );
             if !self.gizmondo {
                 inputs.extend((1..=4).map(|n| n.to_string()));
-                inputs.push("Tab".into());
+                inputs.extend(["Tab", "Escape", "`", "P"].map(str::to_owned));
             }
         }
         let prefix = pocket_library::input_gestures::binding_key(self.gizmondo, controller, "");
         let missing: Vec<_> = visible_buttons(self.gizmondo)
-            .filter(|b| !controller || *b != GuestButton::StylusClick)
+            .filter(|b| if controller { *b != GuestButton::StylusClick } else { !matches!(b, GuestButton::Screenshot | GuestButton::RotateScreen) })
             .filter(|button| {
                 if config.long_press_bindings.iter().any(|(key, b)| {
                     key.starts_with(&prefix)

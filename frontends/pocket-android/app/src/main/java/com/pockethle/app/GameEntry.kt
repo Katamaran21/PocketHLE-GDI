@@ -55,6 +55,16 @@ data class GameEntry(
     }
 }
 
+enum class TiltInput(val id: String, val label: String) {
+    ACCELEROMETER("accelerometer", "Use physical accelerometer"),
+    LEFT_RIGHT("left_right", "Simulate left/right tilt"),
+    FOUR_DIRECTIONS("four_directions", "Simulate tilt in four directions");
+
+    companion object {
+        fun fromId(id: String): TiltInput? = values().firstOrNull { it.id == id }
+    }
+}
+
 data class GameSettings(
     val cpuBackend: String, // "stub" or "unicorn"
     val maxSlices: Long,
@@ -70,10 +80,11 @@ data class GameSettings(
      */
     val rotation: String,
     val frameRateLimit: String? = null,
-    val gpuRenderer: Boolean? = null,
+    val gpuCompatibilityProfile: String = "generic",
     val executableHeap: Boolean? = null,
     val dpadDeadzone: String = "large",
     val pocketpcTouchSteering: Boolean = false,
+    val pocketpcTiltInput: TiltInput? = null,
     val pocketpcControls: String? = null,
     val pocketpcSwapButtonGroups: Boolean = false,
     val pocketpcStylusGridJson: String = "{}",
@@ -95,7 +106,8 @@ data class GameSettings(
         remove("anisotropic_filtering")
         optJSONObject("stylus_stick")?.apply { remove("enabled");remove("controller") }
         put("frame_rate_limit", frameRateLimit ?: JSONObject.NULL)
-        put("gpu_renderer", gpuRenderer ?: JSONObject.NULL)
+        remove("gpu_renderer")
+        put("gpu_compatibility_profile", gpuCompatibilityProfile)
         put("executable_heap", executableHeap ?: JSONObject.NULL)
         put("dpad_deadzone", dpadDeadzone)
         put("cpu_backend", cpuBackend)
@@ -105,6 +117,7 @@ data class GameSettings(
         put("screen", screen)
         put("rotation", rotation)
         put("pocketpc_touch_steering", pocketpcTouchSteering)
+        put("pocketpc_tilt_input", pocketpcTiltInput?.id ?: JSONObject.NULL)
         put("pocketpc_controls", pocketpcControls ?: JSONObject.NULL)
         put("pocketpc_swap_button_groups", pocketpcSwapButtonGroups)
         put("pocketpc_stylus_grid", JSONObject(pocketpcStylusGridJson))
@@ -145,9 +158,9 @@ data class GameSettings(
             rotation = obj.optString("rotation", "none").ifEmpty { "none" },
             dpadDeadzone = obj.optString("dpad_deadzone", "large"),
             frameRateLimit = if (obj.isNull("frame_rate_limit")) null else obj.optString("frame_rate_limit", "unlimited").takeUnless { it == "inherit" },
-            gpuRenderer = if (obj.isNull("gpu_renderer")) null else obj.optBoolean("gpu_renderer", false),
             executableHeap = if (obj.isNull("executable_heap")) null else obj.optBoolean("executable_heap"),
             pocketpcTouchSteering = obj.optBoolean("pocketpc_touch_steering", false),
+            pocketpcTiltInput = TiltInput.fromId(obj.optString("pocketpc_tilt_input")),
             pocketpcControls = if(obj.isNull("pocketpc_controls")) null else obj.optString("pocketpc_controls"),
             pocketpcSwapButtonGroups = obj.optBoolean("pocketpc_swap_button_groups", false),
             pocketpcStylusGridJson = obj.optJSONObject("pocketpc_stylus_grid")?.toString() ?: "{}",
@@ -160,6 +173,11 @@ data class GameSettings(
             pocketpcPlatformType = obj.optString("pocketpc_platform_type", ""),
             pocketpcGapiColumns = obj.optBoolean("pocketpc_gapi_columns", false),
             pocketpcEglRgba8888Only = obj.optBoolean("pocketpc_egl_rgba8888_only", false),
+            gpuCompatibilityProfile = when (val profile = obj.optString("gpu_compatibility_profile", "generic")) {
+                "generic", "nvidia_goforce5500", "intel2700g", "adreno200" -> profile
+                "qualcomm_snapdragon" -> "adreno200"
+                else -> "generic"
+            },
             storageCardDir = if (obj.isNull("storage_card_dir")) null else obj.optString("storage_card_dir"),
             windowsCe = obj.optJSONObject("windows_ce")?.let(WindowsCeSettings::fromJson),
             originalJson = obj.toString(),
@@ -234,6 +252,7 @@ data class LauncherConfig(
     val controlsOpacity: Float,
     val pocketpcControlsSize: String = "normal",
     val pocketpcTouchLayout: String = "classic",
+    val pocketpcTiltInput: TiltInput = TiltInput.ACCELEROMETER,
     val gizmondoControlsSize: String = "normal",
     val gizmondoMaximizeScreen: Boolean = false,
     /**
@@ -249,7 +268,30 @@ data class LauncherConfig(
      */
     val keybindingsJson: String?,
 ) {
+    val glesResolutionScale: Int
+        get() = when (glesInternalResolution) {
+            2, 3 -> 2
+            4, 6 -> 3
+            5, 7 -> 4
+            else -> 1
+        }
+
+    val glesResolutionAllSizes: Boolean
+        get() = glesInternalResolution == 2 || glesInternalResolution in 6..7
+
+    fun withGlesResolution(scale: Int, allSizes: Boolean): LauncherConfig {
+        val policy = when (scale) {
+            2 -> if (allSizes) 2 else 3
+            3 -> if (allSizes) 6 else 4
+            4 -> if (allSizes) 7 else 5
+            else -> 1
+        }
+        return copy(glesInternalResolution = policy)
+    }
+
     fun toJson(): JSONObject = JSONObject(originalJson).apply {
+        remove("pocketpc_intel2700g_depth_bias")
+        remove("pocketpc_nv_combiners")
         remove("android_display_scale") // Discard the removed manual presentation preference.
         remove("optimizations")
         remove("anisotropic_filtering")
@@ -285,6 +327,7 @@ data class LauncherConfig(
         put("controls_opacity", controlsOpacity.toDouble())
         put("android_pocketpc_controls_size", pocketpcControlsSize)
         put("android_pocketpc_touch_layout", pocketpcTouchLayout)
+        put("pocketpc_tilt_input", pocketpcTiltInput.id)
         put("android_gizmondo_controls_size", gizmondoControlsSize)
         put("android_gizmondo_maximize_screen", gizmondoMaximizeScreen)
         if (keybindingsJson != null) {
@@ -316,7 +359,7 @@ data class LauncherConfig(
             gpuRenderer = obj.optBoolean("gpu_renderer", true),
             executableHeap = obj.optBoolean("executable_heap", true),
             frameRateLimit = obj.optString("frame_rate_limit", "60").takeIf { it in listOf("10","15","20","30","45","60","120","unlimited") } ?: "60",
-            glesInternalResolution = obj.optInt("gles_internal_resolution", 1).takeIf { it == 2 || it == 3 || it == 4 || it == 5 } ?: 1,
+            glesInternalResolution = obj.optInt("gles_internal_resolution", 1).takeIf { it in 1..7 } ?: 1,
             lastImportDir = obj.optString("last_import_dir").takeIf { !obj.isNull("last_import_dir") && it.isNotEmpty() },
             showFps = obj.optBoolean("show_fps", true),
             showIps = obj.optBoolean("show_ips", false),
@@ -339,6 +382,7 @@ data class LauncherConfig(
             colorsLanguage = obj.optString("colors_language", "english").takeIf { it in listOf("english", "french", "german", "italian", "spanish") } ?: "english",
             gizmondoMaximizeScreen = obj.optBoolean("android_gizmondo_maximize_screen", false),
             gizmondoControlsSize = obj.optString("android_gizmondo_controls_size", "normal").takeIf { it == "normal" || it == "big" } ?: "normal",
+            pocketpcTiltInput = TiltInput.fromId(obj.optString("pocketpc_tilt_input")) ?: TiltInput.ACCELEROMETER,
             pocketpcTouchLayout = obj.optString("android_pocketpc_touch_layout", "classic").takeIf { it == "classic" || it == "controller" } ?: "classic",
             pocketpcControlsSize = obj.optString("android_pocketpc_controls_size", "normal").takeIf { it == "normal" || it == "big" } ?: "normal",
             controlsOpacity = obj.optDouble("controls_opacity", 1.0).toFloat()

@@ -1,8 +1,11 @@
 //! Published stable releases only; no installation or access to the game library.
 use serde::Deserialize;
 
+pub const REPOSITORY_URL: &str = "https://github.com/Katamaran21/PocketHLE-GDI";
 pub const API_URL: &str = "https://api.github.com/repos/Katamaran21/PocketHLE-GDI/releases/latest";
 const RELEASES: &str = "https://github.com/Katamaran21/PocketHLE-GDI/releases/";
+#[cfg(feature = "release-updates")]
+const API_URLS: [&str; 1] = [API_URL];
 
 #[derive(Clone, Copy, Debug)]
 pub enum Platform {
@@ -97,25 +100,31 @@ pub fn check(installed: &str, platform: Platform) -> Option<Update> {
         .tls_config(std::sync::Arc::new(tls))
         .timeout(Duration::from_secs(8))
         .build();
-    let response = agent
-        .get(API_URL)
-        .set(
-            "User-Agent",
-            concat!("PocketHLE/", env!("CARGO_PKG_VERSION")),
-        )
-        .set("Accept", "application/vnd.github+json")
-        .call()
-        .ok()?;
-    let mut json = String::new();
-    response
-        .into_reader()
-        .take(1_048_577)
-        .read_to_string(&mut json)
-        .ok()?;
-    if json.len() > 1_048_576 {
-        return None;
+    for api in API_URLS {
+        let Ok(response) = agent
+            .get(api)
+            .set(
+                "User-Agent",
+                concat!("PocketHLE-GDI/", env!("CARGO_PKG_VERSION")),
+            )
+            .set("Accept", "application/vnd.github+json")
+            .call()
+        else {
+            continue;
+        };
+        let mut json = String::new();
+        if response
+            .into_reader()
+            .take(1_048_577)
+            .read_to_string(&mut json)
+            .is_ok()
+            && json.len() <= 1_048_576
+            && serde_json::from_str::<Release>(&json).is_ok()
+        {
+            return from_json(&json, installed, platform);
+        }
     }
-    from_json(&json, installed, platform)
+    None
 }
 
 #[cfg(test)]
@@ -148,7 +157,7 @@ mod tests {
         }
     }
     fn release(tag: &str, assets: serde_json::Value) -> String {
-        serde_json::json!({"tag_name":tag,"draft":false,"prerelease":false,"assets":assets})
+        serde_json::json!({"tag_name":tag,"html_url":format!("{RELEASES}tag/{tag}"),"draft":false,"prerelease":false,"assets":assets})
             .to_string()
     }
     #[test]

@@ -5,6 +5,25 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class InternalResolutionSettingsTest {
+    @Test fun gpuCompatibilityProfilePersistsWithoutInheritingRetiredGlobalOptions() {
+        assertEquals("generic", GameSettings.fromJson(JSONObject()).gpuCompatibilityProfile)
+        for (profile in listOf("generic", "nvidia_goforce5500", "intel2700g", "adreno200")) {
+            val original = JSONObject().put("gpu_compatibility_profile", profile)
+                .put("gpu_renderer", false).put("future_setting", "kept")
+            val saved = GameSettings.fromJson(original).copy(screen = "landscape").toJson()
+            assertEquals(profile, GameSettings.fromJson(saved).gpuCompatibilityProfile)
+            assertFalse(saved.has("gpu_renderer"))
+            assertEquals("kept", saved.getString("future_setting"))
+        }
+        val legacy = JSONObject().put("pocketpc_intel2700g_depth_bias", true)
+            .put("pocketpc_nv_combiners", true).put("future_setting", "kept")
+        val saved = LauncherConfig.fromJson(legacy).toJson()
+        assertFalse(saved.has("pocketpc_intel2700g_depth_bias"))
+        assertFalse(saved.has("pocketpc_nv_combiners"))
+        assertEquals("kept", saved.getString("future_setting"))
+        assertEquals("generic", GameSettings.fromJson(legacy).gpuCompatibilityProfile)
+    }
+
     @Test fun eglFormatProfileDefaultsOffAndRoundTripsWithoutChangingOtherSettings() {
         assertFalse(GameSettings.fromJson(JSONObject()).pocketpcEglRgba8888Only)
         val original=JSONObject().put("pocketpc_gapi_columns",true).put("gpu_renderer",false).put("future_setting","kept")
@@ -13,7 +32,7 @@ class InternalResolutionSettingsTest {
             val restored=GameSettings.fromJson(saved)
             assertEquals(enabled,restored.pocketpcEglRgba8888Only)
             assertTrue(restored.pocketpcGapiColumns)
-            assertEquals(false,restored.gpuRenderer)
+            assertFalse(saved.has("gpu_renderer"))
             assertEquals("kept",saved.getString("future_setting"))
         }
     }
@@ -38,10 +57,17 @@ class InternalResolutionSettingsTest {
     }
 
     @Test fun allResolutionPoliciesRoundtripWithoutChangingOtherSettings() {
-        for (policy in listOf(1,2,3,4,5)) {
-            val original=LauncherConfig.default().copy(glesInternalResolution=policy)
+        val policies = listOf(
+            Triple(1, 1, false), Triple(2, 2, true), Triple(3, 2, false),
+            Triple(4, 3, false), Triple(5, 4, false), Triple(6, 3, true),
+            Triple(7, 4, true),
+        )
+        for ((policy, scale, allSizes) in policies) {
+            val original = LauncherConfig.default().withGlesResolution(scale, allSizes)
             val decoded=LauncherConfig.fromJson(original.toJson())
-            assertEquals(policy,decoded.glesInternalResolution)
+            assertEquals(policy, decoded.glesInternalResolution)
+            assertEquals(scale, decoded.glesResolutionScale)
+            assertEquals(allSizes, decoded.glesResolutionAllSizes)
             assertEquals(original.gpuRenderer,decoded.gpuRenderer)
         }
     }

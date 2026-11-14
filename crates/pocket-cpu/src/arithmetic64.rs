@@ -1,7 +1,11 @@
-//! Register-only wide arithmetic and exact runtime-compatible conversions.
+//! Register-only arithmetic matching the WinCE runtime handlers.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arithmetic64 {
+    SingleSquareRoot,
+    DoubleSquareRoot,
+    DoubleSine,
+    DoubleCosine,
     SignedToDouble,
     UnsignedToDouble,
     DoubleToSigned,
@@ -16,7 +20,11 @@ impl Arithmetic64 {
     pub fn unary(self) -> bool {
         matches!(
             self,
-            Self::SignedToDouble
+            Self::SingleSquareRoot
+                | Self::DoubleSquareRoot
+                | Self::DoubleSine
+                | Self::DoubleCosine
+                | Self::SignedToDouble
                 | Self::UnsignedToDouble
                 | Self::DoubleToSigned
                 | Self::DoubleToUnsigned
@@ -25,6 +33,12 @@ impl Arithmetic64 {
     /// Match the runtime handlers, including divide-by-zero and MIN / -1.
     pub fn evaluate(self, dividend: u64, divisor: u64) -> u64 {
         match self {
+            Self::SingleSquareRoot => {
+                return u64::from(f32::from_bits(dividend as u32).sqrt().to_bits());
+            }
+            Self::DoubleSquareRoot => return f64::from_bits(dividend).sqrt().to_bits(),
+            Self::DoubleSine => return f64::from_bits(dividend).sin().to_bits(),
+            Self::DoubleCosine => return f64::from_bits(dividend).cos().to_bits(),
             Self::SignedToDouble => return ((dividend as i64) as f64).to_bits(),
             Self::UnsignedToDouble => return (dividend as f64).to_bits(),
             Self::DoubleToSigned => return (f64::from_bits(dividend) as i64) as u64,

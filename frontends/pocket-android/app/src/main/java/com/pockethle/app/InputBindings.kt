@@ -113,7 +113,7 @@ internal class InputBindings(private val config: LauncherConfig, private val giz
                 "giz_piano3" to ("Brightness" to 0x72),
                 "giz_piano4" to ("Geofence" to 0x73),
                 "giz_piano5" to ("Power" to 0x7a),
-                "turbo" to ("Turbo (PocketHLE)" to 0x72),
+                "turbo" to ("Turbo (PocketHLE-Reborn)" to 0x72),
                 "center_tap" to ("Center tap" to CenterTapPulse.COMMAND),
                 "stylus_click" to ("Stylus click / mode" to DeckInputPolicy.STYLUS_CLICK_COMMAND),
                 "rotate_screen" to ("Rotation" to DeckInputPolicy.ROTATION_COMMAND),
@@ -200,7 +200,7 @@ internal class InputBindings(private val config: LauncherConfig, private val giz
                 "Backslash" -> "\\"
                 "Pipe" -> "|"
                 "Questionmark" -> "?"
-                "Backtick" -> "`"
+                "Backtick", "²" -> "`"
                 "Equals" -> "="
                 "OpenBracket" -> "["
                 "CloseBracket" -> "]"
@@ -226,6 +226,7 @@ internal class InputBindings(private val config: LauncherConfig, private val giz
                 KeyEvent.KEYCODE_DPAD_RIGHT -> "Right"
                 KeyEvent.KEYCODE_ENTER -> "Enter"
                 KeyEvent.KEYCODE_SPACE -> "Space"
+                KeyEvent.KEYCODE_GRAVE -> "`"
                 KeyEvent.KEYCODE_TAB -> "Tab"
                 KeyEvent.KEYCODE_ESCAPE -> "Escape"
                 KeyEvent.KEYCODE_MOVE_HOME -> "Home"

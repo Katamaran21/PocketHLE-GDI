@@ -52,7 +52,7 @@ enum Command {
         /// Archive or executable to import.
         path: PathBuf,
         /// Library root. Defaults to `POCKETHLE_LIBRARY`, else
-        /// `<documents>/PocketHLE`.
+        /// `<documents>/PocketHLE-Reborn`.
         #[arg(long)]
         library: Option<PathBuf>,
     },
@@ -74,6 +74,9 @@ enum Command {
     /// `--cpu stub` is available for trace-only analysis.
     Run {
         path: PathBuf,
+        /// Use the Generic OpenGL ES (2.0, Common) profile.
+        #[arg(long = "gles2", visible_alias = "adreno200")]
+        adreno200: bool,
         /// CPU backend.
         #[arg(long, default_value = DEFAULT_CPU_BACKEND)]
         cpu: CpuBackend,
@@ -264,6 +267,7 @@ fn main() -> Result<()> {
         Command::RenderDemo { out } => cmd_render_demo(&out),
         Command::Run {
             path,
+            adreno200,
             cpu,
             halt_on_unimplemented,
             max_slices,
@@ -294,6 +298,7 @@ fn main() -> Result<()> {
         } => cmd_run(
             &path,
             cpu,
+            adreno200,
             halt_on_unimplemented,
             max_slices,
             instructions_per_slice,
@@ -527,7 +532,7 @@ fn cmd_render_demo(out_path: &std::path::Path) -> Result<()> {
         pack_rgb565(0xff, 0, 0),
     );
 
-    let ppm = fb.snapshot_ppm();
+    let ppm = fb.snapshot_presentation_ppm();
     std::fs::write(out_path, &ppm).context("writing PPM")?;
     println!(
         "Wrote {}×{} demo PPM to {}",
@@ -573,6 +578,7 @@ fn resolve_message_budget(
 fn cmd_run(
     path: &std::path::Path,
     backend: CpuBackend,
+    adreno200: bool,
     halt_on_unimplemented: bool,
     max_slices: u64,
     instructions_per_slice: u64,
@@ -704,6 +710,7 @@ fn cmd_run(
     } else {
         None
     };
+    emu.set_programmable_gles(adreno200);
     emu.set_gizmondo_audio_compatibility(_launcher.native_screen.is_some());
     // An explicit `--screen` wins; otherwise a launcher that recognised
     // the device the game shipped on picks the geometry, because the
@@ -1089,7 +1096,7 @@ fn cmd_run(
             .state
             .presentation_framebuffer()
             .map_err(anyhow::Error::msg)?
-            .snapshot_ppm();
+            .snapshot_presentation_ppm();
         let final_path = std::env::temp_dir().join("pockethle-final.ppm");
         if let Err(e) = std::fs::write(&final_path, &ppm) {
             eprintln!("warn: could not write {} ({e})", final_path.display());
@@ -1484,7 +1491,10 @@ impl pocket_core::kernel::FrameHook for LiveInputHook {
                                     .presentation_framebuffer()
                                     .map_err(std::io::Error::other)
                                     .and_then(|frame| {
-                                        std::fs::write(path.trim(), frame.snapshot_ppm())
+                                        std::fs::write(
+                                            path.trim(),
+                                            frame.snapshot_presentation_ppm(),
+                                        )
                                     }) {
                                     Ok(()) => {
                                         log::info!("live framebuffer snapshot: {}", path.trim())
@@ -1814,7 +1824,7 @@ impl pocket_core::kernel::FrameHook for DumpFrameHook {
         }
         let path = self.dir.join(format!("frame_{:06}.ppm", self.written));
         let ppm = match state.presentation_framebuffer() {
-            Ok(frame) => frame.snapshot_ppm(),
+            Ok(frame) => frame.snapshot_presentation_ppm(),
             Err(error) => {
                 log::error!("dump presentation failed: {error}");
                 return pocket_core::kernel::FrameAction::Stop;

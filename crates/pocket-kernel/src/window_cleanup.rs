@@ -105,6 +105,13 @@ impl KernelState {
     }
 
     fn discard_one_window_metadata(&mut self, hwnd: &u32) {
+        let directdraw = &mut self.framebuffer.directdraw;
+        if directdraw
+            .fullscreen_owner
+            .is_some_and(|(_, owner)| owner == *hwnd)
+        {
+            directdraw.fullscreen_owner = None;
+        }
         if self.console.view.as_ref().is_some_and(|v| v.hwnd == *hwnd) {
             self.release_console_window();
         }

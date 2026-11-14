@@ -46,7 +46,7 @@ class MainActivity : HostKeyActivity() {
     private var pendingDataGameId: String? = null
 
     private fun pickData(entry: GameEntry) {
-        if (!libraryBusy && addDataModel.step.value == AddDataModel.Step.Idle) {
+        if (!libraryBusy && !firstImportActive && addDataModel.step.value == AddDataModel.Step.Idle) {
             pendingDataGameId = entry.id
             addDataPicker.launch(arrayOf("*/*"))
         }
@@ -57,7 +57,13 @@ class MainActivity : HostKeyActivity() {
         dataDialog = null
         if (step == AddDataModel.Step.Idle) {
             refreshLibrary()
+            showNextImportOptions()
             showReleaseUpdate()
+            return
+        }
+        if (step is AddDataModel.Step.Notice && step.success && step.launchOptions != null) {
+            importOptionsQueue.addLast(step.launchOptions)
+            addDataModel.cancel()
             return
         }
         val dialog = AddDataDialog(this, ::handleHostKeyEvent)
@@ -70,9 +76,15 @@ class MainActivity : HostKeyActivity() {
                 dialog.setCancelable(false)
                 dialog.controllerCancel = false
             }
+            is AddDataModel.Step.Destination -> {
+                dialog.setTitle("Choose data destination")
+                dialog.setButton(android.content.DialogInterface.BUTTON_POSITIVE, "Application Folder") { _, _ -> addDataModel.chooseDestination(false) }
+                dialog.setButton(android.content.DialogInterface.BUTTON_NEUTRAL, "My Documents") { _, _ -> addDataModel.chooseDestination(true) }
+                dialog.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "Cancel") { _, _ -> addDataModel.cancel() }
+            }
             is AddDataModel.Step.Zip -> {
                 dialog.setTitle("Add/Replace Data — ZIP archive")
-                dialog.setMessage("Extract the ZIP contents into the game folder, or copy the ZIP file unchanged?")
+                dialog.setMessage("Extract the ZIP contents into the selected folder, or copy the ZIP file unchanged?")
                 dialog.setButton(android.content.DialogInterface.BUTTON_POSITIVE, "Extract contents") { _, _ -> addDataModel.chooseZip(true) }
                 dialog.setButton(android.content.DialogInterface.BUTTON_NEUTRAL, "Copy ZIP unchanged") { _, _ -> addDataModel.chooseZip(false) }
                 dialog.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "Cancel") { _, _ -> addDataModel.cancel() }
@@ -93,7 +105,7 @@ class MainActivity : HostKeyActivity() {
             }
             is AddDataModel.Step.Overwrite -> {
                 dialog.setTitle("Replace existing data?")
-                dialog.setMessage("Existing files or folders will be replaced. No files have been copied into the game folder yet.\n\n" + step.paths.joinToString("\n"))
+                dialog.setMessage("Existing files or folders will be replaced. No files have been copied into the selected folder yet.\n\n" + step.paths.joinToString("\n"))
                 dialog.setButton(android.content.DialogInterface.BUTTON_POSITIVE, "Yes") { _, _ -> addDataModel.confirmOverwrite() }
                 dialog.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "Cancel") { _, _ -> addDataModel.cancel() }
             }
@@ -140,6 +152,21 @@ class MainActivity : HostKeyActivity() {
         super.onStop()
     }
 
+    private val firstImportQueue = java.util.ArrayDeque<String>()
+    private var firstImportDialog: ImportSetupDialog? = null
+    private var firstImportLoading = false
+    private var restoredFirstImport: JSONObject? = null
+    private val firstImportActive: Boolean
+        get() = firstImportQueue.isNotEmpty() || firstImportDialog != null || firstImportLoading
+
+    private val importOptionsQueue = java.util.ArrayDeque<JSONObject>()
+    private var importOptionsDialog: AlertDialog? = null
+    private var waitingForImportSettings = false
+    private val importSettings = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        waitingForImportSettings = false
+        showNextImportOptions()
+    }
+
     private val importGame = registerForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
@@ -182,7 +209,7 @@ class MainActivity : HostKeyActivity() {
             } finally { setLibraryBusy(null) }
             result.onSuccess {
                 refreshLibrary()
-                AlertDialog.Builder(this@MainActivity).setTitle("PocketHLE backup").setMessage(it)
+                AlertDialog.Builder(this@MainActivity).setTitle("PocketHLE-Reborn backup").setMessage(it)
                     .setPositiveButton(android.R.string.ok, null).show()
             }.onFailure {
                 AlertDialog.Builder(this@MainActivity).setTitle("Backup/restore failed").setMessage(it.message ?: "Unknown error")
@@ -197,6 +224,18 @@ class MainActivity : HostKeyActivity() {
         setSupportActionBar(findViewById<Toolbar>(R.id.toolbar))
 
         rootDir = LibraryPaths.root(this)
+        savedInstanceState?.getString("first_import_queue")?.let { raw ->
+            runCatching { JSONArray(raw) }.getOrNull()?.let { queue ->
+                for (i in 0 until queue.length()) queue.optString(i).takeIf { it in listOf("gizmondo", "pocket_pc") }?.let { firstImportQueue.addLast(it) }
+            }
+        }
+        restoredFirstImport = savedInstanceState?.getString("first_import_draft")?.let { runCatching { JSONObject(it) }.getOrNull() }
+        savedInstanceState?.getString("import_options_queue")?.let { raw ->
+            runCatching { JSONArray(raw) }.getOrNull()?.let { queue ->
+                for (i in 0 until queue.length()) queue.optJSONObject(i)?.let { importOptionsQueue.addLast(it) }
+            }
+        }
+        waitingForImportSettings = savedInstanceState?.getBoolean("waiting_import_settings", false) ?: false
         pendingDataGameId = savedInstanceState?.getString("add_data_game_id")
         addDataModel = androidx.lifecycle.ViewModelProvider(this)[AddDataModel::class.java]
         emptyState = findViewById(R.id.empty_state)
@@ -211,6 +250,7 @@ class MainActivity : HostKeyActivity() {
                 )
             },
             onAddData = { entry -> pickData(entry) },
+            onSwitchExecutable = ::switchLaunchExecutable,
             onRemove = { entry -> confirmRemove(entry) },
             onRename = { entry -> renameGame(entry) },
             onInformation = { entry -> showInformation(entry) },
@@ -230,7 +270,7 @@ class MainActivity : HostKeyActivity() {
         })
 
         findViewById<FloatingActionButton>(R.id.fab_import).setOnClickListener {
-            if (!libraryBusy) importGame.launch(arrayOf("application/vnd.ms-cab-compressed", "application/x-rar-compressed", "application/zip", "application/octet-stream", "*/*"))
+            if (!libraryBusy && !firstImportActive) importGame.launch(arrayOf("application/vnd.ms-cab-compressed", "application/x-rar-compressed", "application/zip", "application/octet-stream", "*/*"))
         }
         lifecycleScope.launch {
             pendingReleaseUpdate = withContext(Dispatchers.IO) {
@@ -240,19 +280,72 @@ class MainActivity : HostKeyActivity() {
         }
     }
 
+    private fun switchLaunchExecutable(entry: GameEntry) {
+        if (libraryBusy) return
+        lifecycleScope.launch {
+            val response = withContext(Dispatchers.IO) {
+                runCatching { JSONObject(NativeBridge.launchExecutables(rootDir, entry.id, null)) }
+            }
+            val body = response.getOrNull()
+            val entries = body?.optJSONArray("executables")
+            if (entries == null || entries.length() == 0) {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Switch Launch Executable")
+                    .setMessage(body?.optString("error", "No launchable executables found.")
+                        ?: response.exceptionOrNull()?.localizedMessage
+                        ?: "Could not list executables.")
+                    .setPositiveButton(android.R.string.ok, null)
+                    .show()
+                return@launch
+            }
+            val paths = Array(entries.length()) { entries.getString(it) }
+            val labels = Array(paths.size) { paths[it].removePrefix("extracted/") }
+            AlertDialog.Builder(this@MainActivity)
+                .setTitle("Switch Launch Executable")
+                .setSingleChoiceItems(labels, paths.indexOf(body?.optString("current").orEmpty())) { dialog, index ->
+                    dialog.dismiss()
+                    lifecycleScope.launch {
+                        val result = withContext(Dispatchers.IO) {
+                            runCatching {
+                                val saved = JSONObject(NativeBridge.launchExecutables(rootDir, entry.id, paths[index]))
+                                if (!saved.optBoolean("ok")) error(saved.optString("error"))
+                                saved
+                            }
+                        }
+                        result.onSuccess { saved ->
+                            refreshLibrary()
+                            saved.optJSONObject("launch_options")?.let {
+                                importOptionsQueue.addLast(it)
+                                showNextImportOptions()
+                            }
+                        }.onFailure { error ->
+                            AlertDialog.Builder(this@MainActivity)
+                                .setTitle("Could not switch executable")
+                                .setMessage(error.localizedMessage)
+                                .setPositiveButton(android.R.string.ok, null)
+                                .show()
+                        }
+                    }
+                }
+                .setNegativeButton(android.R.string.cancel, null)
+                .show()
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         if (!libraryBusy) refreshLibrary()
+        showNextImportOptions()
         showReleaseUpdate()
     }
 
     private fun showReleaseUpdate() {
         val update = pendingReleaseUpdate ?: return
-        if (ReleaseUpdates.announced || libraryBusy || dataDialog?.isShowing == true || isFinishing || isDestroyed ||
+        if (ReleaseUpdates.announced || libraryBusy || firstImportActive || importOptionsDialog != null || importOptionsQueue.isNotEmpty() || dataDialog?.isShowing == true || isFinishing || isDestroyed ||
             !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return
         ReleaseUpdates.announced = true
         pendingReleaseUpdate = null
-        Snackbar.make(recycler, "PocketHLE ${update.version} is available", Snackbar.LENGTH_INDEFINITE)
+        Snackbar.make(recycler, "PocketHLE-Reborn ${update.version} is available", Snackbar.LENGTH_INDEFINITE)
             .setAction("Download") {
                 runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(update.url))) }
                     .onFailure { android.widget.Toast.makeText(this, "No browser available", android.widget.Toast.LENGTH_LONG).show() }
@@ -265,7 +358,7 @@ class MainActivity : HostKeyActivity() {
     }
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        if (libraryBusy) return true
+        if (libraryBusy || firstImportActive) return true
         return when (item.itemId) {
             R.id.action_backup -> { saveLibraryBackup(); true }
             R.id.action_restore -> { restoreBackup.launch(arrayOf("application/zip", "application/octet-stream", "*/*")); true }
@@ -297,6 +390,10 @@ class MainActivity : HostKeyActivity() {
     }
 
     override fun onSaveInstanceState(out: Bundle) {
+        out.putString("first_import_queue", JSONArray(firstImportQueue.toList()).toString())
+        out.putString("first_import_draft", (firstImportDialog?.snapshot() ?: restoredFirstImport)?.toString())
+        out.putString("import_options_queue", JSONArray(importOptionsQueue.toList()).toString())
+        out.putBoolean("waiting_import_settings", waitingForImportSettings)
         out.putString("add_data_game_id", pendingDataGameId)
         out.putBoolean("gizmondo_tab", gizmondoTab); super.onSaveInstanceState(out)
     }
@@ -317,7 +414,7 @@ class MainActivity : HostKeyActivity() {
         editGameName(entry.id, entry.displayName, "Rename game")
     }
 
-    private fun editGameName(id: String, detectedName: String, title: String) {
+    private fun editGameName(id: String, detectedName: String, title: String, afterClose: (() -> Unit)? = null) {
         val input = android.widget.EditText(this).apply { setText(detectedName); selectAll(); isSingleLine = true }
         val dialog = AlertDialog.Builder(this).setTitle(title).setView(input)
             .setNegativeButton(android.R.string.cancel,null).setPositiveButton("Save",null).create()
@@ -330,6 +427,7 @@ class MainActivity : HostKeyActivity() {
                 else input.error=result?.optString("error") ?: "Could not save settings"
             }
         }
+        dialog.setOnDismissListener { afterClose?.invoke() }
         dialog.show()
     }
 
@@ -377,6 +475,11 @@ class MainActivity : HostKeyActivity() {
     }
 
     override fun onDestroy() {
+        firstImportDialog?.dispose()
+        firstImportDialog = null
+        importOptionsDialog?.setOnDismissListener(null)
+        importOptionsDialog?.dismiss()
+        importOptionsDialog = null
         dataDialog?.dismiss()
         dataDialog = null
         busyDialog?.dismiss()
@@ -505,6 +608,42 @@ class MainActivity : HostKeyActivity() {
                 }.show()
             return
         }
+        val executableChoices = obj.optJSONArray("executable_choices")
+        if (executableChoices != null && executableChoices.length() > 0) {
+            val game = executableChoices.getJSONObject(0)
+            val executables = game.getJSONArray("executables")
+            setLibraryBusy("Waiting for executable selection…")
+            busyDialog?.dismiss()
+            busyDialog = null
+            val labels = Array(executables.length()) { executables.getString(it).removePrefix("extracted/") }
+            fun cancelImport() {
+                NativeBridge.cancelPreparedImport(rootDir, token)
+                pendingImportToken = null
+                setLibraryBusy(null)
+            }
+            val title = "Choose executable for ${game.getString("display_name")}"
+            val hint = "You can change this later in the game’s ⋯ menu → Switch Launch Executable."
+            val heading = android.text.SpannableString("$title\n$hint").apply {
+                setSpan(android.text.style.RelativeSizeSpan(0.75f), title.length + 1, length, 0)
+            }
+            AlertDialog.Builder(this)
+                .setTitle(heading)
+                .setCancelable(false)
+                .setItems(labels) { _, index ->
+                    runCatching {
+                        val next = NativeBridge.choosePreparedImportExecutable(rootDir, token, game.getString("id"), index)
+                        val response = JSONObject(next)
+                        if (!response.optBoolean("ok", false)) error(response.optString("error"))
+                        next
+                    }.onSuccess { showPreparedImport(it) }.onFailure { error ->
+                        cancelImport()
+                        showImportError(error.message ?: "Unknown error")
+                    }
+                }
+                .setNegativeButton("Cancel import") { _, _ -> cancelImport() }
+                .show()
+            return
+        }
         val updates = obj.getJSONArray("updates")
         if (updates.length() == 0) {
             commitPreparedImport(token, false)
@@ -550,12 +689,170 @@ class MainActivity : HostKeyActivity() {
         }
     }
 
+    private fun enqueueImportOptions(entries: List<JSONObject>) {
+        entries.forEach { entry ->
+            entry.optJSONArray("first_import_setup")?.let { platforms ->
+                for (i in 0 until platforms.length()) {
+                    val platform = platforms.optString(i)
+                    if (platform in listOf("gizmondo", "pocket_pc") && !firstImportQueue.contains(platform)) firstImportQueue.addLast(platform)
+                }
+            }
+            entry.optJSONObject("launch_options")?.let { options ->
+                if (importOptionsQueue.none { it.optString("id") == options.optString("id") }) {
+                    importOptionsQueue.addLast(options.put("display_name", entry.optString("display_name")))
+                }
+            }
+        }
+        showNextImportOptions()
+    }
+
+    private fun showNextFirstImportSetup() {
+        if (firstImportDialog != null || firstImportLoading || libraryBusy || waitingForImportSettings
+            || isFinishing || isDestroyed || !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return
+        val platform = firstImportQueue.peekFirst() ?: return
+        firstImportLoading = true
+        lifecycleScope.launch {
+            val read = withContext(Dispatchers.IO) { runCatching { JSONObject(NativeBridge.readConfig(rootDir)) } }
+            firstImportLoading = false
+            read.fold(onSuccess = { raw ->
+                if (raw.has("error")) {
+                    firstImportQueue.pollFirst()
+                    Snackbar.make(recycler, raw.optString("error"), Snackbar.LENGTH_LONG).show()
+                    showNextImportOptions()
+                    return@fold
+                }
+                if (raw.optJSONObject("first_import_setup")?.optBoolean(platform, false) == true) {
+                    firstImportQueue.pollFirst(); restoredFirstImport = null
+                    showNextImportOptions(); return@fold
+                }
+                lateinit var setup: ImportSetupDialog
+                setup = ImportSetupDialog(this@MainActivity, platform, LauncherConfig.fromJson(raw),
+                    ::handleHostKeyEvent, restoredFirstImport?.takeIf { it.optString("platform") == platform }) { choices ->
+                    lifecycleScope.launch {
+                        val saved = withContext(Dispatchers.IO) {
+                            runCatching {
+                                val result = JSONObject(NativeBridge.finishImportSetup(rootDir, choices.toString()))
+                                check(result.optBoolean("ok", false)) { result.optString("error", "Could not save settings") }
+                            }
+                        }
+                        saved.fold(onSuccess = {
+                            setup.dispose(); firstImportDialog = null
+                            firstImportQueue.pollFirst(); restoredFirstImport = null
+                            showNextImportOptions()
+                        }, onFailure = { setup.failed(it.message ?: "Unknown error") })
+                    }
+                }
+                restoredFirstImport = null
+                firstImportDialog = setup
+                setup.show()
+            }, onFailure = {
+                firstImportQueue.pollFirst()
+                Snackbar.make(recycler, it.message ?: "Could not read setup settings", Snackbar.LENGTH_LONG).show()
+                showNextImportOptions()
+            })
+        }
+    }
+
+    private fun showNextImportOptions() {
+        if (firstImportActive) { showNextFirstImportSetup(); return }
+        if (isFinishing || isDestroyed || libraryBusy || waitingForImportSettings ||
+            importOptionsDialog != null || dataDialog?.isShowing == true) return
+        val entry = importOptionsQueue.peekFirst() ?: return
+        val id = entry.getString("id")
+        val currentProfile = entry.optString("current_profile")
+        val profiles = entry.optJSONArray("profiles")
+        val message = "${entry.optString("display_name")}\n\n${entry.optString("message")}"
+        val displayAdvice = entry.optBoolean("show_display_advice")
+        val title = if (displayAdvice) "Pocket PC launch settings" else "GPU compatibility profile"
+        val builder = AlertDialog.Builder(this).setTitle(title)
+        val choices = android.widget.RadioGroup(this)
+        if (profiles != null && profiles.length() > 0) {
+            val padding = (24 * resources.displayMetrics.density).toInt()
+            choices.setPadding(padding, 0, padding, 0)
+            choices.addView(android.widget.TextView(this).apply { text = message })
+            for (index in 0 until profiles.length()) {
+                val profile = profiles.getJSONObject(index)
+                choices.addView(android.widget.RadioButton(this).apply {
+                    this.id = android.view.View.generateViewId()
+                    text = profile.getString("label")
+                    tag = profile.getString("id")
+                    isChecked = tag == currentProfile
+                })
+            }
+            builder.setView(android.widget.ScrollView(this).apply { addView(choices) })
+        } else {
+            builder.setMessage(message)
+        }
+
+        fun openSettings() {
+            waitingForImportSettings = true
+            importSettings.launch(Intent(this, GameSettingsActivity::class.java)
+                .putExtra(GameSettingsActivity.EXTRA_GAME_ID, id)
+                .putExtra(GameSettingsActivity.EXTRA_GAME_NAME, entry.optString("display_name")))
+        }
+
+        fun applyChoice(settings: Boolean) {
+            val selected = choices.findViewById<android.view.View>(choices.checkedRadioButtonId)?.tag as? String
+            if (selected == null || selected == currentProfile) {
+                if (settings) openSettings()
+                return
+            }
+            waitingForImportSettings = true
+            lifecycleScope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val config = JSONObject(NativeBridge.readGameSettings(rootDir, id))
+                        check(!config.has("error")) { config.optString("error") }
+                        config.put("gpu_compatibility_profile", selected)
+                        val saved = JSONObject(NativeBridge.writeGameSettings(rootDir, id, config.toString()))
+                        check(saved.optBoolean("ok")) { saved.optString("error") }
+                    }
+                }
+                waitingForImportSettings = false
+                result.onSuccess {
+                    refreshLibrary()
+                    if (settings) openSettings() else showNextImportOptions()
+                }.onFailure { error ->
+                    importOptionsQueue.addFirst(entry)
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Could not save GPU profile")
+                        .setMessage(error.localizedMessage)
+                        .setPositiveButton(android.R.string.ok, null)
+                        .setOnDismissListener { showNextImportOptions() }
+                        .show()
+                }
+            }
+        }
+
+        builder.setPositiveButton("Continue") { _, _ -> applyChoice(false) }
+        if (displayAdvice) {
+            builder.setNegativeButton("Open game settings") { _, _ -> applyChoice(true) }
+        }
+        val dialog = builder.create()
+        importOptionsDialog = dialog
+        dialog.setOnDismissListener {
+            importOptionsQueue.pollFirst()
+            importOptionsDialog = null
+            recycler.post { showNextImportOptions() }
+        }
+        dialog.show()
+        val continueButton = dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE)
+        choices.setOnCheckedChangeListener { group, checkedId ->
+            val profile = group.findViewById<android.view.View>(checkedId)?.tag
+            continueButton.text = if (profile != null && profile != currentProfile) "Save profile" else "Continue"
+        }
+        choices.findViewById<android.view.View>(choices.checkedRadioButtonId)?.requestFocus()
+            ?: dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).requestFocus()
+    }
+
     private fun handleImportResult(raw: String, confirmName: Boolean = true) {
         try {
             if (raw.trimStart().startsWith("[")) {
                 val entries = GameEntry.listFromJson(raw)
-                gizmondoTab = true
-                findViewById<com.google.android.material.tabs.TabLayout>(R.id.platform_tabs).getTabAt(0)?.select()
+                val imported = JSONArray(raw)
+                enqueueImportOptions((0 until imported.length()).map { imported.getJSONObject(it) })
+                gizmondoTab = entries.firstOrNull()?.isGizmondo ?: true
+                findViewById<com.google.android.material.tabs.TabLayout>(R.id.platform_tabs).getTabAt(if (gizmondoTab) 0 else 1)?.select()
                 Snackbar.make(recycler, if (confirmName) "Imported ${entries.size} separate games." else "Imported or updated ${entries.size} games. Saves and settings kept.", Snackbar.LENGTH_LONG).show()
                 return
             }
@@ -570,7 +867,7 @@ class MainActivity : HostKeyActivity() {
                 AlertDialog.Builder(this).setTitle("Import demo card")
                     .setMessage("Keep the original launcher or create a separate directory and library entry for each game?")
                     .setCancelable(false)
-                    .setNegativeButton("Keep launcher") { _,_ -> editGameName(id,name,"Confirm game name") }
+                    .setNegativeButton("Keep launcher") { _,_ -> editGameName(id,name,"Confirm game name") { enqueueImportOptions(listOf(obj)) } }
                     .setPositiveButton("Separate games") { _,_ ->
                         setLibraryBusy("Separating demo card games…")
                         lifecycleScope.launch {
@@ -583,11 +880,17 @@ class MainActivity : HostKeyActivity() {
                             }
                             split.fold(onSuccess={ entries ->
                                 refreshLibrary()
+                                enqueueImportOptions(listOf(obj))
                                 Snackbar.make(recycler,"Imported ${entries.size} separate games. Names can be edited from each game menu.",Snackbar.LENGTH_LONG).show()
-                            },onFailure={ e -> Snackbar.make(recycler,"Could not split card: ${e.message}",Snackbar.LENGTH_LONG).show() })
+                            },onFailure={ e ->
+                                enqueueImportOptions(listOf(obj))
+                                Snackbar.make(recycler,"Could not split card: ${e.message}",Snackbar.LENGTH_LONG).show()
+                            })
                         }
                     }.show()
-            } else if (confirmName) editGameName(id, name, "Confirm game name")
+            } else if (confirmName && obj.optBoolean("is_gizmondo")) editGameName(id, name, "Confirm game name") {
+                enqueueImportOptions(listOf(obj))
+            } else enqueueImportOptions(listOf(obj))
             Snackbar.make(
                 recycler,
                 if (confirmName) getString(R.string.import_success, name) else "Updated $name; saves and settings kept.",
@@ -629,7 +932,7 @@ class MainActivity : HostKeyActivity() {
     private var launchPending = false
 
     private fun launchGame(entry: GameEntry) {
-        if (libraryBusy || launchPending) return
+        if (libraryBusy || firstImportActive || launchPending) return
         launchPending = true
         lifecycleScope.launch {
             try {
@@ -877,7 +1180,7 @@ class MainActivity : HostKeyActivity() {
     }
 
     private fun startGame(entry: GameEntry) {
-        if (libraryBusy) return
+        if (libraryBusy || firstImportActive) return
         startActivity(
             Intent(this, GameActivity::class.java)
                 .putExtra(GameActivity.EXTRA_GAME_ID, entry.id)

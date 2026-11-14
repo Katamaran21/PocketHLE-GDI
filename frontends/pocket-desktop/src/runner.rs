@@ -1,12 +1,13 @@
 //! Background runner that drives [`pocket_core::Emulator`] for the
 //! desktop GUI.
 
+use pocket_core::child_jobs::{self, ChildJob};
+use pocket_core::winceapi::{self, SystemMediaCommand, SystemMediaInput, SystemMediaStatus};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::sync::Mutex;
-use pocket_core::winceapi::{self, SystemMediaCommand, SystemMediaInput, SystemMediaStatus};
 use std::time::{Duration, Instant};
 
 use pocket_core::kernel::{FrameAction, FrameHook, InputEvent, KernelState};
@@ -47,7 +48,7 @@ fn presentation_phase(
 
 #[derive(Debug, Clone)]
 pub struct Runner {
-    library_profile:pocket_library::LauncherProfile,
+    library_profile: pocket_library::LauncherProfile,
     inner: Arc<Mutex<()>>,
     missing_api_logging: Arc<AtomicBool>,
     shared_context_source: Arc<Mutex<Option<pocket_core::winceapi::gles::SharedContextSource>>>,
@@ -57,7 +58,7 @@ pub struct Runner {
 impl Default for Runner {
     fn default() -> Self {
         Self {
-            library_profile:Default::default(),
+            library_profile: Default::default(),
             inner: Default::default(),
             missing_api_logging: Arc::new(AtomicBool::new(true)),
             shared_context_source: Default::default(),
@@ -66,8 +67,11 @@ impl Default for Runner {
     }
 }
 impl Runner {
-    pub fn new(library_profile:pocket_library::LauncherProfile) -> Self {
-        Self {library_profile,..Self::default()}
+    pub fn new(library_profile: pocket_library::LauncherProfile) -> Self {
+        Self {
+            library_profile,
+            ..Self::default()
+        }
     }
 
     pub fn set_shared_context_source(
@@ -123,7 +127,7 @@ impl Runner {
         gps_notice_tx: Option<Sender<(f64, f64)>>,
         dependency_notice_tx: Option<Sender<String>>,
         system_media: SystemMediaView,
-    ) -> RunOutcome {
+    ) -> (RunOutcome, Option<pocket_library::session_diagnostic::Diagnostic>) {
         let _guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut hook = RunHook::new(live_tx, input_rx);
         hook.system_media = system_media;
@@ -134,22 +138,32 @@ impl Runner {
             && game.settings.storage_card_dir.is_some()
             && !card_root.is_dir()
         {
-            return RunOutcome {
-                summary: format!("SD Card folder does not exist: {}", card_root.display()),
-                framebuffer: None,
-            };
+            let summary = format!("SD Card folder does not exist: {}", card_root.display());
+            let diagnostic = pocket_library::session_diagnostic::startup_failure(summary.clone(), Vec::new());
+            return (RunOutcome { summary, framebuffer: None }, Some(diagnostic));
         }
-        self.run_process(
-            &library_root,
-            &game,
-            &card_root,
-            None,
-            None,
-            None,
-            None,
-            &mut hook,
-        )
-        .0
+        let ((outcome, code), log) = pocket_library::session_diagnostic::capture(|| {
+            self.run_process(
+                &library_root,
+                &game,
+                &card_root,
+                None,
+                None,
+                None,
+                None,
+                &mut hook,
+            )
+        });
+        let diagnostic = pocket_library::session_diagnostic::classify(
+            hook.stopped_by_user,
+            hook.started,
+            code,
+            hook.startup_exit,
+            hook.runtime_error.as_deref(),
+            &outcome.summary,
+            log,
+        );
+        (outcome, diagnostic)
     }
 
     fn run_process(
@@ -225,9 +239,24 @@ impl Runner {
         // [`pocket_library::Library::migrate_legacy_entries`], which
         // covers users who downgrade or who have a stale
         // `library.json` from before that migration existed.
-        let launcher_config = pocket_library::Library::open_with_profile(library_root,self.library_profile)
-            .map(|l| l.config().clone())
-            .unwrap_or_default();
+        let launcher_config =
+            pocket_library::Library::open_with_profile(library_root, self.library_profile)
+                .map(|l| l.config().clone())
+                .unwrap_or_default();
+        if guest_path.is_none()
+            && metadata
+                .as_ref()
+                .is_some_and(|image| image.managed_runtime.is_some())
+        {
+            return run_compact_framework(
+                &exe,
+                game,
+                library_root,
+                metadata.as_ref(),
+                &launcher_config,
+                hook,
+            );
+        }
         let requested_backend = game.settings.cpu_backend;
         let mut effective_backend = requested_backend;
         let mut emu = match requested_backend {
@@ -259,7 +288,7 @@ impl Runner {
         hook.frame_interval = frame_interval(fps_limit);
         log::info!("PRESENTATION_LIMIT={} (completed frames; unbounded intermediate GDI updates remain coalesced)",
             fps_limit.filter(|fps| *fps != 0).map(|fps| format!("{fps} FPS")).unwrap_or_else(|| if fps_limit == Some(0) { "UNLIMITED".into() } else { "NATIVE".into() }));
-        emu.set_unimplemented_api_sink(Box::new(crate::unimplemented_log::UnimplementedLog::new(
+        emu.set_unimplemented_api_sink(Box::new(pocket_core::winceapi::unimplemented_log::UnimplementedLog::new(
             library_root.join("pockethle-unimplemented-apis.log"),
             game.display_name.clone(),
             guest_path
@@ -319,6 +348,10 @@ impl Runner {
         }
         emu.set_gizmondo_audio_compatibility(is_gizmondo);
         if let Some(process) = emu.process_mut() {
+            if !is_gizmondo {
+                process.state.virtual_tilt_axes =
+                    game.settings.effective_tilt_axes(&launcher_config);
+            }
             process.state.touch_steering.enabled = !is_gizmondo
                 && (game.settings.controls_mode()
                     == pocket_library::stylus_grid::ControlsMode::Zones);
@@ -398,16 +431,20 @@ impl Runner {
                 let _ = emu.set_pocketpc_processor("pxa270");
             }
         }
-        emu.set_gpu_renderer(
-            game.settings
-                .gpu_renderer
-                .unwrap_or(launcher_config.gpu_renderer),
-        );
+        let profile = game.settings.gpu_compatibility_profile;
+        let programmable = !is_gizmondo
+            && (profile.programmable_gles()
+                || metadata
+                    .as_ref()
+                    .is_some_and(pocket_library::uses_programmable_gles));
+        // A process can expose GLES2 entry points and still use GLES1 through
+        // libGLES_CM/CL. Keep the GLES1 backend tied to the global setting.
+        emu.set_gpu_renderer(launcher_config.gpu_renderer);
         emu.set_gizmondo_goforce_driver(is_gizmondo);
-        emu.set_nv_combiner_allowed(is_gizmondo || launcher_config.pocketpc_nv_combiners);
-        emu.set_intel2700g_depth_bias(
-            !is_gizmondo && launcher_config.pocketpc_intel2700g_depth_bias,
-        );
+        emu.set_programmable_gles(programmable);
+        emu.set_goforce_5500_profile(!is_gizmondo && profile.nvidia_combiners());
+        emu.set_nv_combiner_allowed(is_gizmondo || profile.nvidia_combiners());
+        emu.set_intel2700g_depth_bias(!is_gizmondo && profile.intel_depth_bias());
         emu.set_gles_internal_resolution(launcher_config.gles_internal_resolution);
         log::info!("Gizmondo GPS configuration: gizmondo={} host_enabled={} fixed_enabled={} latitude={} longitude={}",is_gizmondo,launcher_config.gps_enabled,launcher_config.gps_fixed_enabled,launcher_config.gps_fixed_latitude,launcher_config.gps_fixed_longitude);
         let hardware = (
@@ -571,7 +608,9 @@ impl Runner {
         emu.set_egl_rgba8888_only(!is_gizmondo && game.settings.pocketpc_egl_rgba8888_only);
         emu.set_pocketpc_gapi_columns(if is_gizmondo {
             (screen_w, screen_h) == (320, 240)
-                && metadata.as_ref().is_some_and(pocket_library::analysis::uses_rotated_gizmondo_lcd)
+                && metadata
+                    .as_ref()
+                    .is_some_and(pocket_library::analysis::uses_rotated_gizmondo_lcd)
         } else {
             game.settings.pocketpc_gapi_columns
         });
@@ -677,19 +716,22 @@ impl Runner {
             if let Some(process) = emu.process_mut() {
                 process.state.cedb.path = Some(save_dir.join("cedb-contacts.json"));
             }
-            if !is_gizmondo
-                && !paths
-                    .save_prefix
-                    .trim_end_matches('\\')
-                    .eq_ignore_ascii_case(r"\My Documents")
-            {
-                emu.mount_isolated_save_dir(r"\My Documents\", save_dir.join("my-documents"));
-            }
             summary_lines.push(format!(
                 "Save data: {} -> {:?}",
                 save_dir.display(),
                 paths.save_prefix
             ));
+        }
+        if !is_gizmondo {
+            for (prefix, directory) in game.application_data_mounts(&library_root) {
+                emu.mount_isolated_save_dir(&prefix, directory);
+            }
+        }
+        if game.my_documents_uses_separate_directory(&library_root) {
+            emu.mount_isolated_save_dir(
+                r"\My Documents",
+                game.save_dir(&library_root).join("my-documents"),
+            );
         }
         if !is_gizmondo && game.source_cab.to_ascii_lowercase().ends_with(".cab") {
             if let Some(install_dir) = game.install_dir.as_deref() {
@@ -808,7 +850,14 @@ impl Runner {
             }
         }
         emu.start_audio();
+        hook.started = true;
+        let started_at = std::time::Instant::now();
         let run_result = emu.run_with_hook(hook);
+        hook.startup_exit = started_at.elapsed()
+            < pocket_library::session_diagnostic::STARTUP_DIAGNOSTIC_WINDOW;
+        if let Err(error) = &run_result {
+            hook.runtime_error = Some(format!("{error:#}"));
+        }
         match &run_result {
             Ok(()) => summary_lines.push("Emulator exited cleanly.".to_string()),
             Err(e) => summary_lines.push(format!("Emulator stopped: {e:#}")),
@@ -1108,10 +1157,7 @@ impl Drop for ProcessStartup {
         }
     }
 }
-struct ChildJob {
-    table: pocket_core::kernel::handles::HandleTable,
-    thread: std::thread::JoinHandle<(RunOutcome, u32)>,
-}
+
 
 #[derive(Default)]
 struct CeDesktopView {
@@ -1159,7 +1205,7 @@ struct RunHook {
     foreground: Arc<AtomicU32>,
     pid: u32,
     parent_pid: u32,
-    children: Vec<ChildJob>,
+    children: Vec<ChildJob<(RunOutcome, u32)>>,
     last_frame: u64,
     frame_send_failed: bool,
     input_disconnected: bool,
@@ -1173,6 +1219,9 @@ struct RunHook {
     /// for the entire run instead of growing one per delivered frame.
     scratch: Vec<u8>,
     saw_non_black: bool,
+    started: bool,
+    startup_exit: bool,
+    runtime_error: Option<String>,
     stopped_by_user: bool,
     launch_context: Option<LaunchContext>,
 }
@@ -1437,7 +1486,10 @@ impl RunHook {
                 loop {
                     match rx.try_recv() {
                         Ok(InputCommand::Input(ev)) => {
-                            if self.media_input.capture(ev, media_active, &mut self.media_commands) {
+                            if self
+                                .media_input
+                                .capture(ev, media_active, &mut self.media_commands)
+                            {
                                 continue;
                             }
                             match ev {
@@ -1502,17 +1554,9 @@ impl RunHook {
         hook
     }
     fn finish_children(&mut self) {
-        for job in self.children.drain(..) {
-            if !job.table.start_allowed() {
-                job.table
-                    .terminate_remote_process(job.table.process_id(), 0xc0000001);
-                job.table.allow_start();
-            }
-            if let Err(_) = job.thread.join() {
-                self.stop_all.store(true, Ordering::Release);
-            }
-        }
+        child_jobs::finish(&mut self.children, &self.stop_all);
     }
+
     fn reap_children(&mut self) {
         let mut index = 0;
         while index < self.children.len() {
@@ -1572,10 +1616,60 @@ impl RunHook {
             last_completed: 0,
             scratch: Vec::new(),
             saw_non_black: false,
+            started: false,
+            startup_exit: false,
+            runtime_error: None,
             stopped_by_user: false,
             launch_context: None,
         }
     }
+}
+
+fn run_compact_framework(
+    exe: &std::path::Path,
+    game: &GameEntry,
+    library_root: &std::path::Path,
+    image: Option<&pocket_core::pe::LoadedImage>,
+    config: &pocket_library::LauncherConfig,
+    hook: &mut RunHook,
+) -> (RunOutcome, u32) {
+
+    let tilt = game.settings.effective_tilt_axes(config);
+    let mut input = std::collections::VecDeque::new();
+    let sender = hook.frame_tx.clone();
+    let mut framebuffer = None;
+    let result = pocket_netcf::host::run(
+        exe,
+        pocket_netcf::host::Options {
+            size: game.settings.screen.resolve_image(image),
+            save_root: Some(game.save_dir(library_root)),
+            guest_path: game.guest_launch_paths(library_root).map(|paths| paths.module_path),
+            tilt,
+            gpu_renderer: config.gpu_renderer,
+            gles_internal_resolution: config.gles_internal_resolution,
+            frame_rate_limit: game.settings.effective_frame_rate_limit(config),
+        },
+        |events| {
+            let stop = hook.drain_input(&mut input);
+            events.extend(input.drain(..));
+            !stop
+        },
+        |frame| {
+            let snapshot = FrameSnapshot::from_framebuffer(frame);
+            if let Some(sender) = &sender {
+                let _ = sender.send(snapshot.clone());
+            }
+            framebuffer = Some(snapshot);
+        },
+        |audio| audio.start(),
+    );
+    hook.started = framebuffer.is_some();
+    hook.runtime_error = result.as_ref().err().cloned();
+    let (summary, code) = match result {
+        Ok(()) => ("Compact Framework session ended.".into(), 0),
+        Err(error) => (error, 0xc0000135),
+    };
+    (RunOutcome { summary, framebuffer }, code)
 }
 
 impl FrameHook for RunHook {
@@ -1670,6 +1764,7 @@ impl FrameHook for RunHook {
                                 Ok(frame) => frame,
                                 Err(error) => {
                                     log::error!("GPU snapshot failed: {error}");
+                                    self.runtime_error = Some(format!("GPU snapshot failed: {error}"));
                                     state.should_stop = true;
                                     return FrameAction::Stop;
                                 }
@@ -1679,11 +1774,13 @@ impl FrameHook for RunHook {
                                 Ok(frame) => frame.is_all_black(),
                                 Err(error) => {
                                     log::error!("framebuffer read failed: {error}");
+                                    self.runtime_error = Some(format!("framebuffer read failed: {error}"));
                                     state.should_stop = true;
                                     return FrameAction::Stop;
                                 }
                             };
-                            if black && self.saw_non_black && !state.framebuffer.has_system_video() {
+                            if black && self.saw_non_black && !state.framebuffer.has_system_video()
+                            {
                                 return if stop_requested {
                                     state.should_stop = true;
                                     FrameAction::Stop
@@ -1698,6 +1795,7 @@ impl FrameHook for RunHook {
                                 Ok(frame) => frame,
                                 Err(error) => {
                                     log::error!("presentation read failed: {error}");
+                                    self.runtime_error = Some(format!("presentation read failed: {error}"));
                                     state.should_stop = true;
                                     return FrameAction::Stop;
                                 }
@@ -1958,8 +2056,8 @@ mod launcher_return_tests {
         });
         let table = context.as_ref().map(|context| context.table.clone());
         let mut hook = RunHook::new(None, None);
-        let (outcome, code) =
-            Runner::new(Default::default()).run_process(&root, &game, &card, None, None, context, None, &mut hook);
+        let (outcome, code) = Runner::new(Default::default())
+            .run_process(&root, &game, &card, None, None, context, None, &mut hook);
         assert_eq!(code, 77, "{}", outcome.summary);
         if let Some(table) = table {
             assert_eq!(table.exit_code(table.process_id(), None), Some(77));
@@ -2054,8 +2152,8 @@ mod launcher_return_tests {
             }
         });
         let mut hook = RunHook::new(None, Some(rx));
-        let (outcome, code) =
-            Runner::new(Default::default()).run_process(&root, &game, &card, None, None, None, None, &mut hook);
+        let (outcome, code) = Runner::new(Default::default())
+            .run_process(&root, &game, &card, None, None, None, None, &mut hook);
         completed.store(true, Ordering::Release);
         input.join().unwrap();
         assert_eq!(code, 0, "{}", outcome.summary);

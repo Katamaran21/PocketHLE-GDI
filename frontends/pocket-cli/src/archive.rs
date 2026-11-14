@@ -319,7 +319,7 @@ fn prepare_installshield_sfx(path: &Path) -> Result<Launcher> {
 fn prepare_cab(path: &Path) -> Result<Launcher> {
     let tmp = TempDir::with_prefix("pockethle-cab-")
         .with_context(|| format!("creating temp dir for {}", path.display()))?;
-    let (files, header) = pocket_core::cab::extract_with_header(path, tmp.path())
+    let (files, header) = pocket_core::cab::extract_for_install(path, tmp.path())
         .with_context(|| format!("extracting {}", path.display()))?;
 
     if files.is_empty() {
@@ -333,17 +333,19 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     // (`_G2D32~1.003`, `ZUMAPP~1.002`, …). Games then `CreateFileW`
     // their assets by their *long* name (`_game_common.pak`,
     // `ZumaPPC_VS2008.exe`). Parse `_setup.xml` (or the binary `.000`
-    // install header) and materialise the long-name copies under the
-    // same temp dir so a single mount answers both shapes.
+    // install header) and materialise the installed names before choosing
+    // an executable and removing consumed XML cabinet member names.
     let setup = parse_setup_script(&files);
-    materialise_long_names(tmp.path(), &files, &setup);
+    let long_names = materialise_long_names(tmp.path(), &files, &setup);
     // A `.000` header that parsed as a real MSCE file names every
     // payload exactly, so the reconstruct-by-guesswork paths below only
     // add wrong names. They stay for headers we could not parse.
     let structured = header.as_ref().is_some_and(|h| h.structured);
+    let mut header_names = Vec::new();
     if structured {
         if let Some(h) = header.as_ref() {
-            pocket_core::cab::materialise_install_header_names(tmp.path(), &files, h);
+            header_names =
+                pocket_core::cab::materialise_install_header_names(tmp.path(), &files, h);
         }
     } else {
         materialise_legacy_names(tmp.path(), &files, header.as_ref());
@@ -353,17 +355,32 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
         }
     }
 
-    // Chopper Fight's `.000` gives GUI and scene ZIPs their install paths;
-    // expand them after preserving that tree so startup enumeration finds
-    // the expected images and level files.
-    extract_payload_archives(tmp.path())
-        .with_context(|| format!("extracting nested game archives from {}", path.display()))?;
-
     let exe_path = match find_main_exe(&files, &setup, header.as_ref()) {
         Some(p) => p,
         None => pick_entrypoint_pe(files.iter().map(|f| f.extracted_path.as_path()))
             .with_context(|| format!("looking for a launchable PE inside {}", path.display()))?,
     };
+
+    let exe_path = long_names
+        .iter()
+        .find(|(source, destination)| *source == exe_path && is_entrypoint_candidate(destination))
+        .map(|(_, destination)| destination.clone())
+        .unwrap_or(exe_path);
+    let mut installed_names = long_names;
+    installed_names.extend(header_names);
+    pocket_core::cab::remove_materialised_cab_sources(
+        tmp.path(),
+        setup.as_ref(),
+        header.as_ref(),
+        &installed_names,
+        &exe_path,
+    )?;
+
+    // Chopper Fight's `.000` gives GUI and scene ZIPs their install paths;
+    // expand them after preserving that tree so startup enumeration finds
+    // the expected images and level files.
+    extract_payload_archives(tmp.path())
+        .with_context(|| format!("extracting nested game archives from {}", path.display()))?;
 
     // The shortcut names the file the *installer* would have left there,
     // which for a cabinet shipping one build per 3D chip is whichever
@@ -535,11 +552,11 @@ fn materialise_long_names(
     root: &Path,
     files: &[pocket_core::cab::CabFile],
     setup: &Option<pocket_core::cab::WinCeSetupScript>,
-) {
-    let Some(setup) = setup else { return };
-    if setup.renames.is_empty() {
-        return;
-    }
+) -> Vec<(PathBuf, PathBuf)> {
+    let Some(setup) = setup else {
+        return Vec::new();
+    };
+    let mut copies = Vec::new();
     let install_root = setup.install_root();
     for (short, long) in &setup.renames {
         let source_suffix = short.rsplit('.').next().unwrap_or(short);
@@ -581,8 +598,10 @@ fn materialise_long_names(
             );
         } else {
             log::debug!("materialised {} as {}", short, dest.display());
+            copies.push((src.to_path_buf(), dest));
         }
     }
+    copies
 }
 
 fn extract_payload_archives(root: &Path) -> Result<()> {

@@ -15,7 +15,7 @@
 
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -1409,6 +1409,243 @@ pub fn materialise_setup_names(root: &Path, files: &[CabFile]) -> Vec<(PathBuf, 
     created
 }
 
+/// Remove raw cabinet member names after entry-point and metadata discovery.
+pub fn remove_materialised_cab_sources(
+    root: &Path,
+    setup: Option<&WinCeSetupScript>,
+    header: Option<&WinCeInstallHeader>,
+    copies: &[(PathBuf, PathBuf)],
+    executable: &Path,
+) -> io::Result<()> {
+    let path_key = |path: &Path| path.to_string_lossy().to_ascii_lowercase();
+    let (by_source, destinations) = cab_install_destinations(root, setup, header);
+    let installed_copies: HashSet<_> = copies
+        .iter()
+        .map(|(source, destination)| (source, path_key(destination)))
+        .collect();
+    let sources = copies.iter().map(|(source, _)| source.clone());
+    let redundant = redundant_cab_members(
+        root,
+        executable,
+        sources,
+        by_source,
+        destinations,
+        |source, destination| {
+            installed_copies.contains(&(source, path_key(destination)))
+                && cab_copy_matches(source, destination).unwrap_or(false)
+        },
+    );
+    for source in redundant {
+        fs::remove_file(source)?;
+    }
+    Ok(())
+}
+
+type CabDestinations = HashMap<String, Vec<Option<PathBuf>>>;
+
+fn cab_install_destinations(
+    root: &Path,
+    setup: Option<&WinCeSetupScript>,
+    header: Option<&WinCeInstallHeader>,
+) -> (CabDestinations, HashSet<String>) {
+    let mut by_source = HashMap::<_, Vec<_>>::new();
+    let mut destinations = HashSet::new();
+    let mut record = |source: String, destination: Option<PathBuf>| {
+        if let Some(path) = &destination {
+            destinations.insert(path.to_string_lossy().to_ascii_lowercase());
+        }
+        by_source.entry(source).or_default().push(destination);
+    };
+    if let Some(setup) = setup {
+        let install_root = setup.install_root();
+        for (source, destination) in &setup.renames {
+            let destination = setup
+                .relative_destination(destination, install_root.as_deref())
+                .map(|relative| join_guest_relative(root, relative));
+            record(source.to_ascii_lowercase(), destination);
+        }
+    }
+    if let Some(header) = header.filter(|header| header.structured) {
+        for entry in &header.files {
+            record(
+                format!(".{:03}", entry.file_id),
+                header.host_path(root, &entry.destination),
+            );
+        }
+    }
+    (by_source, destinations)
+}
+
+/// Identify byte-identical aliases left by an earlier CAB import.
+pub fn installed_cab_aliases(root: &Path, executable: &Path) -> io::Result<Vec<PathBuf>> {
+    let manifest_limit = 16 * 1024 * 1024;
+    let mut members = Vec::new();
+    let mut headers = Vec::new();
+    let mut by_id = HashMap::<u16, usize>::new();
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        if extension == "000" {
+            headers.push(path);
+        } else if extension.len() == 3 && extension.bytes().all(|byte| byte.is_ascii_digit()) {
+            if let Ok(id) = extension.parse() {
+                *by_id.entry(id).or_default() += 1;
+            }
+            if plain_path_below(root, &path, false) {
+                members.push(path);
+            }
+        }
+    }
+    let read_manifest = |path: &Path| {
+        if !plain_path_below(root, path, false) {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        File::open(path)
+            .ok()?
+            .take(manifest_limit + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() as u64 <= manifest_limit).then_some(bytes)
+    };
+    let setup =
+        read_manifest(&root.join("_setup.xml")).map(|bytes| WinCeSetupScript::parse_bytes(&bytes));
+    let header = match headers.as_slice() {
+        [path] => {
+            read_manifest(path).and_then(|bytes| WinCeInstallHeader::parse_bytes(&bytes).ok())
+        }
+        _ => None,
+    };
+    let (mut by_source, destinations) =
+        cab_install_destinations(root, setup.as_ref(), header.as_ref());
+    for (id, count) in by_id {
+        if count > 1 {
+            by_source.remove(&format!(".{id:03}"));
+        }
+    }
+    Ok(redundant_cab_members(
+        root,
+        executable,
+        members,
+        by_source,
+        destinations,
+        |source, destination| {
+            plain_path_below(root, destination, false)
+                && cab_copy_matches(source, destination).unwrap_or(false)
+        },
+    ))
+}
+
+/// Check that a path stays beneath a trusted root and crosses no links.
+pub fn plain_path_below(root: &Path, path: &Path, directory: bool) -> bool {
+    use std::path::Component;
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    if components.peek().is_none() {
+        return false;
+    }
+    while let Some(Component::Normal(part)) = components.next() {
+        current.push(part);
+        let Ok(metadata) = fs::symlink_metadata(&current) else {
+            return false;
+        };
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return false;
+            }
+        }
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+        if components.peek().is_none() {
+            return if directory {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            };
+        }
+        if !metadata.is_dir() {
+            return false;
+        }
+    }
+    false
+}
+
+fn redundant_cab_members(
+    root: &Path,
+    executable: &Path,
+    sources: impl IntoIterator<Item = PathBuf>,
+    by_source: CabDestinations,
+    destinations: HashSet<String>,
+    matches: impl Fn(&PathBuf, &Path) -> bool,
+) -> Vec<PathBuf> {
+    let path_key = |path: &Path| path.to_string_lossy().to_ascii_lowercase();
+    let mut visited = HashSet::new();
+    let mut redundant = Vec::new();
+    for source in sources {
+        let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let name = name.to_ascii_lowercase();
+        if !visited.insert(path_key(&source))
+            || source.parent() != Some(root)
+            || path_key(&source) == path_key(executable)
+            || name == "_setup.xml"
+            || name.ends_with(".000")
+            || name.ends_with(".999")
+            || destinations.contains(&path_key(&source))
+        {
+            continue;
+        }
+        let extension = source.extension().and_then(|ext| ext.to_str());
+        let numbered_key = extension
+            .and_then(|ext| ext.parse::<u16>().ok())
+            .map(|id| format!(".{id:03}"));
+        let mut expected = by_source.get(&name).into_iter().flatten().peekable();
+        let numbered = numbered_key.as_ref().and_then(|key| by_source.get(key));
+        if (expected.peek().is_some() || numbered.is_some())
+            && expected
+                .chain(numbered.into_iter().flatten())
+                .all(|destination| {
+                    destination
+                        .as_ref()
+                        .is_some_and(|destination| matches(&source, destination))
+                })
+        {
+            redundant.push(source);
+        }
+    }
+    redundant
+}
+
+fn cab_copy_matches(source: &Path, destination: &Path) -> io::Result<bool> {
+    let mut source = File::open(source)?;
+    let mut destination = File::open(destination)?;
+    let mut remaining = source.metadata()?.len();
+    if destination.metadata()?.len() != remaining {
+        return Ok(false);
+    }
+    let mut source_bytes = [0; 8192];
+    let mut destination_bytes = [0; 8192];
+    while remaining != 0 {
+        let count = remaining.min(source_bytes.len() as u64) as usize;
+        source.read_exact(&mut source_bytes[..count])?;
+        destination.read_exact(&mut destination_bytes[..count])?;
+        if source_bytes[..count] != destination_bytes[..count] {
+            return Ok(false);
+        }
+        remaining -= count as u64;
+    }
+    Ok(true)
+}
+
 impl WinCeInstallHeader {
     /// Resolve an install destination from this header onto the host
     /// path [`materialise_install_header_names`] wrote it to under
@@ -1450,22 +1687,27 @@ pub fn materialise_install_header_names(
         .as_deref()
         .map(|d| d.trim_end_matches('\\'));
 
-    // Index the cabinet by numeric extension: the spec is explicit that
-    // only the extension identifies an entry, the 8.3 stem is generated
-    // and must not be relied on.
-    let by_id: HashMap<u16, &CabFile> = files
-        .iter()
-        .filter_map(|f| {
-            let ext = f.short_name.rsplit('.').next()?;
-            ext.parse::<u16>().ok().map(|id| (id, f))
-        })
-        .collect();
+    // The numeric extension identifies the member. Keep ambiguous IDs out
+    // of the copy list so cleanup cannot consume either candidate.
+    let mut by_id = HashMap::new();
+    for file in files {
+        if let Some(id) = file
+            .short_name
+            .rsplit_once('.')
+            .and_then(|(_, extension)| extension.parse::<u16>().ok())
+        {
+            by_id
+                .entry(id)
+                .and_modify(|member| *member = None)
+                .or_insert(Some(file));
+        }
+    }
 
     let mut created = Vec::new();
     for entry in &header.files {
-        let Some(src) = by_id.get(&entry.file_id) else {
+        let Some(Some(src)) = by_id.get(&entry.file_id) else {
             log::debug!(
-                ".000 header names file id {} but the cab has no such entry; skipping",
+                ".000 header names file id {} without a unique cabinet member; skipping",
                 entry.file_id
             );
             continue;
@@ -1562,6 +1804,117 @@ mod tests {
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].1.file_name().unwrap(), "lÉvel.dat");
         assert_eq!(fs::read(&paths[0].1).unwrap(), b"original");
+        remove_materialised_cab_sources(&root, None, Some(&header), &paths, &root.join("app.exe"))
+            .unwrap();
+        assert!(!files[0].extracted_path.exists());
+        assert_eq!(fs::read(&paths[0].1).unwrap(), b"original");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn msce_cleanup_uses_declared_paths_when_installed_basenames_match() {
+        let root = std::env::temp_dir().join(format!("pocket-cab-nested-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let destinations = [
+            (1, r"\Program Files\Game\A\level.dat"),
+            (2, r"\Program Files\Game\B\level.dat"),
+        ];
+        let header = WinCeInstallHeader {
+            structured: true,
+            install_dir: Some(r"\Program Files\Game\".into()),
+            files: destinations
+                .into_iter()
+                .map(|(file_id, destination)| WinCeInstallFile {
+                    source: format!(".{file_id:03}"),
+                    file_id,
+                    destination: destination.into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let files = ["asset.001", "asset.002"].map(|name| CabFile {
+            short_name: name.into(),
+            extracted_path: root.join(name),
+            size: name.len() as u64,
+        });
+        for file in &files {
+            fs::write(&file.extracted_path, &file.short_name).unwrap();
+        }
+        let copies = materialise_install_header_names(&root, &files, &header);
+        assert_eq!(copies.len(), 2);
+        remove_materialised_cab_sources(&root, None, Some(&header), &copies, &root.join("app.exe"))
+            .unwrap();
+        assert!(files.iter().all(|file| !file.extracted_path.exists()));
+        assert_eq!(
+            fs::read(root.join("A").join("level.dat")).unwrap(),
+            b"asset.001"
+        );
+        assert_eq!(
+            fs::read(root.join("B").join("level.dat")).unwrap(),
+            b"asset.002"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installed_setup_payloads_hide_raw_names_only_after_all_copies_succeed() {
+        let root = std::env::temp_dir().join(format!("pocket-cab-aliases-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("payload.dat.001");
+        let first = root.join("payload.dat");
+        let second = root.join("backup.dat");
+        let unmapped = root.join("other.dat.002");
+        for path in [&source, &first, &unmapped] {
+            fs::write(path, b"payload").unwrap();
+        }
+        let setup = WinCeSetupScript {
+            renames: vec![
+                ("payload.dat.001".into(), "payload.dat".into()),
+                ("payload.dat.001".into(), "backup.dat".into()),
+            ],
+            ..Default::default()
+        };
+        let mut copies = vec![(source.clone(), first.clone())];
+        remove_materialised_cab_sources(&root, Some(&setup), None, &copies, &root.join("app.exe"))
+            .unwrap();
+        assert!(source.is_file());
+
+        fs::copy(&source, &second).unwrap();
+        copies.push((source.clone(), second.clone()));
+        remove_materialised_cab_sources(&root, Some(&setup), None, &copies, &root.join("app.exe"))
+            .unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(first).unwrap(), b"payload");
+        assert_eq!(fs::read(second).unwrap(), b"payload");
+        assert!(unmapped.is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_preserves_overwritten_members_with_different_bytes() {
+        let root =
+            std::env::temp_dir().join(format!("pocket-cab-collision-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let installed = root.join("level.dat");
+        fs::write(&installed, b"final").unwrap();
+        let mut setup = WinCeSetupScript::default();
+        let mut copies = Vec::new();
+        for (name, bytes) in [
+            ("asset.001", b"other"),
+            ("asset.002", b"final"),
+            ("asset.003", b"final"),
+        ] {
+            let source = root.join(name);
+            fs::write(&source, bytes).unwrap();
+            setup.renames.push((name.into(), "level.dat".into()));
+            copies.push((source, installed.clone()));
+        }
+        remove_materialised_cab_sources(&root, Some(&setup), None, &copies, &root.join("app.exe"))
+            .unwrap();
+        assert!(copies[0].0.is_file());
+        assert!(!copies[1].0.exists());
+        assert!(!copies[2].0.exists());
+        assert_eq!(fs::read(installed).unwrap(), b"final");
         fs::remove_dir_all(root).unwrap();
     }
 

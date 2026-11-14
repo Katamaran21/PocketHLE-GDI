@@ -162,7 +162,9 @@ impl KernelState {
         let mut pending: Vec<_> = self
             .modules
             .iter()
-            .filter(|module| module.refcount != 0)
+            .filter(|module| {
+                module.refcount != 0 || self.static_module_roots.contains(&module.base)
+            })
             .map(|module| module.base)
             .collect();
         // CE6 Remote Desktop releases cetscoem.dll from mstscax.dll's
@@ -245,6 +247,7 @@ impl KernelState {
         self.ce.module_versions.remove(&base);
         self.ce.debug_zones.remove(&base);
         self.ce.com.servers.retain(|_, handle| *handle != base);
+        self.static_module_roots.retain(|&root| root != base);
         for satellite in module.satellites {
             if let Some(module) = self
                 .modules

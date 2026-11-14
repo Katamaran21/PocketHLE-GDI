@@ -46,7 +46,7 @@ class GameActivity : AppCompatActivity() {
     }
 
     private lateinit var surface: GLSurfaceView
-    private lateinit var progress: ProgressBar
+    private lateinit var loadingOverlay: View
     private lateinit var status: TextView
     private lateinit var fpsOverlay: TextView
     private val fpsMeter = FrameRateMeter()
@@ -60,7 +60,7 @@ class GameActivity : AppCompatActivity() {
     private lateinit var glRenderer: AndroidFrameRenderer
     private lateinit var bindings: InputBindings
 
-    /** Cached handle from `nativeStartGame` (`0` once we've finished). */
+    /** Cached handle from `nativeStartGameWithDiagnostic` (`0` once we've finished). */
     @Volatile private var session: Long = 0
     private var joiningSession = false
 
@@ -90,6 +90,7 @@ class GameActivity : AppCompatActivity() {
      */
     private var rotationDegrees: Int = 0
     private var gizmondoGame = true
+    private var simulateAccelerometerTilt = false
     private var gameId = ""
     private var gameRoot = ""
     private var pocketPcFullscreen = false
@@ -133,6 +134,7 @@ class GameActivity : AppCompatActivity() {
     /** Prevent multiple dependency prompts during asynchronous session polling. */
     private var dependencyDialogVisible = false
 
+    private var liveGrid: LiveTouchGrid? = null
     private var gridRouter: StylusGridRouter? = null
     private val gridAxes = mutableSetOf<String>()
     private var touchSteeringEnabled = false
@@ -251,7 +253,7 @@ class GameActivity : AppCompatActivity() {
                 // Worker exited on its own (game called ExitProcess
                 // / hit max_slices / errored out). Reap it so we
                 // surface the summary in the status panel.
-                finishSession()
+                finishSession(reportFailure = true)
                 return
             }
             mainHandler.postDelayed(this, POLL_INTERVAL_MS)
@@ -299,26 +301,32 @@ class GameActivity : AppCompatActivity() {
             updatePocketPcLayout()
         }
 
-        val name = intent.getStringExtra(EXTRA_GAME_NAME) ?: "PocketHLE"
+        val name = intent.getStringExtra(EXTRA_GAME_NAME) ?: "PocketHLE-Reborn"
         title = name
 
         surface = findViewById(R.id.surface)
+        loadingOverlay = findViewById(R.id.game_loading)
         presentationHandle = NativeBridge.nativeCreatePresentation()
-        glRenderer = AndroidFrameRenderer(this, config.upscaleFilter, showFps, !gizmondoGame, config.graphicsDiagnostics, presentationHandle) {
+        glRenderer = AndroidFrameRenderer(
+            this, config.upscaleFilter, showFps, !gizmondoGame, config.graphicsDiagnostics,
+            presentationHandle,
+            firstFrameDrawn = { mainHandler.post { loadingOverlay.visibility = View.GONE } },
+        ) {
             mainHandler.post {
                 presentationReady = true
                 presentationStart?.let { (root,id) -> presentationStart=null; startSession(root,id) }
             }
         }
-        sharedEglFactory = SharedEglContextFactory(presentationHandle, glRenderer, launchSettings.gpuRenderer ?: config.gpuRenderer)
+        val shareOpenGlContext = config.gpuRenderer ||
+            (!gizmondoGame && launchSettings.gpuCompatibilityProfile == "adreno200")
+        sharedEglFactory = SharedEglContextFactory(presentationHandle, glRenderer, shareOpenGlContext)
         glRenderer.sharedContextAvailable = { sharedEglFactory.isShared() }
         findViewById<View>(R.id.btn_fullscreen).setOnClickListener { setControllerFullscreen(true) }
         surface.setEGLContextClientVersion(3)
         surface.setEGLContextFactory(sharedEglFactory)
-        surface.preserveEGLContextOnPause = launchSettings.gpuRenderer ?: config.gpuRenderer
+        surface.preserveEGLContextOnPause = shareOpenGlContext
         surface.setRenderer(glRenderer)
         surface.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
-        progress = findViewById(R.id.progress)
         status = findViewById(R.id.status)
         fpsOverlay = findViewById(R.id.fps_overlay)
         ipsOverlay = findViewById(R.id.ips_overlay)
@@ -354,6 +362,8 @@ class GameActivity : AppCompatActivity() {
         val rootDir = LibraryPaths.root(this)
         val isGizmondo = NativeBridge.isGizmondoGame(rootDir, id)
         val gameSettings = runCatching { GameSettings.fromJson(JSONObject(NativeBridge.readGameSettings(rootDir, id))) }.getOrDefault(GameSettings.default())
+        simulateAccelerometerTilt = !isGizmondo &&
+            (gameSettings.pocketpcTiltInput ?: config.pocketpcTiltInput) != TiltInput.ACCELEROMETER
         dpadDeadzone = ControlDeadzone.from(gameSettings.dpadDeadzone)
         touchSteeringEnabled = !gizmondoGame && gameSettings.controlsMode()=="zones"
         gridRouter = if(!gizmondoGame && gameSettings.controlsMode()=="grid") StylusGridRouter(StylusGridConfig.parse(gameSettings.pocketpcStylusGridJson),JSONObject(config.originalJson).optString("gamepad_fullscreen").takeIf { it.isNotEmpty() && it!="null" }) else null
@@ -361,6 +371,22 @@ class GameActivity : AppCompatActivity() {
         (gameControls as? GizmondoControls)?.dpad?.deadZoneRadius = dpadDeadzone.radius
         val fixedGps = config.gpsFixedEnabled && NativeBridge.isColorsGame(rootDir, id)
         rotationDegrees = readRotationDegrees(rootDir, id)
+        if (!gizmondoGame && intent.getBooleanExtra(EXTRA_CONFIGURE_GRID, false)) {
+            gridRouter?.let { router ->
+                liveGrid = LiveTouchGrid(
+                    this, findViewById(R.id.content_column), findViewById(R.id.game_area),
+                    router.config, bindings,
+                    JSONObject(config.originalJson).optString("gamepad_fullscreen")
+                        .takeIf { it.isNotEmpty() && it != "null" },
+                    ::releaseHeldInput,
+                ) {
+                    val raw = JSONObject(NativeBridge.readGameSettings(gameRoot, gameId))
+                    raw.put("pocketpc_stylus_grid", router.config.json())
+                    val result = JSONObject(NativeBridge.writeGameSettings(gameRoot, gameId, raw.toString()))
+                    if (!result.optBoolean("ok")) Toast.makeText(this, "Could not save touch grid.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
         glRenderer.setRotationDegrees(rotationDegrees)
         if (!gizmondoGame) {
             findViewById<View>(R.id.btn_rotate_game).setOnClickListener { cycleRotation() }
@@ -372,7 +398,7 @@ class GameActivity : AppCompatActivity() {
         BatteryHost.initialize(this)
         DeviceStatusHost.initialize(this)
         VibrationHost.initialize(this)
-        if (!gizmondoGame && pocketPcFullscreen && pocketPcFullscreenMode=="without_controls") {
+        if (!gizmondoGame && liveGrid == null && pocketPcFullscreen && pocketPcFullscreenMode=="without_controls") {
             controllerFullscreenHost.setDisplaySize(240,320)
             setControllerFullscreen(true)
         }
@@ -398,18 +424,26 @@ class GameActivity : AppCompatActivity() {
     private fun startSession(rootDir: String, id: String) {
         if (!presentationReady) { presentationStart = rootDir to id; return }
         if (isFinishing || isDestroyed) return
-        val handle = NativeBridge.nativeStartGame(rootDir, id, presentationHandle)
+        if (!simulateAccelerometerTilt) accelerometer.start()
+        val startup = runCatching {
+            org.json.JSONObject(NativeBridge.nativeStartGameWithDiagnostic(rootDir, id, presentationHandle))
+        }.getOrNull()
+        val handle = startup?.optLong("handle") ?: 0L
         if (handle == 0L) {
-            progress.visibility = View.GONE
-            android.widget.Toast.makeText(this, "Could not start the game: see logcat", android.widget.Toast.LENGTH_LONG).show()
-            finish()
+            accelerometer.stop()
+            loadingOverlay.visibility = View.GONE
+            val diagnostic = startup?.optJSONObject("diagnostic")
+            showSessionDiagnostic(
+                diagnostic?.optString("title") ?: "Could not start the game",
+                diagnostic?.optString("reason") ?: "The native session could not be created.",
+                diagnostic?.optString("details").orEmpty()
+            )
             return
         }
         session = handle
         if (!gizmondoGame) NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_KEYBOARD_ROTATION, rotationDegrees/90, 0)
         startAudio(handle)
         status.text = "Backend: Unicorn (ARM)\nRunning…"
-        // The spinner gets hidden the moment the first frame arrives.
         mainHandler.postDelayed(pollTick, POLL_INTERVAL_MS)
     }
 
@@ -450,6 +484,13 @@ class GameActivity : AppCompatActivity() {
         }
     }
 
+    private val accelerometer by lazy {
+        AccelerometerHost(this) {
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.rotation
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         (getSystemService(INPUT_SERVICE) as android.hardware.input.InputManager).registerInputDeviceListener(stylusDeviceListener,mainHandler)
@@ -462,7 +503,10 @@ class GameActivity : AppCompatActivity() {
         GpsHost.resume()
         VibrationHost.resume()
         val handle = session
-        if (handle != 0L && !audioRunning) startAudio(handle)
+        if (handle != 0L) {
+            if (!simulateAccelerometerTilt) accelerometer.start()
+            if (!audioRunning) startAudio(handle)
+        }
     }
 
     override fun onPause() {
@@ -474,6 +518,7 @@ class GameActivity : AppCompatActivity() {
         CameraHost.pause()
         GpsHost.pause()
         VibrationHost.pause()
+        accelerometer.stop()
         releaseHeldInput()
         stopAudio()
         super.onPause()
@@ -518,6 +563,7 @@ class GameActivity : AppCompatActivity() {
         CameraHost.closeAll()
         GpsHost.closeAll()
         VibrationHost.closeAll()
+        accelerometer.stop()
         finishSession()
         if (!joiningSession && ::sharedEglFactory.isInitialized) {
             if (::glRenderer.isInitialized) glRenderer.stopPresentation()
@@ -533,7 +579,7 @@ class GameActivity : AppCompatActivity() {
      * Stop the emulator if it is still running, free the native
      * session, and surface the textual summary in the status panel.
      */
-    private fun finishSession() {
+    private fun finishSession(reportFailure: Boolean = false) {
         val handle = session
         if (handle == 0L) return
         joiningSession = true
@@ -543,11 +589,12 @@ class GameActivity : AppCompatActivity() {
         CameraHost.closeAll()
         GpsHost.closeAll()
         VibrationHost.closeAll()
+        accelerometer.stop()
         releaseHeldInput()
         session = 0
         stopAudio()
         val audioToJoin = audioThreads.toList()
-        progress.visibility = View.GONE
+        loadingOverlay.visibility = View.GONE
         // `nativeFinishGame` blocks on the worker thread join, so
         // do it off the UI thread to keep the UI responsive — the
         // join is usually fast (the Stop signal already fired) but
@@ -561,11 +608,60 @@ class GameActivity : AppCompatActivity() {
                 joiningSession = false
                 android.util.Log.i("PocketHLE", summary)
                 if (!isFinishing && !isDestroyed) {
-                    android.widget.Toast.makeText(this, "Emulation finished. See the logs for details.", android.widget.Toast.LENGTH_SHORT).show()
-                    finish()
+                    val diagnostic = runCatching {
+                        org.json.JSONObject(summary).optJSONObject("diagnostic")
+                    }.getOrNull()
+                    if (reportFailure && diagnostic != null) {
+                        showSessionDiagnostic(
+                            diagnostic.getString("title"),
+                            diagnostic.getString("reason"),
+                            diagnostic.getString("details")
+                        )
+                    } else if (reportFailure && !summary.startsWith("{")) {
+                        showSessionDiagnostic("Emulation stopped", summary, summary)
+                    } else {
+                        finish()
+                    }
                 }
             }
         }.start()
+    }
+
+    private fun showSessionDiagnostic(title: String, reason: String, details: String) {
+        val message = android.widget.TextView(this).apply {
+            text = reason
+            val padding = (24 * resources.displayMetrics.density).toInt()
+            setPadding(padding, padding / 2, padding, padding / 2)
+        }
+        val scroll = android.widget.ScrollView(this).apply {
+            addView(message)
+            isFocusable = false
+        }
+        var expanded = false
+        val dialog = AddDataDialog(this) { false }.apply {
+            setTitle(title)
+            setView(scroll)
+            setButton(android.content.DialogInterface.BUTTON_NEUTRAL, "Show details", null as android.content.DialogInterface.OnClickListener?)
+            setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "Copy diagnostic", null as android.content.DialogInterface.OnClickListener?)
+            setButton(android.content.DialogInterface.BUTTON_POSITIVE, "Return to library") { _, _ -> finish() }
+            setCancelable(false)
+            controllerCancel = false
+        }
+        dialog.setOnShowListener {
+            val showDetails = dialog.getButton(android.content.DialogInterface.BUTTON_NEUTRAL)
+            showDetails.setOnClickListener {
+                expanded = !expanded
+                message.text = if (expanded) "$reason\n\n$details" else reason
+                scroll.isFocusable = expanded
+                showDetails.text = if (expanded) "Hide details" else "Show details"
+            }
+            dialog.getButton(android.content.DialogInterface.BUTTON_NEGATIVE).setOnClickListener {
+                val clipboard = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("PocketHLE-Reborn diagnostic", "$title\n$reason\n\n$details"))
+            }
+            showDetails.requestFocus()
+        }
+        dialog.show()
     }
 
     private fun startAudio(handle: Long) {
@@ -737,7 +833,7 @@ class GameActivity : AppCompatActivity() {
     private fun updatePocketPcLayout() {
         if (gizmondoGame) return
         findViewById<View>(R.id.toolbar).visibility=View.GONE
-        gameControls.visibility=if (pocketPcFullscreen && pocketPcFullscreenMode=="without_controls") View.GONE else View.VISIBLE
+        gameControls.visibility=if (liveGrid == null && pocketPcFullscreen && pocketPcFullscreenMode=="without_controls") View.GONE else View.VISIBLE
         // Both PPC layouts are immersive game screens. The fullscreen preference
         // only changes the controls policy; it must not reserve a status bar.
         androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window,false)
@@ -746,6 +842,7 @@ class GameActivity : AppCompatActivity() {
     }
 
     private fun setControllerFullscreen(enabled: Boolean) {
+        if (enabled && liveGrid != null) return
         releaseHeldInput()
         glRenderer.controllerFullscreen=enabled
         if(enabled) {
@@ -778,7 +875,11 @@ class GameActivity : AppCompatActivity() {
 
     private fun paintFrame(frame: FrameSnapshot) {
         updatePocketPcDisplayGeometry(frame)
-        progress.visibility = View.GONE
+        liveGrid?.let { grid ->
+            val rect = renderedDisplayRect(surface.width, surface.height, frame.width, frame.height,
+                frame.textureWidth, frame.textureHeight, rotationDegrees, true, controllerFullscreenHost.active)
+            grid.updateDisplay(rect, rect.height > rect.width)
+        }
         glRenderer.submit(frame)
         surface.requestRender()
 
@@ -909,6 +1010,7 @@ class GameActivity : AppCompatActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (liveGrid?.key(event) == true) return true
         val keyAction=InputBindings.keyName(event)?.let {DeckInputPolicy.key(it)}
         if(keyAction!=null) {
             if(event.action==KeyEvent.ACTION_DOWN && event.repeatCount==0 && ::glRenderer.isInitialized) performHostShortcut(keyAction)
@@ -1010,6 +1112,7 @@ class GameActivity : AppCompatActivity() {
      * button can be held at once without one release cancelling both.
      */
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (liveGrid?.motion(event) == true) return true
         val joystick =
             event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK ||
                 event.source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
@@ -1040,8 +1143,8 @@ class GameActivity : AppCompatActivity() {
         gesturePair(MotionEvent.AXIS_Y, "LeftStickUp", "LeftStickDown")
         gesturePair(MotionEvent.AXIS_Z, "RightStickLeft", "RightStickRight")
         gesturePair(MotionEvent.AXIS_RZ, "RightStickUp", "RightStickDown")
-        gestureAxis("LeftTrigger2", event.getAxisValue(MotionEvent.AXIS_LTRIGGER))
-        gestureAxis("RightTrigger2", event.getAxisValue(MotionEvent.AXIS_RTRIGGER))
+        if (liveGrid == null) gestureAxis("LeftTrigger2", event.getAxisValue(MotionEvent.AXIS_LTRIGGER))
+        if (liveGrid == null) gestureAxis("RightTrigger2", event.getAxisValue(MotionEvent.AXIS_RTRIGGER))
         val desired = linkedMapOf<String, Int>()
         val aimDesired = linkedMapOf<String, Pair<Int, Float>>()
         fun axis(name: String, value: Float, negative: String, positive: String) {
@@ -1096,9 +1199,9 @@ class GameActivity : AppCompatActivity() {
         }
         axis("DPad", event.getAxisValue(MotionEvent.AXIS_HAT_X), "Left", "Right")
         axis("DPad", event.getAxisValue(MotionEvent.AXIS_HAT_Y), "Up", "Down")
-        if (touchSteeringEnabled) {
+        if (touchSteeringEnabled || simulateAccelerometerTilt) {
             steeringDevice = event.deviceId
-            val active = activityResumed && hasWindowFocus() && !surfacePointerDown
+            val active = activityResumed && hasWindowFocus() && (simulateAccelerometerTilt || !surfacePointerDown)
             val x =
                 if (active)
                     (event.getAxisValue(MotionEvent.AXIS_X).coerceIn(-1f, 1f) * 1000).toInt()
@@ -1114,7 +1217,7 @@ class GameActivity : AppCompatActivity() {
         }
         axis("RightStick", event.getAxisValue(MotionEvent.AXIS_Z), "Left", "Right")
         axis("RightStick", event.getAxisValue(MotionEvent.AXIS_RZ), "Up", "Down")
-        listOf(
+        if (liveGrid == null) listOf(
                 "LeftTrigger2" to MotionEvent.AXIS_LTRIGGER,
                 "RightTrigger2" to MotionEvent.AXIS_RTRIGGER,
             )
@@ -1163,10 +1266,17 @@ class GameActivity : AppCompatActivity() {
     }
     private fun cancelGrid(){gridRouter?.cancel()?.let{sendGrid(it)}}
     private fun routeGrid(input:GridInput,down:Boolean):Boolean {
+        if (liveGrid?.virtualInput(input, down) == true) return true
         if(input.source=="keyboard" && bindings.stylusKeyboardReserved(input.name)) return false
         val router=gridRouter ?: return false
         if(!router.assigned(input)) return false
-        if(!surfacePointerDown && activityResumed && hasWindowFocus()) router.input(input,down)?.let{sendGrid(it)}
+        if (!surfacePointerDown && activityResumed && hasWindowFocus()) {
+            lastFrame?.let { frame ->
+                val quarterTurn = rotationDegrees == 90 || rotationDegrees == 270
+                router.config.orient((frame.height > frame.width) xor quarterTurn)
+            }
+            router.input(input, down)?.let { sendGrid(it) }
+        }
         return true
     }
 
@@ -1221,6 +1331,7 @@ class GameActivity : AppCompatActivity() {
     }
 
     private fun acquireGuestKey(handle: Long, requestedVk: Int) {
+        if (liveGrid?.editing == true) return
         if(requestedVk==DeckInputPolicy.STYLUS_CLICK_COMMAND) {if(handle==session) stylusButton(true);return}
         if (requestedVk == DeckInputPolicy.ROTATION_COMMAND) { if (handle == session) cycleRotation(); return }
         if (requestedVk == DeckInputPolicy.SCREENSHOT_COMMAND) return
@@ -1276,6 +1387,7 @@ class GameActivity : AppCompatActivity() {
     }
 
     private fun updateStylusAim() {
+        if (liveGrid?.editing == true) return
         if(gizmondoGame || session==0L || !::stylusBindings.isInitialized) return
         val strengths=stylusTouch.copyOf()
         stylusKeys.values.forEach { strengths[it]=1f }
@@ -1314,7 +1426,7 @@ class GameActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(hostLongCheck)
         cancelGrid()
         gridAxes.clear()
-        if (session != 0L && touchSteeringEnabled)
+        if (session != 0L && (touchSteeringEnabled || simulateAccelerometerTilt))
             NativeBridge.nativeSendInput(session, NativeBridge.INPUT_TOUCH_STEERING, 0, 0)
         stylusKeys.clear()
         stylusAxes.clear()
@@ -1373,6 +1485,7 @@ class GameActivity : AppCompatActivity() {
     @SuppressLint("ClickableViewAccessibility")
     private fun wireSurfaceTouchInput() {
         surface.setOnTouchListener { v, event ->
+            if (liveGrid?.editing == true) return@setOnTouchListener true
             val handle = session
             if (handle == 0L) return@setOnTouchListener false
             val frame = lastFrame
@@ -1560,6 +1673,7 @@ class GameActivity : AppCompatActivity() {
     )
 
     companion object {
+        const val EXTRA_CONFIGURE_GRID = "configure_grid"
         const val EXTRA_GAME_ID = "com.pockethle.app.EXTRA_GAME_ID"
         const val EXTRA_GAME_NAME = "com.pockethle.app.EXTRA_GAME_NAME"
 

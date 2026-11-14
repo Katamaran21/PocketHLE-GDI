@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">PocketHLE GDI</string>
+    <string name="game_loading">Loading...</string>
     <string name="settings_title">Settings</string>
     <string name="game_settings_title">Game settings</string>
     <string name="about_title">About</string>
@@ -26,31 +27,29 @@
     <string name="pref_rotation_title">Rotate display</string>
     <string name="pref_rotation_summary">Turns the picture without changing the screen size reported to the game. Use this if the picture is sideways. Touch and direction controls follow the rotation.</string>
 
-    <string-array name="cpu_backend_entries">
-        <item>Stub (safe)</item>
-        <item>Unicorn (real ARM)</item>
-    </string-array>
-    <string-array name="cpu_backend_values">
-        <item>stub</item>
-        <item>unicorn</item>
-    </string-array>
     <string-array name="screen_entries">
         <item>Automatic (Pocket PC)</item>
         <item>240x320 (QVGA portrait)</item>
         <item>320x240 (landscape)</item>
         <item>176x220 (small)</item>
+        <item>240x400 (WQVGA portrait)</item>
+        <item>400x240 (WQVGA landscape)</item>
         <item>480x640 (VGA portrait)</item>
         <item>640x480 (VGA landscape)</item>
-        <item>480x800 (WVGA)</item>
+        <item>480x800 (WVGA portrait)</item>
+        <item>800x480 (WVGA landscape)</item>
     </string-array>
     <string-array name="screen_values">
         <item>portrait</item>
         <item>qvga</item>
         <item>landscape</item>
         <item>small_portrait</item>
+        <item>wqvga</item>
+        <item>wqvga_landscape</item>
         <item>vga</item>
         <item>vga_landscape</item>
         <item>wvga</item>
+        <item>wvga_landscape</item>
     </string-array>
     <string-array name="rotation_entries">
         <item>0°</item>
@@ -63,24 +62,6 @@
         <item>cw90</item>
         <item>half</item>
         <item>ccw90</item>
-    </string-array>
-    <string-array name="fullscreen_mode_entries">
-        <item>Fullscreen with controls</item>
-        <item>Fullscreen without controls</item>
-    </string-array>
-    <string-array name="fullscreen_mode_values">
-        <item>with_controls</item>
-        <item>without_controls</item>
-    </string-array>
-    <string-array name="orientation_entries">
-        <item>Automatic</item>
-        <item>Portrait</item>
-        <item>Landscape</item>
-    </string-array>
-    <string-array name="orientation_values">
-        <item>auto</item>
-        <item>portrait</item>
-        <item>landscape</item>
     </string-array>
     <string name="action_play">Play</string>
     <string name="action_information">Information</string>

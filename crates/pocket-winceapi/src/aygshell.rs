@@ -3,6 +3,7 @@
 //! SDK ordinals and owned shell window identities.
 
 mod gesture;
+mod registry_notify;
 
 use pocket_kernel::gdi::STOCK_SYSTEM_FONT;
 use pocket_kernel::{DispatchOutcome, KernelError};
@@ -20,6 +21,7 @@ const SPI_GETSIPINFO: u32 = 0xE1;
 
 pub fn register(d: &mut WinCeDispatcher) {
     let dll = "aygshell.dll";
+    registry_notify::register(d);
     for f in [
         "SHInitExtraControls",
         "SHFindMenuBar",
@@ -78,7 +80,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // real handlers in the PPC2002 block below, which still answers
     // TRUE for 9 — so Pocket DeathMatch keeps the return value its
     // startup path checks.
-    for ord in [12u16, 13, 14, 21, 49, 50, 65, 71, 72, 80, 84, 341, 344] {
+    for ord in [12u16, 13, 14, 21, 49, 50, 65, 71, 72, 80, 84, 344] {
         d.register_handler(dll, &format!("ord:{ord}"), ok);
     }
     for (ordinal, handler) in [
@@ -1109,6 +1111,7 @@ mod resource_and_focus_tests {
         kernel.resources.push(ResourceEntry {
             ty: ResourceKey::Name("GIF".into()),
             name: ResourceKey::Id(106),
+            native_leaves: Vec::new(),
             data_rva: 0x1000,
             size: bytes.len() as u32,
             codepage: 0,
@@ -1158,6 +1161,7 @@ mod resource_and_focus_tests {
         kernel.resources.push(ResourceEntry {
             ty: ResourceKey::Id(2),
             name: ResourceKey::Id(7),
+            native_leaves: Vec::new(),
             data_rva: 0x1000,
             size: dib.len() as u32,
             codepage: 0,

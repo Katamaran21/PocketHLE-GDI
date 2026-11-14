@@ -3,7 +3,7 @@
 Use this guide to collect graphics timings from the current Android build.
 Rendering and presentation contracts are maintained in [GPU.md](GPU.md);
 build the complete app with matching Rust JNI and Kotlin code as described in
-[ANDROID-BUILD.md](ANDROID-BUILD.md). No old diagnostic or cumulative patch ZIP
+[Build and release](BUILD.md#android). No old diagnostic or cumulative patch ZIP
 is needed.
 
 Shared GLES presentation reports `PRESENTATION=GPU_SHARED (Android)` when active.
@@ -17,7 +17,7 @@ Disable Show IPS and recording so they do not change the presentation path.
 Collect software and GPU runs as described below. For a specific sharing or
 surface-lifecycle issue, a targeted GPU run plus background/resume is useful.
 Neither the log's presence nor an older benchmark establishes a device-wide FPS
-improvement. Earlier implementation/validation records below are historical.
+improvement. Earlier implementation/validation records are kept in the historical archive.
 
 Enable **Emulator Settings > Diagnostics > Graphics diagnostics**, keep **Log
 verbosity = 1**, then start a game. The switch defaults to off and applies at
@@ -25,11 +25,13 @@ next game launch. It is independent of rendering mode, FPS/IPS and frame limits.
 Turn it off after collecting the report. Verbosity 2/3 is unnecessary and its
 existing per-call debug logs can distort measurements.
 
-Only two runs are needed. Use the same game, scene, native internal resolution
-and filter for both; disable optional IPS measurement and recording to avoid
-those changing the presentation path. Run approximately 20 seconds of intro and
-20 seconds of gameplay in software, then repeat with GPU rendering. Keep the
-phone's power mode unchanged. Collect both runs in one log:
+To compare renderers, use a GLES 1.x game and set **OpenGL ES internal
+resolution (host OpenGL)** to **Native** in the global graphics settings. Use the
+same game, scene and filter for both runs. Run approximately 20 seconds of
+intro and 20 seconds of gameplay with global **GPU rendering** off, then
+enable it and relaunch the game for the second run. Keep the phone's power
+mode unchanged. The **Generic OpenGL ES (2.0, Common)** profile uses host
+OpenGL, so collect a host OpenGL run for GLES 2.0 diagnostics.
 
 ```bat
 adb logcat -c
@@ -126,4 +128,4 @@ desktop timer extension used for the November investigation are removed. Setting
 that old variable no longer activates profiling. Android's pre-existing setting,
 ES timer queries and bounded observations remain available as described above.
 Functional rendering contracts belong to [GPU.md](GPU.md); dated measurements
-and validation limits belong to [IMPLEMENTATION-NOTES.md](IMPLEMENTATION-NOTES.md#nv-combiner-and-egl-investigation-2026-11-09).
+and validation limits belong to [the original investigation](history/IMPLEMENTATION-NOTES.md#nv-combiner-and-egl-investigation-2026-11-09).

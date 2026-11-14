@@ -358,6 +358,8 @@ pub struct Context {
     // ---- transform state ----
     pub matrix_mode: MatrixMode,
     pub modelview: MatrixStack,
+    palette_matrices: [MatrixStack; 32],
+    palette_index: usize,
     pub projection: MatrixStack,
     /// GL ES keeps one texture matrix stack per server texture unit.
     pub texture_matrix: [MatrixStack; MAX_TEXTURE_UNITS],
@@ -468,6 +470,8 @@ impl Context {
             gpu_failed: false,
             matrix_mode: MatrixMode::Modelview,
             modelview: MatrixStack::new(16),
+            palette_matrices: std::array::from_fn(|_| MatrixStack::new(1)),
+            palette_index: 0,
             projection: MatrixStack::new(16),
             texture_matrix: std::array::from_fn(|_| MatrixStack::new(16)),
             current_color: [1.0, 1.0, 1.0, 1.0],
@@ -579,11 +583,10 @@ impl Context {
         }
     }
 
-    /// Host-only GPU resolution policy: 1=native, 2=all 2x, 3=QVGA-only 2x, 4=QVGA-only 3x, 5=QVGA-only 4x.
-    /// Guest surfaces, queries and reads stay logical.
+    /// Host-only GPU resolution policy. Guest coordinates remain logical.
     pub fn set_internal_resolution(&mut self, scale: u8) {
         self.internal_resolution = match scale {
-            2 | 3 | 4 | 5 => scale,
+            2..=7 => scale,
             _ => 1,
         };
         if let Some(gpu) = self.gpu.as_mut() {
@@ -602,12 +605,23 @@ impl Context {
         self.gpu.as_ref()?.scaled_rgb565_into(out)
     }
 
-    /// Host presentation pixels; logical readbacks and guest memory remain RGB565.
+    /// Host presentation at source precision; guest display memory remains RGB565.
     pub fn scaled_display_rgba_into(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
         if self.gpu_failed {
             return None;
         }
-        self.gpu.as_ref()?.scaled_display_rgba_into(out)
+        if let Some(gpu) = self.gpu.as_ref() {
+            return gpu.scaled_display_rgba_into(out);
+        }
+        if self.target.rgb565 {
+            return None;
+        }
+        out.clear();
+        out.extend_from_slice(&self.target.color);
+        for pixel in out.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        Some((self.target.width, self.target.height))
     }
 
     /// Select before guest rendering begins. Initialization failure keeps software.
@@ -681,6 +695,13 @@ impl Context {
         self.gpu
             .as_ref()
             .map_or(MAX_TEXTURE_UNITS, |g| g.texture_coordinate_capacity())
+    }
+
+    /// Querying identity must not create, bind or synchronize a host context.
+    pub fn renderer_name(&self) -> &str {
+        self.gpu
+            .as_ref()
+            .map_or("PocketHLE Software Rasterizer", |gpu| gpu.renderer_name())
     }
 
     pub fn gpu_active(&self) -> bool {
@@ -808,6 +829,7 @@ impl Context {
             MatrixMode::Modelview => &mut self.modelview,
             MatrixMode::Projection => &mut self.projection,
             MatrixMode::Texture => &mut self.texture_matrix[self.active_texture as usize],
+            MatrixMode::Palette => &mut self.palette_matrices[self.palette_index],
         }
     }
 
@@ -816,6 +838,22 @@ impl Context {
             Some(m) => self.matrix_mode = m,
             None => self.set_error(GL_INVALID_ENUM),
         }
+    }
+
+    pub fn set_palette_index(&mut self, index: u32) {
+        if (index as usize) < self.palette_matrices.len() {
+            self.palette_index = index as usize;
+        } else {
+            self.set_error(GL_INVALID_VALUE);
+        }
+    }
+
+    pub fn load_palette_from_modelview(&mut self) {
+        self.palette_matrices[self.palette_index].load(*self.modelview.current());
+    }
+
+    pub fn current_matrix(&mut self) -> &Matrix4 {
+        self.stack_mut().current()
     }
 
     pub fn load_identity(&mut self) {
@@ -910,7 +948,9 @@ impl Context {
             GL_COLOR_MATERIAL => self.lighting.color_material = on,
             crate::lighting::RESCALE_NORMAL => self.lighting.rescale = on,
             GL_POLYGON_OFFSET_FILL => self.state.polygon_offset = on,
-            0x0b10 | 0x0b20 | 0x809d | 0x809e | 0x809f | 0x80a0 => {
+            // Palette array entry points are already accepted by the bridge.
+            // Retain this enable so glGetError does not contaminate later calls.
+            0x0b10 | 0x0b20 | 0x809d | 0x809e | 0x809f | 0x80a0 | GL_MATRIX_PALETTE_OES => {
                 if on {
                     self.es11.extra_enables.insert(cap);
                 } else {
@@ -938,6 +978,13 @@ impl Context {
                 self.texture_units[unit].texcoord_array.enabled = on;
             }
             GL_NORMAL_ARRAY => self.normal_array.enabled = on,
+            GL_MATRIX_INDEX_ARRAY_OES | GL_WEIGHT_ARRAY_OES => {
+                if on {
+                    self.es11.extra_enables.insert(array);
+                } else {
+                    self.es11.extra_enables.remove(&array);
+                }
+            }
             GL_POINT_SIZE_ARRAY_OES => {
                 self.point_size_array.enabled = on;
                 self.state.point_size_array = on;
@@ -1148,6 +1195,15 @@ impl Context {
             return false;
         }
         true
+    }
+
+    pub fn buffer_sub_data_read(&mut self, target: u32, offset: u32, size: usize) -> Option<&[u8]> {
+        if !self.validate_buffer_sub_data(target, offset, size) {
+            return None;
+        }
+        let name = self.bound_buffer_name(target).unwrap();
+        let start = offset as usize;
+        Some(&self.buffers[&name].data[start..start + size])
     }
 
     pub fn validate_buffer_sub_data(&mut self, target: u32, offset: u32, size: usize) -> bool {
@@ -2505,6 +2561,11 @@ impl Context {
     // ---- clearing -------------------------------------------------------
 
     pub fn clear(&mut self, mask: u32) {
+        let mask = if self.target.depth.is_empty() {
+            mask & !GL_DEPTH_BUFFER_BIT
+        } else {
+            mask
+        };
         // ES 1.1 section 4.2.3: reject the whole command before changing buffers.
         if mask & !(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT) != 0 {
             self.set_error(GL_INVALID_VALUE);
@@ -3588,32 +3649,40 @@ impl Context {
                 _ => {}
             }
 
-            // Stream primitives in their original order without allocating a triangle list.
-            let mut draw = |tri| {
-                raster::draw_triangle(&mut self.target, &self.state, &sample, &stages, tri);
-            };
-            match mode {
-                GL_TRIANGLES => {
-                    for c in verts.chunks_exact(3) {
-                        draw([c[0], c[1], c[2]]);
-                    }
-                }
-                GL_TRIANGLE_STRIP => {
-                    for i in 2..verts.len() {
-                        // Preserve alternating winding and the provoking vertex.
-                        if i % 2 == 0 {
-                            draw([verts[i - 2], verts[i - 1], verts[i]]);
-                        } else {
-                            draw([verts[i - 1], verts[i - 2], verts[i]]);
+            let compatibility_pass = self
+                .combiner_programs
+                .active()
+                .is_none()
+                .then(|| self.state.intel2700g_depth_color_pass())
+                .flatten();
+            for pass in std::iter::once(&self.state).chain(compatibility_pass.as_ref()) {
+                // Stream primitives in their original order without allocating a triangle list.
+                let mut draw = |tri: [Vertex; 3]| {
+                    raster::draw_triangle(&mut self.target, pass, &sample, stages, tri);
+                };
+                match mode {
+                    GL_TRIANGLES => {
+                        for c in verts.chunks_exact(3) {
+                            draw([c[0], c[1], c[2]]);
                         }
                     }
-                }
-                GL_TRIANGLE_FAN => {
-                    for i in 2..verts.len() {
-                        draw([verts[0], verts[i - 1], verts[i]]);
+                    GL_TRIANGLE_STRIP => {
+                        for i in 2..verts.len() {
+                            // Preserve alternating winding and the provoking vertex.
+                            if i % 2 == 0 {
+                                draw([verts[i - 2], verts[i - 1], verts[i]]);
+                            } else {
+                                draw([verts[i - 1], verts[i - 2], verts[i]]);
+                            }
+                        }
                     }
+                    GL_TRIANGLE_FAN => {
+                        for i in 2..verts.len() {
+                            draw([verts[0], verts[i - 1], verts[i]]);
+                        }
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             }
         })();
         verts.clear();
@@ -3912,6 +3981,71 @@ mod tests {
         });
         c.gpu_requested = true;
         c
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires native GL/GLES; exact fixed clip boundaries and stream format transitions"]
+    fn gpu_fixed_clip_boundaries_match_float_with_client_arrays_and_vbos() {
+        for es in [false, true] {
+            for rgb565 in [false, true] {
+                for scale in [1, 2] {
+                    let mut c = native_ctx(es);
+                    c.target = raster::RenderTarget::with_format(64, 64, rgb565);
+                    c.gpu.as_mut().unwrap().set_surface_rgb565(rgb565).unwrap();
+                    c.set_internal_resolution(scale);
+                    c.state.intel2700g_depth_bias = true;
+                    c.set_client_state(GL_VERTEX_ARRAY, true);
+                    let buffer = c.gen_buffers(1)[0];
+                    for ty in [GL_FIXED, GL_FLOAT, GL_FIXED] {
+                        for size in [2, 3, 4] {
+                            for z in [-1., 1.] {
+                                let mut bytes = Vec::new();
+                                for (x, y) in [(-1., -1.), (1., -1.), (-1., 1.), (1., 1.)] {
+                                    for value in [x, y, z, 1.].into_iter().take(size as usize) {
+                                        bytes.extend(if ty == GL_FIXED {
+                                            fixed::from_f32(value).to_le_bytes()
+                                        } else {
+                                            value.to_le_bytes()
+                                        });
+                                    }
+                                }
+                                let mut mem = FakeMem { base: BASE, bytes };
+                                for vbo in [false, true] {
+                                    c.bind_buffer(GL_ARRAY_BUFFER, if vbo { buffer } else { 0 });
+                                    if vbo {
+                                        c.buffer_data(
+                                            GL_ARRAY_BUFFER,
+                                            mem.bytes.len(),
+                                            Some(&mem.bytes),
+                                            GL_DYNAMIC_DRAW,
+                                        );
+                                    }
+                                    c.set_vertex_pointer(size, ty, 0, if vbo { 0 } else { BASE });
+                                    c.current_color = if vbo {
+                                        [0., 1., 0., 1.]
+                                    } else {
+                                        [1., 0., 0., 1.]
+                                    };
+                                    c.clear_color = [0., 0., 0., 1.];
+                                    c.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                                    c.draw_arrays(&mut mem, GL_TRIANGLE_STRIP, 0, 4);
+                                    c.sync_gpu();
+                                    let expected = if vbo {
+                                        [0, 255, 0, 255]
+                                    } else {
+                                        [255, 0, 0, 255]
+                                    };
+                                    assert!(c.target.color.chunks_exact(4).all(|p| p == expected), "es={es}, rgb565={rgb565}, scale={scale}, ty={ty}, size={size}, z={z}, vbo={vbo}");
+                                    assert!(c.gpu_active());
+                                    assert_eq!(c.take_error(), GL_NO_ERROR);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(unix)]

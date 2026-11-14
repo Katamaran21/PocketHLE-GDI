@@ -89,8 +89,7 @@ impl Default for GuestFormat {
     }
 }
 
-#[derive(Debug)]
-#[cfg(feature = "audio-cpal")]
+#[derive(Debug, Clone)]
 struct AudioVoice {
     samples: Vec<i16>,
     format: GuestFormat,
@@ -100,6 +99,50 @@ struct AudioVoice {
     volume: f32,
     group: u32,
     paused: bool,
+}
+
+/// Mix independent voices using their own source rates, on both CPAL and
+/// Android. Keeping the source format is essential when PlaySound changes rate.
+fn mix_voices(voices: &mut Vec<AudioVoice>, output_rate: u32) -> (f32, f32) {
+    let (mut left, mut right) = (0.0, 0.0);
+    let mut index = 0;
+    while index < voices.len() {
+        let voice = &mut voices[index];
+        if voice.paused {
+            index += 1;
+            continue;
+        }
+        let voice_channels = voice.format.channels.max(1) as usize;
+        let frame_count = voice.samples.len() / voice_channels;
+        let source_frame = (voice.position_q16 >> 16) as usize;
+        if frame_count == 0 || source_frame >= frame_count {
+            if voice.looped && frame_count > 0 {
+                voice.position_q16 %= (frame_count as u64) << 16;
+            } else {
+                voices.swap_remove(index);
+                continue;
+            }
+        }
+        let source_frame = (voice.position_q16 >> 16) as usize;
+        let sample_index = source_frame * voice_channels;
+        let left_sample = voice.samples[sample_index] as f32 / 32768.0
+            * voice.volume
+            * ((1.0 - voice.pan) * 2.0).min(1.0);
+        let right_sample = if voice_channels > 1 {
+            voice.samples[sample_index + 1] as f32 / 32768.0
+                * voice.volume
+                * (voice.pan * 2.0).min(1.0)
+        } else {
+            voice.samples[sample_index] as f32 / 32768.0 * voice.volume * (voice.pan * 2.0).min(1.0)
+        };
+        left += left_sample;
+        right += right_sample;
+        voice.position_q16 = voice.position_q16.saturating_add(
+            ((voice.format.sample_rate.max(1) as u64) << 16) / output_rate.max(1) as u64,
+        );
+        index += 1;
+    }
+    (left, right)
 }
 
 /// How a voice submitted through [`AudioEngine::play_voice_with`]
@@ -145,6 +188,7 @@ struct WaveStream {
     samples: std::collections::VecDeque<i16>,
     format: GuestFormat,
     phase: u64,
+    playback_rate_q16: u32,
     written: u64,
     consumed: u64,
     paused: bool,
@@ -160,6 +204,7 @@ impl WaveStream {
             samples: Default::default(),
             format,
             phase: 0,
+            playback_rate_q16: 1 << 16,
             written: 0,
             consumed: 0,
             paused: false,
@@ -172,10 +217,12 @@ impl WaveStream {
     fn advance_virtual(&mut self, active: bool) {
         let now = Instant::now();
         if !active && !self.paused && self.consumed < self.written {
-            let rate = self.format.sample_rate.max(1) as u128;
+            const Q16_NANOSECONDS_PER_SECOND: u128 = 1_000_000_000 << 16;
+            let rate =
+                u128::from(self.format.sample_rate.max(1)) * u128::from(self.playback_rate_q16);
             let elapsed = now.duration_since(self.tick).as_nanos() * rate + self.fraction;
-            let frames = elapsed / 1_000_000_000;
-            self.fraction = elapsed % 1_000_000_000;
+            let frames = elapsed / Q16_NANOSECONDS_PER_SECOND;
+            self.fraction = elapsed % Q16_NANOSECONDS_PER_SECOND;
             self.consume(
                 (frames * self.format.channels.max(1) as u128).min(usize::MAX as u128) as usize,
             );
@@ -254,7 +301,8 @@ impl WaveStream {
             let right = if channels > 1 { self.samples[1] } else { left };
             (left, right)
         };
-        self.phase += ((self.format.sample_rate.max(1) as u64) << 16) / rate.max(1) as u64;
+        self.phase += u64::from(self.format.sample_rate.max(1)) * u64::from(self.playback_rate_q16)
+            / u64::from(rate.max(1));
         let frames = self.phase >> 16;
         self.phase &= 0xffff;
         self.consume((frames as usize).saturating_mul(channels));
@@ -338,7 +386,6 @@ struct Shared {
     /// resumes.
     paused: bool,
     /// Independent sound-effect voices mixed over the waveOut stream.
-    #[cfg(feature = "audio-cpal")]
     voices: Vec<AudioVoice>,
     /// Optional WAV tap so headless runs can verify that a game
     /// really produces sound on a machine with no audio hardware.
@@ -367,7 +414,6 @@ impl Shared {
             virtual_cursor: 0,
             virtual_tick: None,
             paused: false,
-            #[cfg(feature = "audio-cpal")]
             voices: Vec::new(),
             capture: None,
             output_recording: None,
@@ -448,21 +494,17 @@ impl Shared {
         self.consumed = 0;
         self.virtual_cursor = 0;
         self.virtual_tick = None;
-        #[cfg(feature = "audio-cpal")]
         self.voices.clear();
     }
 
-    #[cfg(feature = "audio-cpal")]
     fn stop_voices(&mut self) {
         self.voices.clear();
     }
 
-    #[cfg(feature = "audio-cpal")]
     fn stop_voice_group(&mut self, group: u32) {
         self.voices.retain(|v| v.group != group);
     }
 
-    #[cfg(feature = "audio-cpal")]
     fn pause_voice_group(&mut self, group: u32, paused: bool) {
         for voice in &mut self.voices {
             if voice.group == group {
@@ -471,11 +513,15 @@ impl Shared {
         }
     }
 
-    #[cfg(feature = "audio-cpal")]
     fn add_voice(&mut self, samples: Vec<i16>, format: GuestFormat, params: VoiceParams) {
         if samples.is_empty() {
             return;
         }
+        if !self.mix_format_ready {
+            self.mix_format = format;
+            self.mix_format_ready = true;
+        }
+        self.guest_format_ready = true;
         if let Some(cap) = self.capture.as_mut() {
             cap.write(&samples, format);
         }
@@ -528,49 +574,9 @@ impl Shared {
                     }
                 }
 
-                #[cfg(feature = "audio-cpal")]
-                {
-                    let mut index = 0;
-                    while index < self.voices.len() {
-                        let voice = &mut self.voices[index];
-                        if voice.paused {
-                            index += 1;
-                            continue;
-                        }
-                        let voice_channels = voice.format.channels.max(1) as usize;
-                        let frame_count = voice.samples.len() / voice_channels;
-                        let source_frame = (voice.position_q16 >> 16) as usize;
-                        if frame_count == 0 || source_frame >= frame_count {
-                            if voice.looped && frame_count > 0 {
-                                voice.position_q16 %= (frame_count as u64) << 16;
-                            } else {
-                                self.voices.swap_remove(index);
-                                continue;
-                            }
-                        }
-                        let source_frame = (voice.position_q16 >> 16) as usize;
-                        let sample_index = source_frame * voice_channels;
-                        let left_sample = voice.samples[sample_index] as f32 / 32768.0
-                            * voice.volume
-                            * ((1.0 - voice.pan) * 2.0).min(1.0);
-                        let right_sample = if voice_channels > 1 {
-                            voice.samples[sample_index + 1] as f32 / 32768.0
-                                * voice.volume
-                                * (voice.pan * 2.0).min(1.0)
-                        } else {
-                            voice.samples[sample_index] as f32 / 32768.0
-                                * voice.volume
-                                * (voice.pan * 2.0).min(1.0)
-                        };
-                        left += left_sample;
-                        right += right_sample;
-                        voice.position_q16 = voice.position_q16.saturating_add(
-                            ((voice.format.sample_rate.max(1) as u64) << 16)
-                                / output_rate.max(1) as u64,
-                        );
-                        index += 1;
-                    }
-                }
+                let (l, r) = mix_voices(&mut self.voices, output_rate);
+                left += l;
+                right += r;
                 // MAS, legacy PCM and HSS share the emulated output device.
                 // waveOut handles have absolute instance volumes of their own.
                 left *= volume_gain(self.device_volume, 0);
@@ -837,6 +843,24 @@ impl AudioEngine {
         }
     }
 
+    pub fn set_wave_playback_rate(&self, handle: u32, rate_q16: u32) -> bool {
+        let Ok(mut shared) = self.shared.lock() else {
+            return false;
+        };
+        let active = shared.device_active;
+        let Some(stream) = shared.wave_streams.get_mut(&handle) else {
+            return false;
+        };
+        stream.advance_virtual(active);
+        stream.playback_rate_q16 = rate_q16;
+        true
+    }
+
+    pub fn wave_playback_rate(&self, handle: u32) -> Option<u32> {
+        let shared = self.shared.lock().ok()?;
+        Some(shared.wave_streams.get(&handle)?.playback_rate_q16)
+    }
+
     /// Device ID 0 updates existing instances and the default for future opens.
     /// An open HWAVEOUT updates only that stream, including queued/live-loop PCM.
     pub fn set_wave_volume(&self, handle: u32, volume: u32) -> bool {
@@ -984,8 +1008,10 @@ impl AudioEngine {
         if let Ok(mut s) = self.shared.lock() {
             if let Some(v) = s.wave_streams.get_mut(&handle) {
                 let volume = v.volume;
+                let playback_rate = v.playback_rate_q16;
                 *v = WaveStream::new(v.format);
                 v.volume = volume;
+                v.playback_rate_q16 = playback_rate;
             }
         }
     }
@@ -1053,50 +1079,34 @@ impl AudioEngine {
         format: GuestFormat,
         params: VoiceParams,
     ) -> usize {
-        #[cfg(feature = "audio-cpal")]
-        {
-            if let Ok(mut s) = self.shared.lock() {
-                s.add_voice(samples.to_vec(), format, params);
-                samples.len()
-            } else {
-                0
-            }
-        }
-        #[cfg(not(feature = "audio-cpal"))]
-        {
-            let _ = (format, params);
-            self.push_samples(samples)
+        if let Ok(mut s) = self.shared.lock() {
+            s.add_voice(samples.to_vec(), format, params);
+            samples.len()
+        } else {
+            0
         }
     }
 
     pub fn stop_voices(&self) {
-        #[cfg(feature = "audio-cpal")]
         if let Ok(mut s) = self.shared.lock() {
             s.stop_voices();
         }
     }
 
     /// Stop only the voices tagged with `group`, leaving every other
-    /// voice playing. Without the `audio-cpal` feature there are no
-    /// voices to stop and this does nothing.
+    /// voice playing.
     pub fn stop_voice_group(&self, group: u32) {
-        #[cfg(feature = "audio-cpal")]
         if let Ok(mut s) = self.shared.lock() {
             s.stop_voice_group(group);
         }
-        #[cfg(not(feature = "audio-cpal"))]
-        let _ = group;
     }
 
     /// Pause or resume only one mixer voice group.  This is used by devices
     /// such as Gizmondo MAS1 whose transport is independent of waveOut.
     pub fn pause_voice_group(&self, group: u32, paused: bool) {
-        #[cfg(feature = "audio-cpal")]
         if let Ok(mut s) = self.shared.lock() {
             s.pause_voice_group(group, paused);
         }
-        #[cfg(not(feature = "audio-cpal"))]
-        let _ = (group, paused);
     }
 
     /// Update one HSS channel without restarting its playback or other voices.
@@ -1109,7 +1119,6 @@ impl AudioEngine {
         position: Option<u64>,
         looped: bool,
     ) {
-        #[cfg(feature = "audio-cpal")]
         if let Ok(mut shared) = self.shared.lock() {
             for voice in shared
                 .voices
@@ -1125,8 +1134,6 @@ impl AudioEngine {
                 }
             }
         }
-        #[cfg(not(feature = "audio-cpal"))]
-        let _ = (group, volume, rate, pan, position, looped);
     }
 
     /// Convenience for unsigned 8-bit PCM (the format `PlaySound` and
@@ -1173,7 +1180,7 @@ impl AudioEngine {
             s.consumed = 0;
             s.virtual_cursor = 0;
             s.virtual_tick = None;
-            if s.mas_streams.is_empty() {
+            if s.mas_streams.is_empty() && s.voices.is_empty() {
                 s.mix_format_ready = false;
                 s.guest_format_ready = false;
             }
@@ -1410,7 +1417,7 @@ impl AudioTap {
             return 0;
         };
         s.device_active = true;
-        if !s.wave_streams.is_empty() || !s.mas_streams.is_empty() {
+        if !s.wave_streams.is_empty() || !s.mas_streams.is_empty() || !s.voices.is_empty() {
             let format = s.mix_format;
             let mut output = vec![0.0; dst.len()];
             s.render_frames(&mut output, format.sample_rate, format.channels);
@@ -1443,8 +1450,9 @@ impl AudioTap {
         let Ok(s) = self.shared.lock() else {
             return 0;
         };
-        if !s.wave_streams.is_empty() || !s.mas_streams.is_empty() {
+        if !s.wave_streams.is_empty() || !s.mas_streams.is_empty() || !s.voices.is_empty() {
             let channels = s.mix_format.channels.max(1) as usize;
+            let mut voices = s.voices.clone();
             let mut streams = s.wave_streams.clone();
             let mut mas_streams: std::collections::BTreeMap<u32, WaveStream> = s
                 .mas_streams
@@ -1459,7 +1467,13 @@ impl AudioTap {
                 })
                 .collect();
             for frame in dst.chunks_exact_mut(channels) {
-                let (mut left, mut right) = (0.0f32, 0.0f32);
+                let (mut left, mut right) = if s.paused {
+                    (0.0, 0.0)
+                } else {
+                    mix_voices(&mut voices, s.mix_format.sample_rate)
+                };
+                left *= volume_gain(s.device_volume, 0);
+                right *= volume_gain(s.device_volume, 1);
                 for stream in streams.values_mut().chain(mas_streams.values_mut()) {
                     let (l, r) = stream.frame(s.mix_format.sample_rate);
                     left += l;
@@ -1664,7 +1678,6 @@ fn fill_output_u16(
 mod tests {
     use super::*;
 
-    #[cfg(feature = "audio-cpal")]
     #[test]
     fn voice_groups_pause_resume_and_stop_independently_without_a_host_device() {
         let engine = AudioEngine::new();
@@ -1980,12 +1993,147 @@ mod tests {
         assert_eq!(e.buffered_samples(), 0);
     }
 
+    #[test]
+    fn wave_playback_rate_changes_stream_cursor_without_changing_source_format() {
+        let mut wave = WaveStream::new(mono(8000));
+        wave.samples.extend([100, 200, 300, 400]);
+        wave.written = 4;
+        wave.playback_rate_q16 = 0x8000;
+        wave.frame(8000);
+        assert_eq!(wave.consumed, 0);
+        wave.frame(8000);
+        assert_eq!(wave.consumed, 1);
+        assert_eq!(wave.format.sample_rate, 8000);
+
+        wave.playback_rate_q16 = 0x20000;
+        wave.frame(8000);
+        assert_eq!(wave.consumed, 3);
+    }
+
     fn mono(rate: u32) -> GuestFormat {
         GuestFormat {
             sample_rate: rate,
             channels: 1,
             bits_per_sample: 16,
         }
+    }
+
+    #[test]
+    fn android_voice_rate_survives_a_lower_rate_sound_between_plays() {
+        let e = AudioEngine::new();
+        let tap = e.tap();
+        let effect = [1000, -1000, 2000, -2000];
+        e.set_guest_format(mono(22050));
+        e.play_voice(&effect, mono(22050), false);
+        let mut first = [0; 4];
+        tap.drain_into(&mut first);
+        assert_eq!(first, effect);
+
+        // PlaySound(NULL) between menus clears the output format. Gameplay
+        // then opens a lower-rate sound before the same menu effect returns.
+        e.flush();
+        e.set_guest_format(mono(11025));
+        e.play_voice(&[0; 2], mono(11025), false);
+        tap.drain_into(&mut [0; 2]);
+        e.set_guest_format(mono(22050));
+        e.play_voice(&effect, mono(22050), false);
+        assert_eq!(tap.guest_format(), mono(11025));
+        let mut second = [0; 2];
+        tap.drain_into(&mut second);
+        assert_eq!(
+            second,
+            [effect[0], effect[2]],
+            "resample to the announced output rate"
+        );
+        let mut silence = [1; 2];
+        tap.drain_into(&mut silence);
+        assert_eq!(
+            silence, [0; 2],
+            "the effect must finish after the same duration"
+        );
+    }
+
+    #[test]
+    fn android_voice_pitch_and_duration_match_at_fades_source_rates() {
+        // One second at 735 Hz, sampled at 22050 Hz. A raw-ring replay at
+        // 8000 Hz would instead last 2.76 seconds and sound near 267 Hz.
+        let effect: Vec<i16> = (0..22050)
+            .map(|i| if i % 30 < 15 { 1000 } else { -1000 })
+            .collect();
+        for rate in [8000, 11025, 22050] {
+            let e = AudioEngine::new();
+            let tap = e.tap();
+            e.set_guest_format(mono(rate));
+            e.set_guest_format(mono(22050));
+            e.play_voice(&effect, mono(22050), false);
+            let mut out = vec![0; rate as usize + 2];
+            tap.drain_into(&mut out);
+            let audible = out.iter().filter(|s| **s != 0).count();
+            assert!((rate as usize..=rate as usize + 1).contains(&audible));
+            let rising = out.windows(2).filter(|w| w[0] < 0 && w[1] > 0).count();
+            assert!((733..=735).contains(&rising), "pitch at output rate {rate}");
+        }
+    }
+
+    #[test]
+    fn voices_mix_rates_channels_and_preview_without_consuming() {
+        let e = AudioEngine::new();
+        let tap = e.tap();
+        let stereo = GuestFormat {
+            channels: 2,
+            ..mono(22050)
+        };
+        e.open_wave_stream(1, stereo);
+        e.push_wave_samples(1, &[100; 8]);
+        // The last submitted guest format must not reinterpret either voice.
+        e.set_guest_format(mono(11025));
+        e.play_voice(&[1000, 2000], mono(11025), false);
+        e.play_voice(&[300, 400, 500, 600, 700, 800, 900, 1000], stereo, false);
+        let expected = [1400, 1500, 1600, 1700, 2800, 2900, 3000, 3100];
+        let mut out = [0; 8];
+        tap.peek_into(&mut out);
+        assert_eq!(out, expected);
+        assert_eq!(e.wave_playback_cursor(1), 0);
+        tap.drain_into(&mut out);
+        assert_eq!(out, expected);
+        assert_eq!(e.wave_playback_cursor(1), 8);
+    }
+
+    #[test]
+    fn voice_loop_controls_and_wave_cleanup_preserve_the_output_format() {
+        let e = AudioEngine::new();
+        let tap = e.tap();
+        e.play_voice_with(
+            &[1000, 2000],
+            mono(8000),
+            VoiceParams {
+                looped: true,
+                group: 7,
+                volume: 1.0,
+            },
+        );
+        assert!(tap.format_ready());
+        e.open_wave_stream(1, mono(22050));
+        e.flush_wave_out();
+        assert!(tap.format_ready());
+        assert_eq!(tap.guest_format(), mono(8000));
+        let mut out = [0; 4];
+        tap.drain_into(&mut out);
+        assert_eq!(out, [1000, 2000, 1000, 2000]);
+        e.pause_voice_group(7, true);
+        tap.drain_into(&mut out);
+        assert_eq!(out, [0; 4]);
+        e.configure_voice_group(7, 0.5, 8000, 0.5, Some(1), false);
+        e.pause_voice_group(7, false);
+        tap.drain_into(&mut out);
+        assert_eq!(out, [1000, 0, 0, 0]);
+        e.play_voice(&[3000; 4], mono(8000), true);
+        e.stop_voices();
+        assert_eq!(tap.drain_into(&mut out), 0);
+        e.play_voice(&[3000; 4], mono(8000), true);
+        e.flush();
+        assert!(!tap.format_ready());
+        assert_eq!(tap.drain_into(&mut out), 0);
     }
 
     #[test]
@@ -2177,3 +2325,6 @@ mod session_drop_tests {
         assert_eq!(tap.drain_into(&mut output), 0);
     }
 }
+
+mod wave;
+pub use wave::decode_pcm_wave;

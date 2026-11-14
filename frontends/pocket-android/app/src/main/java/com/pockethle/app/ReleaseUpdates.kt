@@ -5,10 +5,11 @@ import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URI
 
-/** One bounded, background request per process; never retains an Activity. */
+/** One bounded, background update check per process; never retains an Activity. */
 object ReleaseUpdates {
     private const val RELEASES = "https://github.com/Katamaran21/PocketHLE-GDI/releases/"
     private const val API = "https://api.github.com/repos/Katamaran21/PocketHLE-GDI/releases/latest"
+    private val endpoints = listOf(API)
     private var checked = false
     private var cached: Update? = null
     @Volatile var announced = false
@@ -17,14 +18,26 @@ object ReleaseUpdates {
     @Synchronized fun check(installed: String): Update? {
         if (checked) return cached
         checked = true
-        cached = runCatching {
-            val connection = URI(API).toURL().openConnection() as HttpURLConnection
-            val deadline = System.nanoTime() + 8_000_000_000L
+        val deadline = System.nanoTime() + 8_000_000_000L
+        for (endpoint in endpoints) {
+            val release = fetch(endpoint, installed, deadline) ?: continue
+            cached = parse(release, installed)
+            break
+        }
+        return cached
+    }
+
+    private fun fetch(endpoint: String, installed: String, deadline: Long): String? =
+        runCatching {
+            val connection = URI(endpoint).toURL().openConnection() as HttpURLConnection
+
             try {
-                connection.connectTimeout = 4000
-                connection.readTimeout = 4000
+                val remainingMs = (deadline - System.nanoTime()) / 1_000_000L
+                if (remainingMs <= 0) return@runCatching null
+                connection.connectTimeout = remainingMs.coerceAtMost(4000).toInt()
+                connection.readTimeout = connection.connectTimeout
                 connection.instanceFollowRedirects = false
-                connection.setRequestProperty("User-Agent", "PocketHLE/$installed")
+                connection.setRequestProperty("User-Agent", "PocketHLE-GDI/$installed")
                 connection.setRequestProperty("Accept", "application/vnd.github+json")
                 if (connection.responseCode != 200) return@runCatching null
                 val output = ByteArrayOutputStream()
@@ -40,11 +53,9 @@ object ReleaseUpdates {
                         output.write(buffer, 0, count)
                     }
                 }
-                parse(output.toString("UTF-8"), installed)
+                output.toString("UTF-8").also { JSONObject(it).getString("tag_name") }
             } finally { connection.disconnect() }
         }.getOrNull()
-        return cached
-    }
 
     internal fun parse(json: String, installed: String): Update? = runCatching {
         val release = JSONObject(json)

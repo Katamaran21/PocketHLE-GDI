@@ -143,9 +143,19 @@ impl Emulator {
         pocket_winceapi::gles::set_gizmondo_goforce_driver(enabled);
     }
 
+    /// Select the PocketPC GoForce 5500 guest capabilities.
+    pub fn set_goforce_5500_profile(&mut self, enabled: bool) {
+        pocket_winceapi::gles::set_goforce_5500_profile(enabled);
+    }
+
     /// Session gate for detected NVIDIA AR10/AR11 combiner clients.
     pub fn set_nv_combiner_allowed(&mut self, allowed: bool) {
         pocket_winceapi::gles::set_nv_combiner_allowed(allowed);
+    }
+
+    /// Select the separate programmable guest EGL/GLES implementation.
+    pub fn set_programmable_gles(&mut self, enabled: bool) {
+        pocket_winceapi::gles2::set_enabled(enabled);
     }
 
     /// Opt-in Intel 2700G WinCE depth-bias semantics for the PocketPC profile.
@@ -155,6 +165,7 @@ impl Emulator {
 
     pub fn set_gles_internal_resolution(&mut self, scale: u8) {
         pocket_winceapi::gles::set_internal_resolution(scale);
+        pocket_winceapi::gles2::set_internal_resolution(scale);
     }
 
     /// Per-session EGL format profile; configure after loading, before guest execution.
@@ -484,6 +495,9 @@ impl Emulator {
     pub fn set_module_path(&mut self, path: impl Into<String>) {
         let path = path.into();
         if let Some(p) = self.process.as_mut() {
+            p.state
+                .object_handles
+                .set_process_image(&path, p.state.image_base);
             p.state.module_path = path;
         } else {
             log::warn!("set_module_path called before load_pe; ignored");
@@ -816,6 +830,7 @@ pub fn suspend_host_session() -> pocket_winceapi::SuspendedSession {
     pocket_winceapi::suspend_session()
 }
 
+pub mod child_jobs;
 pub mod dependencies;
 mod pocketpc_storage;
 
